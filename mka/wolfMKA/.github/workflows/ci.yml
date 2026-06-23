@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      # wolfSSL is built and installed here; the wolfMKA Makefile reads it.
+      WOLFSSL_DIR: ${{ github.workspace }}/wolfssl-install
+
+    steps:
+      - name: Checkout wolfMKA
+        uses: actions/checkout@v4
+
+      # Style gate first: fails fast on formatting without waiting for the
+      # wolfSSL build. clang-format output is version-sensitive, so pin the
+      # exact version the tree was formatted with. The single source of truth
+      # for that version is .clang-format-version (also read by `make format`).
+      - name: Code formatting (clang-format)
+        run: |
+          pipx install "clang-format==$(cat .clang-format-version)"
+          make format-check
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool \
+            cmake python3 doxygen valgrind \
+            gcc-14 clang \
+            gcc-powerpc64-linux-gnu qemu-user
+          # gcc-14 ships gcov-14; -fcondition-coverage (MC/DC) needs GCC >= 14.
+          gcc-14 --version
+          # clang provides libFuzzer (-fsanitize=fuzzer) for the fuzz smoke run.
+          clang --version
+          # gcc-powerpc64-linux-gnu + qemu-ppc64 run the big-endian serialization
+          # test on a real big-endian ISA (make test-endian).
+          powerpc64-linux-gnu-gcc --version | head -1
+
+      # MISRA output is cppcheck-version-sensitive, so pin and build the exact
+      # version from source. The single source of truth is .cppcheck-version
+      # (keep it in sync with the dev environment and the MISRA deviations).
+      - name: Build cppcheck (pinned)
+        run: |
+          ver="$(cat .cppcheck-version)"
+          git clone --depth 1 --branch "$ver" \
+            https://github.com/danmar/cppcheck.git /tmp/cppcheck
+          cmake -S /tmp/cppcheck -B /tmp/cppcheck/build \
+            -DCMAKE_BUILD_TYPE=Release -DFILESDIR=/usr/local/share/cppcheck
+          cmake --build /tmp/cppcheck/build -j"$(nproc)"
+          sudo cmake --install /tmp/cppcheck/build
+          cppcheck --version
+
+      - name: Cache wolfSSL install
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_DIR }}
+          key: wolfssl-${{ runner.os }}-cmac-keywrap-v1
+
+      - name: Build and install wolfSSL (CMAC + AES Key Wrap)
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/wolfSSL/wolfssl.git
+          cd wolfssl
+          ./autogen.sh
+          ./configure --enable-cmac --enable-keywrap --enable-aesgcm \
+                      --enable-static --prefix="$WOLFSSL_DIR"
+          make -j"$(nproc)"
+          make install
+
+      - name: Unit tests
+        run: make test
+
+      - name: Fault-injection tests
+        run: make test-fault
+
+      - name: Cipher/capability negotiation tests
+        run: make test-negotiation
+
+      - name: Optional-feature test builds (distributed-CAK / KMD / suspension)
+        run: |
+          make test-distcak
+          make test-kmd
+          make test-suspension
+
+      - name: Redefinable allocator test
+        run: make test-alloc
+
+      - name: AUTOSAR Mka binding build + test
+        run: make autosar
+
+      - name: No-malloc build + no-allocation symbol check
+        run: make test-nomalloc
+
+      - name: All feature configurations compile
+        run: make features
+
+      - name: Compiles as C++ (g++)
+        run: make cxx
+
+      - name: Valgrind (memory clean)
+        run: |
+          make test
+          valgrind --error-exitcode=1 --leak-check=full ./test/runtests
+
+      - name: Big-endian serialization (native + ppc64 via qemu)
+        run: make test-endian
+
+      - name: Footprint report (code/object/stack size)
+        run: make footprint
+
+      - name: Static analysis (gcc -fanalyzer)
+        run: make analyze
+
+      - name: Sanitizers (ASan + UBSan)
+        run: make sanitize
+
+      - name: Fuzz smoke (libFuzzer — decoder + receive path)
+        # Bounded smoke run to catch regressions; lengthen FUZZ_SECONDS or point
+        # a corpus directory at the harness for a real campaign.
+        run: make fuzz FUZZ_SECONDS=60
+
+      - name: Structural coverage — 100% line + decision + MC/DC (all configs)
+        # -fcondition-coverage (MC/DC) requires GCC >= 14, so build and measure
+        # with the gcc-14 toolchain (gcov-14 must match the compiler).
+        run: make coverage-configs CC=gcc-14 GCOV=gcov-14
+
+      - name: MISRA C:2012 (cppcheck addon)
+        run: make misra
+
+      - name: Doxygen HTML (warnings are errors)
+        run: make docs
+
+      - name: Upload Doxygen HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: doxygen-html
+          path: doc/html

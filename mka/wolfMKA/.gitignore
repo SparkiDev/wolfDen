@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.a
+*.d
+
+# Build directory (coverage objects, compile-flag stamp)
+build/
+
+# Coverage data
+*.gcno
+*.gcda
+*.gcov
+
+# Test / example binaries
+test/runtests
+test/runalloc
+test/runfault
+examples/mka_link
+
+# Generated Doxygen HTML
+doc/

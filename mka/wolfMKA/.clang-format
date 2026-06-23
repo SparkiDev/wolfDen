@@ -1,0 +1,79 @@
+# clang-format configuration for wolfMKA.
+#
+# Reproduces the wolfSSL house style as written in
+# wolfssl/wolfcrypt/src/sp_int.c. Every option below is anchored to an
+# observable convention in that file (and to wolfssl/.editorconfig).
+#
+# Apply with:  clang-format -i src/*.c include/wolfmka/**/*.h \
+#                            test/*.c examples/*.c src/autosar/*.c
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# --- Indentation (wolfssl/.editorconfig: indent_style=space, indent_size=4) ---
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4          # sp_init_multi(): wrapped params hang +4
+IndentWrappedFunctionNames: false
+
+# --- Line length (sp_int.c: no line exceeds 80) -----------------------------
+ColumnLimit: 80
+
+# --- Continuation style -----------------------------------------------------
+# sp_int.c wraps with a 4-space hanging indent, NOT aligned to the open paren:
+#     int sp_init_multi(sp_int* n1, ..., sp_int* n5,
+#         sp_int* n6)
+AlignAfterOpenBracket: DontAlign
+BinPackParameters: true             # fill the line, then wrap (not one-per-line)
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowAllArgumentsOnNextLine: false
+
+# --- Braces: function brace on its own line; control braces attached;
+#     else/catch on a new line (sp_int.c lines 5436, 14227, 14231) ----------
+BreakBeforeBraces: Stroustrup
+
+# --- Pointers/casts: `sp_int* a` ; `(sp_int_digit*)XMALLOC(` ----------------
+PointerAlignment: Left
+DerivePointerAlignment: false
+SpaceAfterCStyleCast: false
+
+# --- Spacing: `if (` spaced, function calls not ----------------------------
+SpaceBeforeParens: ControlStatements
+SpaceBeforeAssignmentOperators: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# --- switch/case (sp_int.c line 18331): labels indented; short cases inline -
+IndentCaseLabels: true
+AllowShortCaseLabelsOnASingleLine: true
+
+# --- Preprocessor: nested #if/#include indented with the hash --------------
+IndentPPDirectives: BeforeHash
+
+# --- Keep the source intentional: no collapsing of short constructs --------
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AlwaysBreakAfterReturnType: None
+
+# --- Includes & alignment: preserve author intent --------------------------
+SortIncludes: false
+# Declaration alignment is OFF: with it on, clang-format also aligns the names
+# of function parameters wrapped onto a continuation line (an unwanted look);
+# the one option governs both, so struct/local alignment is sacrificed to keep
+# wrapped parameter names un-aligned. #define values are still aligned (a
+# separate option that does not affect parameters); assignments are not.
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: AcrossComments
+AlignConsecutiveAssignments: None
+AlignEscapedNewlines: Right
+AlignTrailingComments: true
+ReflowComments: true                # wrap over-long comment prose to 80 too
+                                    # (leaves Doxygen @param/@brief lines intact)
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpacesBeforeTrailingComments: 1
+...
