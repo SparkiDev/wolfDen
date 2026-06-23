@@ -1,0 +1,31 @@
+# Cppcheck suppressions for documented MISRA C:2012 deviations (see MISRA.md).
+# Each entry is an approved deviation, not an unreviewed silence.
+
+# 15.5 single point of exit - guard-clause early returns (project-wide).
+misra-c2012-15.5
+# 8.7 external linkage in one TU - public API declared in headers.
+misra-c2012-8.7
+# 2.3 / 2.4 / 2.5 unused type / tag / macro - public API surface.
+misra-c2012-2.3
+misra-c2012-2.4
+misra-c2012-2.5
+# 20.7 macro parameter parenthesization - type-name / declarator contexts,
+# exempt by the rule's own amplification (tool over-reports).
+misra-c2012-20.7
+# 7.3 lowercase 'l' literal suffix - cppcheck 2.19.0's addon false-positives on
+# identifiers that merely *contain* 'l' (e.g. `pl`, `body_len`, `peer_list`);
+# the codebase uses uppercase literal suffixes only. Re-evaluate on a cppcheck
+# upgrade (see MISRA.md).
+misra-c2012-7.3
+# 21.15 memcpy between incompatible pointer types - big-endian build only. The
+# shared network-order serializers (w_be16/w_be32/w_be48, rd_be48 in
+# mka_bytes.h) copy a scalar's native bytes, which already equal wire order on a
+# big-endian host. Documented deviation (see MISRA.md); scoped to the header.
+misra-c2012-21.15:include/wolfmka/mka_bytes.h
+# 21.1 #define of a reserved name (true / false) - the pre-C99 <stdbool.h> shim
+# in mka_types.h defines bool/true/false exactly as the standard header would,
+# and only when <stdbool.h> is absent. NOT present in the compliant C99
+# configuration (where <stdbool.h> is included). Documented deviation (MISRA.md).
+misra-c2012-21.1:include/wolfmka/mka_types.h
+# Not a MISRA rule: noise from system headers we do not own.
+missingIncludeSystem

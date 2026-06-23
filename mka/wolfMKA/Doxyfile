@@ -1,0 +1,52 @@
+# Doxygen configuration for wolfMKA.
+# Generate HTML API documentation with:  make docs   (or: doxygen Doxyfile)
+
+PROJECT_NAME           = wolfMKA
+PROJECT_BRIEF          = "MACsec Key Agreement (IEEE Std 802.1X) over wolfSSL"
+OUTPUT_DIRECTORY       = doc
+CREATE_SUBDIRS         = NO
+
+# --- Inputs ---------------------------------------------------------------
+# The companion .md documents are listed so the cross-references in README.md
+# (COMPLIANCE.md, FMEA.md, ...) resolve into the generated manual.
+INPUT                  = include src README.md COMPLIANCE.md FMEA.md \
+                         SECURITY.md REQUIREMENTS.md MISRA.md \
+                         CHANGELOG.md FOOTPRINT.md
+FILE_PATTERNS          = *.c *.h *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+
+# --- C-oriented extraction ------------------------------------------------
+OPTIMIZE_OUTPUT_FOR_C  = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+SORT_MEMBER_DOCS       = NO
+
+# Expand the project's function-like and configuration macros so documented
+# definitions are not hidden behind the preprocessor.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+PREDEFINED             = WOLFMKA_NO_EAP=0 \
+                         WOLFMKA_NO_XPN=0 \
+                         WOLFMKA_NO_DELAY_PROTECT=0
+
+# --- Output ---------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+# --- Diagnostics ----------------------------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
