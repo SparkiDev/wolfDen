@@ -272,6 +272,24 @@ MkaStatus wm_Crypto_IcvVerify(MkaCmacCtx* cmac, const uint8_t* ick,
     size_t ick_len, const uint8_t* data, size_t data_len,
     const uint8_t icv[MKA_DEFAULT_ICV_LEN]);
 
+#ifdef WOLFMKA_ICV_L2_ADDR
+/* The L2 prefix is a fixed 14 octets: DA(6) || SA(6) || EAPOL EtherType(2). */
+#define MKA_ICV_L2_PREFIX_LEN 14U
+/**
+ * Compute/verify the MKPDU ICV over an L2 prefix (@p l2 = DA || SA || EAPOL
+ * EtherType, MKA_ICV_L2_PREFIX_LEN octets) then @p data. @p l2_len must equal
+ * MKA_ICV_L2_PREFIX_LEN. Matches wpa_supplicant's ICV input (IEEE Std
+ * 802.1X-2010, 11.11.3). Same return codes as wm_Crypto_IcvCompute/Verify.
+ */
+MkaStatus wm_Crypto_IcvComputeL2(MkaCmacCtx* cmac, const uint8_t* ick,
+    size_t ick_len, const uint8_t* l2, size_t l2_len, const uint8_t* data,
+    size_t data_len, uint8_t icv[MKA_DEFAULT_ICV_LEN]);
+
+MkaStatus wm_Crypto_IcvVerifyL2(MkaCmacCtx* cmac, const uint8_t* ick,
+    size_t ick_len, const uint8_t* l2, size_t l2_len, const uint8_t* data,
+    size_t data_len, const uint8_t icv[MKA_DEFAULT_ICV_LEN]);
+#endif /* WOLFMKA_ICV_L2_ADDR */
+
 /**
  * Acquire and seed one RNG object from the pool so that later random/SAK
  * generation reuses it instead of seeding a fresh RNG on every call (seeding is
