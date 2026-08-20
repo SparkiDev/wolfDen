@@ -191,10 +191,31 @@ extern "C" {
  * use EAP-MSK derivation, so EAP is compiled out. The retry back-off
  * (CP_SWS_Mka_00012), Announcements (CP_SWS_Mka_00009), XPN and delay
  * protection all stay in - each is configurable through Mka_PaeConfigType.
+ *
+ * WOLFMKA_AUTOMOTIVE_PROFILE selects the feature set of the OPEN Alliance TC17
+ * Automotive MKA profile (see OPEN-ALLIANCE.md for the requirement-by-
+ * requirement map). The profile is built on IEEE Std 802.1X-2020, so version 3
+ * MKPDUs are emitted, and it removes Secure Announcements and cipher-suite
+ * negotiation. The remaining profile behaviour is runtime configuration -
+ * wm_Participant_AutomotiveDefaults() fills a MkaParticipantConfig with the
+ * recommended values.
  */
 #ifdef WOLFMKA_AUTOSAR
     #ifndef WOLFMKA_NO_EAP
         #define WOLFMKA_NO_EAP
+    #endif
+#endif
+
+#ifdef WOLFMKA_AUTOMOTIVE_PROFILE
+    /* Automotive MKA removes Secure Announcements and cipher-suite negotiation
+     * (they are an unnecessary attack surface on a statically designed
+     * in-vehicle network). */
+    #ifndef WOLFMKA_NO_ANNOUNCEMENTS
+        #define WOLFMKA_NO_ANNOUNCEMENTS
+    #endif
+    /* Automotive MKA uses version 3 MKPDUs or above. */
+    #ifndef WOLFMKA_MKA_VERSION
+        #define WOLFMKA_MKA_VERSION 3U
     #endif
 #endif
 
@@ -280,11 +301,22 @@ WOLFMKA_LITTLE_ENDIAN or WOLFMKA_BIG_ENDIAN"
 
 /* Protocol version for 802.1X-2010 */
 #define EAPOL_VERSION_2010 3U
+/* MKA protocol version announced in the Basic Parameter Set (11.11.1): 1 for
+ * IEEE Std 802.1X-2010, 2 for 802.1Xbx-2014, 3 for 802.1X-2020. wolfMKA emits
+ * the 802.1X-2010 value by default, since that is the base the wire format is
+ * implemented to; the XPN and suspension parameter sets it also supports are
+ * later amendments, so a build may advertise 2 or 3 instead. Receive is
+ * unaffected either way - a peer's announced version is recorded and never used
+ * to reject a frame. WOLFMKA_AUTOMOTIVE_PROFILE selects 3, which the OPEN
+ * Alliance profile requires. */
+#ifndef WOLFMKA_MKA_VERSION
+    #define WOLFMKA_MKA_VERSION 1U
+#endif
 /* EAPOL-MKA packet type */
-#define EAPOL_TYPE_MKA     5U
+#define EAPOL_TYPE_MKA  5U
 /* version + type + body length(2) */
-#define EAPOL_HDR_LEN      4U
-#define EAPOL_ETHERTYPE    0x888EU
+#define EAPOL_HDR_LEN   4U
+#define EAPOL_ETHERTYPE 0x888EU
 
 /* PAE group destination address 01-80-C2-00-00-03 (used by transport). */
 #define MKA_PAE_GROUP_ADDR {0x01, 0x80, 0xC2, 0x00, 0x00, 0x03}

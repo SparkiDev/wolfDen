@@ -6,6 +6,86 @@ All notable changes to wolfMKA are documented here. The format follows
 exposed in code as `WOLFMKA_VERSION_MAJOR` / `_MINOR` / `_PATCH` /
 `_STRING` / `_HEX` (`include/wolfmka/mka_types.h`).
 
+## [Unreleased]
+
+### Added
+
+- **OPEN Alliance TC17 Automotive MKA profile** (`WOLFMKA_AUTOMOTIVE_PROFILE`,
+  opt-in) — emits version 3 MKPDUs and removes Secure Announcements and
+  cipher-suite negotiation, with `wm_Participant_AutomotiveDefaults()` supplying
+  the profile's startup timing. `make test-automotive` builds and runs the suite
+  under it, and it is one of the enforced `make coverage-configs`
+  configurations. [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) maps the profile
+  requirement by requirement, including the gaps that remain.
+- **Fast response to new information** — `MkaParticipantConfig.immediate_response`
+  (off by default, all builds). A change to the Potential or Live Peer List, a
+  newly installed SAK, or the transmit gate releasing is transmitted on the next
+  `wm_Participant_Run()` rather than at the next Hello Time — the `newInfo`
+  behaviour of IEEE Std 802.1X-2010 9.4. In the in-process two-party test this
+  brings MACsec up 3 ms into the exchange.
+- **Rekey when a peer loses the SAK** — a peer whose MACsec SAK Use goes
+  missing, turns up empty, or names a Key Number never issued has lost the key;
+  the Key Server now distributes a fresh one instead of leaving the peer
+  undecryptable (OPEN Alliance AutoMKA-03011). A peer still naming the Old key
+  mid-handover is not treated as a loss, and the trigger clears on rekey, so one
+  loss causes one rekey rather than one per MKPDU. Applies in every build, on
+  the same footing as the existing rekey when a live peer departs.
+- **Distribute before install** — `MkaParticipantConfig.distribute_before_install`
+  (off by default) puts a newly generated SAK on the wire before programming the
+  local SecY, so a peer behind a slow data plane starts installing at the same
+  moment rather than after (AutoMKA-03010). Programming waits only until the
+  send succeeds, so a key is never installed that no peer has been told about.
+  `wm_Participant_AutomotiveDefaults()` enables it. Only the Key Server defers:
+  a member has nothing to distribute early, and one that held its data plane
+  back would stop reporting itself as receiving, which the Key Server reads as a
+  lost key. While programming is outstanding the MACsec SAK Use withholds the
+  receive claim, so no peer sends protected frames the data plane cannot yet
+  decrypt.
+- **Key Server priority extremes** (automotive profile) — priority 255 now means
+  *never* Key Server and 0 means *always*, rather than merely the least and most
+  preferred values (OPEN Alliance AutoMKA-03007). Two participants both set to
+  255 discover each other but neither serves. Honoured only under
+  `WOLFMKA_AUTOMOTIVE_PROFILE`; elsewhere 255 remains an ordinary low preference
+  and `key_server_capable` is how a participant declines the role.
+- **Message Number recency window** — liveness now requires a peer to echo a
+  Message Number this participant actually emitted recently, not just its
+  Member Identifier (IEEE Std 802.1X-2010 9.4.3; OPEN Alliance AutoMKA-03005).
+  The depth is `MKA_MN_RECENT_WINDOW`, default 3. An MKPDU that reports us live
+  on a stale number is discarded without refreshing the peer's Life timer
+  (AutoMKA-04004), so a peer looping stale information cannot hold an
+  association open.
+- **MACsec statistics** — `MkaSecyOps.get_secy_stats` / `get_tx_sc_stats` /
+  `get_rx_sc_stats` (all optional) and the `wm_Participant_GetSecyStats()`,
+  `GetTxScStats()` and `GetRxScStats()` accessors return the 802.1AE SecY,
+  TxSC and RxSC counter groups (AutoMKA-07009). The counters remain the SecY's;
+  wolfMKA routes to them and keeps none of its own.
+- **PAE status** — `wm_Participant_GetPaeStatus()` returns `MkaPaeStatus`: the
+  state, the peer's SCI, the CKN in use and the cipher suite in force
+  (AutoMKA-07008).
+- **Connectivity Association quiescing** — `wm_Kay_SetQuiesceOthers()` (opt-in)
+  holds the other participants on a port silent while one has MACsec up, and
+  releases them when it drops (AutoMKA-09001 / AutoMKA-09002).
+- **Peer-reset recovery** — a peer that returns with the same SCI but a fresh
+  Member Identifier is admitted alongside its previous entry, and the stale one
+  is retired as soon as the new MI proves liveness rather than being left to
+  expire at the Life Time (OPEN Alliance AutoMKA-03006). Retiring on liveness,
+  not on first sight, means a forged or replayed MI cannot evict a working peer.
+- **Build-selectable announced MKA version** — `WOLFMKA_MKA_VERSION` (default 1,
+  as before; the automotive profile selects 3). Receive is unchanged: a peer's
+  announced version has never been used to reject a frame.
+
+### Changed
+
+- **A participant configured `macsec_desired = false` no longer programs the
+  data plane.** It previously declined only the Key Server role, but still
+  installed a SAK distributed to it — creating the Secure Channels and
+  programming the SAs it was configured not to have. It now declines the key as
+  well, so no SecY call is made at all while MKA itself keeps running (OPEN
+  Alliance AutoMKA-12002). A deployment that relied on the old behaviour was
+  asking for MACsec; set `macsec_desired = true`.
+- `MKA_MKA_VERSION_ID` (a private constant in `mka_kay.c`) is replaced by the
+  public, overridable `WOLFMKA_MKA_VERSION`.
+
 ## [1.0.0] - 2026-06-23
 
 First release. MACsec Key Agreement (IEEE Std 802.1X-2010, Clause 9) over
@@ -36,7 +116,7 @@ wolfSSL.
 
 ### Verification
 
-- 728 unit checks, fault-injection and negotiation suites, and the AUTOSAR
+- 978 unit checks, fault-injection and negotiation suites, and the AUTOSAR
   binding test; 100% line + decision + MC/DC structural coverage across the
   delivered configurations.
 - MISRA C:2012 conformance (cppcheck addon, documented deviations), valgrind,

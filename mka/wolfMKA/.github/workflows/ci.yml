@@ -93,6 +93,9 @@ jobs:
           make test-kmd
           make test-suspension
 
+      - name: OPEN Alliance TC17 Automotive MKA profile
+        run: make test-automotive
+
       - name: Redefinable allocator test
         run: make test-alloc
 

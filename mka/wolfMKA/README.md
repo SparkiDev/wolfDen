@@ -44,6 +44,16 @@ elects a *Key Server*, and securely distributes the *Secure Association Keys
 | Distributed CAK (group-CAK distribution) | §9.x / §11.11 (type 5) | ✅ (opt-in) |
 | Key Management Domain advertisement | §11.11 (type 6) | ✅ (opt-in) |
 | MKA participant suspension | 802.1Xbx-2014 | ✅ (opt-in, XPN) |
+| Fast startup: peer-list change answered at once | §9.4 (`newInfo`) | ✅ (opt-in) |
+| Peer-reset recovery (same SCI, new MI) | OA AutoMKA-03006 | ✅ |
+| Liveness requires an acceptably recent echoed MN | §9.4.3 / OA AutoMKA-03005, -04004 | ✅ |
+| SecY MACsec statistics + PAE status accessors | OA AutoMKA-07008, -07009 | ✅ |
+| Losing CAs quiesce once one establishes MACsec | OA AutoMKA-09001, -09002 | ✅ (opt-in) |
+| Key Server priority 255 = never, 0 = always | OA AutoMKA-03007 | ✅ (profile) |
+| MACsec-disabled mode: MKA runs, data plane untouched | OA AutoMKA-12002 | ✅ |
+| Rekey when a peer stops reporting the SAK | OA AutoMKA-03011 | ✅ |
+| Distribute a new SAK before installing it locally | OA AutoMKA-03010 | ✅ (opt-in) |
+| OPEN Alliance TC17 Automotive MKA profile | OA Automotive MKA v1.0 | ✅ (opt-in — see [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md)) |
 
 All cryptography is performed by wolfSSL: `wc_AesCmacGenerate_ex` (KDF/ICV),
 `wc_AesKeyWrap`/`wc_AesKeyUnWrap` (SAK distribution), and `wc_RNG_*`
@@ -117,6 +127,7 @@ Some features are **opt-in** (off by default, so the default build is unchanged)
 |--------|------|
 | `WOLFMKA_DISTRIBUTED_CAK` | Distributed CAK parameter set (type 5): the `wm_Participant_DistributeCak` Key-Server API, plus a `cak_received` event by which a member reports the unwrapped group CAK to the integrator. `make test-distcak` builds and tests with it enabled. |
 | `WOLFMKA_KMD` | Key Management Domain parameter set (type 6): a configured `kmd` the Key Server advertises, and a `wm_Participant_GetKmd` accessor by which a member reads the received domain name. Informational only (authenticated by the MKPDU ICV; no extra crypto). `make test-kmd` builds and tests with it enabled. |
+| `WOLFMKA_AUTOMOTIVE_PROFILE` | The OPEN Alliance TC17 **Automotive MKA** profile: version 3 MKPDUs and no Secure Announcements / cipher-suite negotiation, plus `wm_Participant_AutomotiveDefaults()` for the profile's startup timing (10 ms → Hello Time ramp and immediate response to a peer-list change). `make test-automotive` builds and tests with it enabled; [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) is the requirement-by-requirement map, including the known gaps. |
 | `WOLFMKA_SUSPENSION` | MKA participant suspension (802.1Xbx-2014): `wm_Participant_Suspend(p, seconds)` / `wm_Participant_Resume(p)`. A suspended participant advertises a suspension time (in the XPN set's MKA Suspension Time field) and goes quiet; peers hold its state past the Life Time so the SAK survives the gap. **Requires XPN** (must not be combined with `WOLFMKA_NO_XPN`). `make test-suspension` builds and tests with it enabled. |
 | `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces offset 0, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, signalled to the SecY as `MKA_CONF_OFFSET_NONE`. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
 
@@ -140,6 +151,25 @@ implies `WOLFMKA_NO_EAP`. The retry back-off, Announcements, XPN and delay
 protection all stay in — each is configurable through `Mka_PaeConfigType`
 (`RetryBaseMs`/`RetryCyclicMs`, `AnnounceCipherSuites`, `CipherSuite`,
 `DelayProtect`). `make autosar` builds and tests with this profile.
+
+**`WOLFMKA_AUTOMOTIVE_PROFILE`.** The OPEN Alliance TC17 *Automotive MKA
+Specification* v1.0 profiles 802.1X-2020 MKA for in-vehicle Ethernet: version 3
+MKPDUs, no Secure Announcements or cipher-suite negotiation, and a startup
+budget of tens of milliseconds instead of seconds. The macro selects the
+compile-time half; `wm_Participant_AutomotiveDefaults()` fills a config with the
+runtime half — the 10 ms → Hello Time ramp and `immediate_response`, which
+answers a peer-list change, a newly installed SAK or the transmit gate opening
+on the next `wm_Participant_Run()` instead of waiting out the interval
+(the `newInfo` behaviour of 802.1X 9.4). In the in-process two-party test
+MACsec is transmitting at both ends **3 ms** into the exchange.
+`make test-automotive` builds and tests with the profile;
+[`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) maps all 65 of the specification's
+requirements to an implementation, a configuration item, or the integrator —
+with no gaps outstanding. wolfMKA is not certified to the profile and has
+not been through an OPEN Alliance plugfest.
+
+`immediate_response` is a plain configuration field, available in every build —
+the profile macro is not needed to use it.
 
 ### Out of scope
 
@@ -264,7 +294,7 @@ agree.
 
 ## Tests
 
-`make test` runs 728 checks across three layers:
+`make test` runs 978 checks across three layers:
 
 - **crypto** — anchored to published vectors: **RFC 4493** (AES-CMAC) and
   **RFC 3394** (AES Key Wrap), plus KDF determinism, SAK wrap/unwrap roundtrip
@@ -292,7 +322,7 @@ both outcomes of every branch are taken, and every operand of each compound
 `&&`/`||` condition is shown to independently affect the result. Run `make
 coverage` to reproduce the figures (gcov `--conditions`, built at `-O0` with
 `-DWOLFMKA_FAULT_INJECT`); the target **fails** below 100% on any of the three
-metrics. `make coverage-configs` re-runs the same enforced check across all nine
+metrics. `make coverage-configs` re-runs the same enforced check across all ten
 delivered configurations (cert base, cipher negotiation, small-stack/no-malloc,
 and the `NO_*` feature-off builds). MC/DC is the masking variant accepted by
 DO-178C, measured with GCC's `-fcondition-coverage`. Every public function is
@@ -354,7 +384,9 @@ integrator must supply — is stated in [`COMPLIANCE.md`](COMPLIANCE.md), backed
 by a component [`FMEA.md`](FMEA.md), a vulnerability-handling process
 ([`SECURITY.md`](SECURITY.md)), the requirements/traceability matrix
 ([`REQUIREMENTS.md`](REQUIREMENTS.md)), and the MISRA conformance record
-([`MISRA.md`](MISRA.md)).
+([`MISRA.md`](MISRA.md)). The two industry-profile maps are
+[`AUTOSAR.md`](AUTOSAR.md) (AUTOSAR Classic `Mka`) and
+[`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) (OPEN Alliance TC17 Automotive MKA).
 
 ## Small-stack / no-malloc / embedded builds
 
@@ -489,6 +521,29 @@ wm_Crypto_DeriveCknFromMsk(cfg.cmac, msk, msk_len, eap_session_id, sid_len,
                         mac_lo, mac_hi, cfg.cak.ckn, ckn_len);
 cfg.cak.cak_len = 16; cfg.cak.ckn_len = ckn_len;
 ```
+
+**Faster establishment.** By default a participant transmits on its periodic
+cadence, so each step of discovery, election and the SAK Use handshake waits a
+Hello Time. Setting `cfg.immediate_response = 1` makes it transmit as soon as it
+has something new to report — a peer entering the Potential list or becoming
+live, a SAK installed, or the transmit gate releasing (the `newInfo` behaviour
+of 802.1X §9.4). Combined with the retry ramp it takes establishment from
+several Hello Times to a few milliseconds of protocol time:
+
+```c
+/* the OPEN Alliance TC17 automotive timing, on any build */
+wm_Participant_AutomotiveDefaults(&cfg);  /* immediate_response + 10 ms ramp */
+wm_Participant_Init(&p, &cfg);
+```
+
+**Key loss and recovery.** A peer whose MACsec SAK Use stops reporting the key
+has lost it — its data plane restarted, typically — and nothing in the protocol
+brings it back on its own. The Key Server notices and distributes a fresh SAK
+(one rekey per loss, not one per MKPDU). Setting `cfg.distribute_before_install`
+additionally has the Key Server put a new SAK on the wire *before* programming
+its own SecY, so a peer behind a slow data plane starts installing at the same
+moment; while that programming is outstanding the participant withholds its
+receive claim, so no peer sends protected frames it could not yet decrypt.
 
 **Rekeying.** When the SecY reports the transmit packet number nearing
 exhaustion (or on a policy timer), the Key Server calls

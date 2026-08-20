@@ -88,6 +88,20 @@ build/quality targets. "Review" denotes a property established by inspection.
 | MKA-REQ-064 | MISRA C:2012 conformance + deviation record | all sources, `MISRA.md` | `make misra` |
 | MKA-REQ-065 | All public entry points validate arguments | all public functions | `test_crypto_invalid_params`, `test_pdu_invalid_params`, `test_kay_errors`/`test_kay_negative`, AUTOSAR `phase_args` — every public function's invalid-argument positions, each covered once |
 | MKA-REQ-066 | Interoperable with hostapd/wpa_supplicant | crypto + wire format | `test_eap_derivation` (EAP-path key hierarchy + ICV pinned byte-for-byte to hostapd output), `test_rfc4493_cmac`, `test_rfc3394_keywrap`, `test_roundtrip_*` |
+| MKA-REQ-068 | MKA version announced in the Basic Parameter Set is build-selectable (1 / 2 / 3) | `WOLFMKA_MKA_VERSION` (`mka_types.h`), `mka_build_fill` | `test_mka_version_announced` |
+| MKA-REQ-069 | A peer-list change, SAK install or transmit-gate release is answerable on the next run rather than at the Hello Time (802.1X 9.4 `newInfo`) | `MkaParticipant.new_info`, `cfg.immediate_response`, `wm_Participant_Run` | `test_immediate_response` |
+| MKA-REQ-071 | A reset peer (same SCI, new MI) is admitted alongside its stale entry, which is retired only once the new MI proves liveness | `mka_retire_stale_mi` (`mka_kay.c`) | `test_peer_reset_new_mi` |
+| MKA-REQ-072 | Liveness requires an acceptably recent echoed Message Number, not the MI alone | `mka_mn_recent`, `mka_list_echo` (`MKA_MN_RECENT_WINDOW`) | `test_mn_recency_window` |
+| MKA-REQ-073 | An MKPDU reporting us live on a stale Message Number is discarded without refreshing the peer's Life timer | `mka_stale_live_echo` | `test_mn_recency_window` |
+| MKA-REQ-074 | SecY MACsec statistics are readable through the participant | `wm_Participant_GetSecyStats` / `GetTxScStats` / `GetRxScStats`, `MkaSecyOps.get_*_stats` | `test_macsec_statistics` |
+| MKA-REQ-075 | Participant status is summarised for a management interface | `wm_Participant_GetPaeStatus` (`MkaPaeStatus`) | `test_pae_status` |
+| MKA-REQ-076 | Losing Connectivity Associations stop transmitting once one establishes MACsec, and resume when it drops | `wm_Kay_SetQuiesceOthers`, `mka_kay_apply_quiesce` | `test_kay_quiesce_others` |
+| MKA-REQ-077 | Under the automotive profile, Key Server priority 255 means never Key Server and 0 means always | `mka_elect_dynamic` (`MKA_PRIORITY_NEVER_KS` / `_ALWAYS_KS`) | `test_ks_priority_extremes` |
+| MKA-REQ-078 | A participant that does not desire MACsec programs no data plane: it declines a distributed SAK | `mka_dist_sak_skip` | `test_kay_macsec_undesired` |
+| MKA-REQ-079 | The Key Server rekeys when a peer that was using the SAK stops reporting it | `mka_note_sak_use`, `mka_sak_use_reports_ours` | `test_rekey_on_lost_sak_use` |
+| MKA-REQ-080 | A new SAK may be distributed before the local SecY is programmed, so both ends install together | `distribute_before_install`, `mka_program_sak` | `test_distribute_before_install`, `test_deferred_install_send_failure` |
+| MKA-REQ-081 | A participant never reports receiving on a key its SecY does not yet hold | `mka_build_sak_use` (gated on `sak_program_pending`) | `test_deferred_install_send_failure` |
+| MKA-REQ-070 | OPEN Alliance TC17 Automotive MKA profile: compile-time feature set and startup-timing defaults | `WOLFMKA_AUTOMOTIVE_PROFILE`, `wm_Participant_AutomotiveDefaults` | `test_automotive_defaults`, `test_automotive_fast_startup`, `make test-automotive` |
 | MKA-REQ-067 | No memory leaks / no undefined behaviour | all | valgrind on `runtests` (all configs); ASan+UBSan-clean (`make sanitize`) across the delivered configurations; GCC `-fanalyzer` clean (`make analyze`); libFuzzer smoke pass on the decoder and receive path (`make fuzz`) |
 
 ## Coverage of the verification suite
@@ -97,7 +111,13 @@ pinned to RFC and hostapd-derived vectors in the suite — see *Interoperability
 in the README). The opt-in cipher/capability negotiation requirements
 MKA-REQ-057..058 are exercised by `make test-negotiation`. `make features`, `make test-alloc`,
 `make test-nomalloc`, `make misra` and a valgrind run cover MKA-REQ-060..064 and
-067. With the
+067. MKA-REQ-068..081 (the announced MKA version, the `newInfo` fast response,
+the OPEN Alliance Automotive profile, peer-reset recovery, the Message Number
+recency window, the MACsec-statistics and PAE-status accessors, and CA
+quiescing) are exercised by `make test` in every
+configuration and additionally by `make test-automotive`; see
+[`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) for the profile's requirement-by-
+requirement map and its known gaps. With the
 fault-injection build, `make coverage` **enforces** (fails below) 100% line,
 100% decision (branch) **and** 100% **MC/DC** coverage of the core sources
 (`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`). MC/DC is the masking variant accepted
