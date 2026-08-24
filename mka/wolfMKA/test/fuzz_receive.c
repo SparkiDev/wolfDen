@@ -46,6 +46,10 @@
 #include "wolfmka/mka_types.h"
 
 static MkaCmacCtx* g_cmac;
+/* One seeded RNG for the whole campaign: without it every MI and SAK draw
+ * seeds a throwaway generator, which dominates the run time and starves the
+ * fuzzer of executions. */
+static MkaRandom* g_rng;
 static uint8_t g_ick[MKA_MAX_CAK_LEN];
 static size_t g_ick_len;
 static MkaCakPair g_cak;
@@ -100,6 +104,9 @@ int LLVMFuzzerInitialize(int* argc, char*** argv)
     (void)argc;
     (void)argv;
     g_cmac = wm_Crypto_CmacInit();
+    if (g_rng == NULL) {
+        g_rng = wm_Crypto_RandomInit();
+    }
     if (g_cmac == NULL) {
         return 0;
     }
@@ -138,10 +145,30 @@ static size_t forge(const uint8_t* body, size_t body_n, uint8_t* out,
         memcpy(&out[EAPOL_HDR_LEN], body, body_n);
     }
     covered = EAPOL_HDR_LEN + body_n;
+    /* Seal exactly what the library verifies. Under WOLFMKA_ICV_L2_ADDR that
+     * includes the L2 prefix derived from the frame; sealing without it would
+     * make every frame fail the ICV and the fuzzer would never reach the state
+     * machine it is aimed at. */
+#ifdef WOLFMKA_ICV_L2_ADDR
+    {
+        static const uint8_t pae_group[6] = MKA_PAE_GROUP_ADDR;
+        uint8_t l2[MKA_ICV_L2_PREFIX_LEN];
+
+        memcpy(&l2[0], pae_group, sizeof pae_group);
+        memcpy(&l2[6], &out[EAPOL_HDR_LEN + 4U], 6);
+        l2[12] = (uint8_t)(EAPOL_ETHERTYPE >> 8);
+        l2[13] = (uint8_t)(EAPOL_ETHERTYPE & 0xFFU);
+        if (wm_Crypto_IcvComputeL2(g_cmac, g_ick, g_ick_len, l2, sizeof l2, out,
+                covered, icv) != MKA_OK) {
+            return 0;
+        }
+    }
+#else
     if (wm_Crypto_IcvCompute(g_cmac, g_ick, g_ick_len, out, covered, icv) !=
         MKA_OK) {
         return 0;
     }
+#endif
     memcpy(&out[covered], icv, MKA_DEFAULT_ICV_LEN);
     return covered + MKA_DEFAULT_ICV_LEN;
 }
@@ -162,6 +189,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     memset(&cfg, 0, sizeof cfg);
     cfg.cak = g_cak;
     cfg.cmac = g_cmac;
+    cfg.rng = g_rng;
     memcpy(cfg.sci, sci, sizeof sci);
     cfg.priority = 10;
     cfg.macsec_desired = 1;

@@ -37,7 +37,7 @@ The mapping:
 | `Mka_SetCknStatus` / `Mka_StartPae` | `wm_Kay_AddParticipant` |
 | `Mka_MainFunction` | `wm_Kay_Run` for every enabled, started, linked PAE |
 | `Mka_RxIndication` | `wm_Kay_Receive` (routed by `RxPduId`) |
-| `Mka_GetPaeStatus` | derived from `wm_Participant_HasSak` / live-peer count |
+| `Mka_GetPaeStatus` | `wm_Participant_GetPaeStatus`, translated (see below) |
 | `Mka_LinkStateChange` / `Mka_SetEnable` | gate `Mka_MainFunction` |
 
 Functions implemented — §8.3: `Mka_Init`, `Mka_GetVersionInfo`,
@@ -61,10 +61,14 @@ The integrator supplies, via the config structs, the lower-layer transmit
 `Mka_Std.h` is a small shim providing AUTOSAR base types (`Std_ReturnType`,
 `PduInfoType`, ...) for standalone builds; in a real stack the platform headers
 provide these (define `MKA_NO_STD_SHIM`). `MacSec` statistics counters live in
-the SecY, so `Mka_GetMacSecStatistics` returns the integrator-tracked values
-(zero in the standalone binding). The binding uses AUTOSAR naming conventions
+the SecY, so `Mka_GetMacSecStatistics` reads them back through
+`wm_Participant_GetSecyStats`, saturating each 64-bit counter into the 32-bit
+AUTOSAR field; a PAE whose data plane exposes no counters reports zeros. The binding uses AUTOSAR naming conventions
 and so is built separately from the MISRA-checked core (`make autosar`, not part
-of `make misra`).
+of `make misra`). That applies to the module's *API surface*: the file's own
+file-static helpers take the project's `mka_*` prefix like every other static
+in `src/`, so a reader can tell `mka_add_ckn` (internal) from `Mka_StartPae`
+(exported SWS API) by name alone.
 
 Reference: AUTOSAR CP R24-11, `AUTOSAR_CP_SWS_MACsecKeyAgreement.pdf`.
 Requirement IDs below are the `CP_SWS_Mka_*` items of that document.
@@ -147,6 +151,16 @@ Secure Channel:
   controlled port for unprotected traffic. Establishing MACsec, or the PAE going
   inactive, clears it.
 
+Permissive mode answers "MKA could not establish a Secure Channel with the
+peer". It deliberately does *not* answer "this ECU's own configuration is
+broken": a PAE whose every CKN failed to instantiate has no CA to run, so
+`Mka_StartPae` leaves it unstarted and it never becomes active for the timeout.
+Opening the controlled port on a configuration fault would be the wrong failure
+direction, and it is the same reasoning that makes a `PermissiveTimeoutMs` of
+zero fail closed rather than run plaintext from the first tick. The enable flags
+are untouched, so `Mka_StartPae` can simply be called again once the
+configuration is fixed.
+
 As with the SecY data plane and the transport, the binding only *decides and
 reports* the permissive state; physically opening the controlled port in
 plaintext is the integrator's action behind that abstracted seam.
@@ -162,3 +176,167 @@ wires it into the platform:
 - Configuration generation (PAEs, roles, CAK/CKN, timers) — the binding consumes
   plain `Mka_ConfigType` structs; an ECU-configuration generator producing them
   is out of scope.
+- `Det`, if development-error reporting is wanted: set `MKA_DEV_ERROR_DETECT` to
+  `STD_ON` and put your `Det.h` on the include path. Optional — the default is
+  `STD_OFF` and the binding links without one.
+
+## Status reporting is the KaY's ladder, translated
+
+`Mka_GetPaeStatus` does not compute the PAE state itself. It reads
+`wm_Participant_GetPaeStatus` for each of the PAE's CAs, translates the
+`MkaPaeState` into `Mka_MkaStatusType`, and reports the most advanced state any
+CA reached — so there is one state machine, not two. Link state and the enable
+flag are the binding's own, and are applied first: a disabled PAE reports
+`MKA_STATUS_UNDEFINED` and one without link `MKA_STATUS_WAITING_PEER_LINK`,
+neither of which the KaY has a view of.
+
+`Mka_GetCknStatus` follows the same rule. `Mka_SetCknStatus`'s enable flag is
+the integrator's *request*, and both it and `Mka_StartPae` leave it set when the
+instantiation fails so that a later call can retry — so on a started PAE the
+status is read from the KaY (`wm_Kay_Find`) rather than off the flag, and a CKN
+whose participant never came up reads back `FALSE`. Before the PAE is started
+there is nothing in the KaY to read, and the flag is reported as configured.
+
+Two consequences worth stating, because both are narrower than a reading of the
+enumeration names might suggest:
+
+- **`MKA_STATUS_MACSEC_RUNNING` means protection is transmitting**, not that a
+  SAK has been agreed. A key whose transmit SA is still being installed — the
+  asynchronous SecY case, where `install_tx_sa` returns `MKA_SECY_PENDING` and
+  completion arrives via `Mka_MacSecAddTxSaNotification` — reports
+  `MKA_STATUS_IN_PROGRESS`. An integrator that opened the controlled port on
+  MACSEC_RUNNING would otherwise send unprotected frames. It *does* stay set
+  across a make-before-break rekey, where the demoted Old key carries traffic
+  while the new one is gated.
+- **`MKA_STATUS_AUTH_FAIL_UNKNOWN_PEER` means no MKPDU has ever
+  authenticated** on that CA, which is the CAK/CKN-mismatch case. It is not
+  cleared by `Mka_LinkStateChange` — a link transition does not change which CAK
+  the far end holds — and it is not reported for an isolated ICV failure on an
+  association that has been working.
+
+## MISRA and structural coverage of the binding
+
+`src/autosar/Mka.c` is checked by `make misra` in two configurations of its own
+(`WOLFMKA_AUTOSAR`, with `MKA_DEV_ERROR_DETECT` off and on). It is not part of
+`$(SRC)`, so it needs a separate invocation - without one it sat outside the
+gate that the project says covers `src/`.
+
+AUTOSAR's `boolean` is a `uint8` typedef rather than C99's `bool`, so MISRA's
+essential type model reads `if (someBoolean)` as an integer controlling
+expression (14.4) and `(boolean)(a != b)` as a cast to the wrong essential type
+(10.5). The file avoids both without changing behaviour: controlling
+expressions compare explicitly against `FALSE`, and boolean assignments use
+`? TRUE : FALSE` instead of a cast - which is idiomatic AUTOSAR style anyway.
+One deviation remains, recorded in [`MISRA.md`](MISRA.md): `mka_send_bridge`
+recovers its PAE from the opaque `void*` context `MkaSendFn` carries (11.5),
+which a generic callback hook cannot express any other way.
+
+## Structural coverage of the binding
+
+`src/autosar/Mka.c` is not part of `make coverage-configs`: it needs
+`-DWOLFMKA_AUTOSAR` (which implies `WOLFMKA_NO_EAP` and changes struct layout)
+and its own suite. It has its own gate instead — **`make coverage-autosar`**,
+held to the same bar as the core sources: **100% line, 100% decision and 100%
+MC/DC**, enforced (the target fails below), measured with GCC's
+`-fcondition-coverage`. It runs twice, once in each `MKA_DEV_ERROR_DETECT`
+setting, since the reporting adds branches of its own; both are in CI alongside
+`coverage-configs`.
+
+Reaching it needed the failure paths a happy-path suite never touches: an
+undersized `WOLFMKA_CMAC_POOL_SIZE` or `WOLFMKA_RANDOM_POOL_SIZE` at init (both
+must run before any successful `Mka_Init`, since each workspace is acquired once
+and never released; the CMAC case is checked and refused before the RNG is even
+requested, so a refusal never leaves a pool object claimed by a module that
+never came up),
+a `PaeCount` with a NULL `Paes`, a PAE declaring CKNs with no array, a zero
+`PermissiveTimeoutMs` under `MKA_PERMISSIVE_MODE_TIMEOUT`, and
+`Mka_GetMacSecStatistics` both with and without a `get_secy_stats` hook behind
+it. One branch was removed rather than covered: `mka_active_status` used to test
+`wm_Participant_GetPaeStatus`'s return, which fails only on a NULL argument and
+so could never be false there — the status is now seeded to `MKA_PAE_UNDEFINED`
+and the call's result used directly.
+
+## Development-error reporting (§7)
+
+The module reports development errors to Det, guarded by the usual
+configuration switch:
+
+```c
+#define MKA_DEV_ERROR_DETECT STD_ON     /* default: STD_OFF */
+```
+
+**Detection does not depend on the switch.** Every condition below is checked,
+and rejected with `E_NOT_OK`, in both settings — the switch only controls
+whether the rejection is also *reported*. Turning it off cannot change what the
+module does, only what a developer is told about it. With it off the reporting
+compiles away to nothing and the binding links with no Det present, which is why
+`STD_OFF` is the default: wolfMKA ships a hand-written binding that must build
+outside a generated BSW stack.
+
+### Errors
+
+| Error | ID | Raised when |
+|---|---|---|
+| `MKA_E_UNINIT` | 0x01 | an API is called before `Mka_Init`, or after it refused a configuration |
+| `MKA_E_PARAM_POINTER` | 0x02 | a required pointer argument is NULL — including a `PaeCount` with a NULL `Paes` |
+| `MKA_E_INVALID_PAE_IDX` | 0x03 | `MkaPaeIdx` is outside `0 .. PaeCount-1` |
+| `MKA_E_INIT_FAILED` | 0x04 | `Mka_Init` refused the configuration (zero `MainFunctionPeriodMs`, or no CMAC workspace free) |
+| `MKA_E_PARAM_INVALID` | 0x05 | a parameter is outside its permitted range or enumeration |
+| `MKA_E_KAY_RUN_FAILED` | 0x80 | **vendor-specific**: a Connectivity Association failed inside `Mka_MainFunction` |
+
+Every API has a service ID (`MKA_SID_*`), so a report says both *what was
+called* and *what was wrong with it* — "uninitialised", "bad PAE index" and
+"NULL pointer" are three different mistakes with three different fixes, and the
+previous code returned the same `E_NOT_OK` for all of them.
+
+The numeric values follow the conventional AUTOSAR numbering, and every one is
+`#ifndef`-guarded so an integration can align them with the exact SWS revision
+or Det configuration it builds against. `MKA_VENDOR_ID`, `MKA_MODULE_ID` and
+`MKA_INSTANCE_ID` are overridable for the same reason — Det uses them to
+attribute the report.
+
+### Two deliberate departures
+
+- **`Mka_MainFunction` reports `MKA_E_UNINIT` once per uninitialised period,
+  not once per call.** A BSW scheduler calls main functions cyclically and
+  unconditionally, and the module can stay uninitialised indefinitely — before
+  the ECU has run `Mka_Init`, or after `Mka_Init` refused a configuration, which
+  leaves it down for good. Reporting on every call would be one message per
+  tick, forever, at whatever rate the task is configured for; the first one
+  already says everything the rest would. It is still worth that one, because an
+  integration that schedules the main function but never calls `Mka_Init`, and
+  calls no other API, has nothing else to tell it so. A successful `Mka_Init`
+  re-arms the report, so a later refusal gets its own. Every other entry point
+  reports on every call, because those are called by application code that chose
+  the moment — there one report answers one mistake.
+- **`MKA_E_KAY_RUN_FAILED` is edge-triggered.** `Mka_MainFunction` used to
+  discard `wm_Kay_Run`'s status, so a per-CA failure — a crypto error during SAK
+  generation, say — vanished and the PAE simply sat at `WAITING_PEER`. It is now
+  reported, but only on the transition into failure: such a condition usually
+  persists, and one message per tick would bury the rest of the log. The
+  remaining PAEs are still stepped, so one CA's failure cannot stall the others.
+
+### Routing reports elsewhere
+
+With the switch on, `MKA_DET_REPORT_ERROR(sid, err)` defaults to
+`Det_ReportError(MKA_MODULE_ID, MKA_INSTANCE_ID, sid, err)` and pulls in
+`Det.h`. Define the macro yourself first — a project Det wrapper, a trace
+buffer, a test double — and `Det.h` is not included at all.
+
+### Verification
+
+`make test-det` runs the whole AUTOSAR suite with `MKA_DEV_ERROR_DETECT=STD_ON`
+against `test/Det.h`, a stand-in for the generated module, and asserts the exact
+`(service ID, error ID)` pair for each rejection. **All eighteen** service IDs
+are covered, not a sample: the thirteen APIs that take a PAE index are driven
+with an out-of-range one and checked for `MKA_E_INVALID_PAE_IDX` against their
+own ID, and the remaining five — `Mka_Init`, `Mka_GetVersionInfo`,
+`Mka_MainFunction`, `Mka_RxIndication`, `Mka_TxConfirmation` — have no index and
+are covered by their own conditions. The suite also asserts that a successful
+call reports nothing, and that the two edge-triggered reports (the main function
+running without a module, and a persistently failing CA) are made once and then
+not repeated. Because
+the stand-in has the AUTOSAR signature, what is exercised is the binding's real
+default wiring rather than an override that bypasses it. `make coverage-autosar`
+enforces 100% line, decision and MC/DC in **both** switch settings.
+

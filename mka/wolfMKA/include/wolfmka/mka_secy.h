@@ -65,32 +65,51 @@ extern "C" {
  * maintains these itself - the data plane owns them.
  */
 typedef struct {
+    /** transmitted without a SecTAG because protection was off */
     uint64_t out_pkts_untagged;
+    /** discarded on transmit: longer than the peer accepts */
     uint64_t out_pkts_too_long;
+    /** user-data octets integrity-protected but not encrypted */
     uint64_t out_octets_protected;
+    /** user-data octets encrypted as well as protected */
     uint64_t out_octets_encrypted;
+    /** received without a SecTAG and accepted (validation permissive) */
     uint64_t in_pkts_untagged;
+    /** received without a SecTAG and discarded (validation strict) */
     uint64_t in_pkts_no_tag;
+    /** discarded: the SecTAG itself was malformed */
     uint64_t in_pkts_bad_tag;
+    /** discarded: no Secure Association matched the SecTAG */
     uint64_t in_pkts_no_sa;
+    /** received for an unknown Secure Association and accepted */
     uint64_t in_pkts_no_sa_error;
+    /** discarded because the SecY validation rate limit was hit */
     uint64_t in_pkts_overrun;
+    /** user-data octets whose integrity was checked, not decrypted */
     uint64_t in_octets_validated;
+    /** user-data octets decrypted as well as validated */
     uint64_t in_octets_decrypted;
 } MkaSecyStats;
 
 /** Per-transmit-Secure-Channel statistics (802.1AE secyTxSCStatsEntry). */
 typedef struct {
+    /** transmitted with integrity protection only */
     uint64_t out_pkts_protected;
+    /** transmitted encrypted as well as protected */
     uint64_t out_pkts_encrypted;
 } MkaTxScStats;
 
 /** Per-receive-Secure-Channel statistics (802.1AE secyRxSCStatsEntry). */
 typedef struct {
+    /** received and validated successfully */
     uint64_t in_pkts_ok;
+    /** delivered without validation (validation disabled) */
     uint64_t in_pkts_unchecked;
+    /** discarded: packet number below the replay window */
     uint64_t in_pkts_late;
+    /** failed validation but were delivered anyway (permissive) */
     uint64_t in_pkts_invalid;
+    /** failed validation and were discarded */
     uint64_t in_pkts_not_valid;
 } MkaRxScStats;
 

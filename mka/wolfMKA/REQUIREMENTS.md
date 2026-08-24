@@ -39,12 +39,15 @@ build/quality targets. "Review" denotes a property established by inspection.
 | Req | Requirement | Std | Implementation | Verification |
 |-----|-------------|-----|----------------|--------------|
 | MKA-REQ-020 | ICV = AES-CMAC(ICK) over the MKPDU | 802.1X 9.4.1 | `wm_Crypto_IcvCompute` | `test_icv` |
+| MKA-REQ-020a | ICV over L2 prefix (DA \|\| SA \|\| EtherType) then the MKPDU, for wpa_supplicant interoperability (`WOLFMKA_ICV_L2_ADDR`) | 802.1X 11.11.3 | `wm_Crypto_IcvComputeL2` / `wm_Crypto_IcvVerifyL2` | `test_icv_l2`, `make test-icv-l2-suite` |
 | MKA-REQ-021 | ICV verified before any content is trusted | 802.1X 9.4.1 | `wm_Pdu_Decode` | `test_icv_tamper` |
 | MKA-REQ-030 | Basic Parameter Set encode/decode | 802.1X 11.11.1 | `mka_basic_encode`,`mka_decode_basic` | `test_roundtrip_*` |
 | MKA-REQ-031 | Live / Potential Peer Lists | 802.1X 11.11.2-3 | `mka_*_peer_list` | `test_roundtrip_full` |
 | MKA-REQ-032 | MACsec SAK Use parameter set | 802.1X 11.11.4 | `mka_*_sak_use` | `test_roundtrip_full` |
 | MKA-REQ-033 | Distributed SAK (incl. explicit cipher suite); received SAK key length and confidentiality offset validated before install | 802.1X 11.11.5 | `mka_*_dist_sak`, `mka_install_from_dist` | `test_roundtrip_full`, `test_dist_sak_explicit_cs`, `test_kay_dist_sak_bad_len`, `test_kay_dist_sak_bad_offset`, `test_pdu_golden_frame` |
 | MKA-REQ-034 | EAPOL-MKA framing + ICV Indicator; on-the-wire byte layout pinned to a golden frame | 802.1X 11.3, 11.11 | `wm_Pdu_Encode` | `test_roundtrip_basic_only`, `test_pdu_golden_frame` |
+| MKA-REQ-034a | Parameter sets are bounded against the start of the ICV, not the end of the body; an ICV Indicator is accepted only immediately before the ICV and declaring its length; a body too short to hold an ICV is rejected | 802.1X 11.11 | `mka_decode_param_sets`, `mka_verify_frame` | `test_pdu_edge_cases` |
+| MKA-REQ-034b | Caller-supplied length fields in an `MkaPdu` are validated against the arrays that back them before encoding | 802.1X 11.11 | `mka_pdu_lens_valid` | `test_pdu_invalid_params` |
 | MKA-REQ-035 | Malformed/truncated MKPDUs rejected | 802.1X 11.11 | `wm_Pdu_Decode` | `test_pdu_malformed` |
 
 ## MKA protocol (Clause 9)
@@ -69,12 +72,14 @@ build/quality targets. "Review" denotes a property established by inspection.
 | MKA-REQ-050 | MKPDU replay protection: MN strictly increases | 802.1X 9.4.2 | `mka_receive_process` | `test_replay_protection` |
 | MKA-REQ-051 | Transmit gated until peers receive on the SAK | 802.1X 9.x | `mka_maybe_enable_tx` | `test_tx_gating` |
 | MKA-REQ-052 | Delay protection via LPN exchange (optional); the full Lowest Acceptable PN is conveyed to the SecY (64-bit for XPN: low 32 from SAK Use, high 32 from the XPN set) | 802.1X 9.4.1; 802.1Xbx | `mka_apply_sak_use`,`mka_build_sak_use`,`set_lowest_pn` | `test_delay_protection`, `test_xpn_delay_protect_lpn64` |
+| MKA-REQ-052a | The transmitted Lowest Acceptable PN is queried from the SecY for the Latest *and* the Old key, in every build - it is the peer that consumes it, so `WOLFMKA_NO_DELAY_PROTECT` does not suppress it | 802.1X 9.4.1, 11.11.4 | `mka_build_sak_use` | `test_sak_use_lpn_per_key` |
 | MKA-REQ-053 | XPN cipher suites + deterministic SSCI (optional); SSCI stays consistent across membership changes (channels reprogrammed when a member joins) | 802.1Xbx; 802.1AE | `mka_apply_cipher_suite`,`mka_compute_ssci`,`mka_reapply_xpn_ssci` | `test_xpn_ssci`, `test_xpn_ssci_membership_change` |
 | MKA-REQ-054 | ICV comparison is constant-time | — | `wm_Crypto_IcvVerify` | Review |
 | MKA-REQ-055 | Cipher-suite / SAK-length consistency enforced | 802.1AE | `mka_cipher_suite_valid` | `make features`, Review |
 | MKA-REQ-056 | Key material securely zeroized when no longer needed | — | `wm_Crypto_ForceZero` (wraps `wc_ForceZero`; transient SAKs / KDF scratch), `wm_Participant_Free`, `wm_Kay_Free` | `test_free`, Review |
 | MKA-REQ-057 | Key Server selects the cipher suite common to all peers (optional, `WOLFMKA_CIPHER_NEGOTIATION`) | 802.1X 9.6.2 | `mka_select_cipher_suite` | `test_cipher_negotiation` |
 | MKA-REQ-058 | Key Server reduces confidentiality offset / drops to integrity-only per the CA's lowest MACsec Capability (optional, `WOLFMKA_CIPHER_NEGOTIATION`) | 802.1X 9.6.2 | `mka_negotiate_offset`,`mka_min_capability`,`mka_apply_cipher_suite` | `test_capability_negotiation` |
+| MKA-REQ-058a | A member joining a keyed CA with a capability below what the SAK in force was negotiated for triggers a rekey - the offset and integrity-only decision are carried in the Distributed SAK, so they cannot be changed for a key already issued. A join that reduces nothing does not rekey | 802.1X 9.6.2, 11.11.3 | `mka_refresh_peer`, `mka_ks_maybe_rekey` (`cap_reduced`) | `test_late_join_capability_mismatch`, `test_kay_join_no_rekey` |
 | MKA-REQ-059 | Distributed SAK / CAK / KMD accepted only from the elected Key Server (a CAK-holding non-KS member cannot override the in-force SAK) | 802.1X 9.8 | `mka_react_to_pdu` (sender SCI must equal the elected `ks_sci`) | `test_dist_sak_only_from_key_server` |
 
 ## Robustness, portability & process (supports IEC 61508 / 62443)
@@ -91,16 +96,48 @@ build/quality targets. "Review" denotes a property established by inspection.
 | MKA-REQ-068 | MKA version announced in the Basic Parameter Set is build-selectable (1 / 2 / 3) | `WOLFMKA_MKA_VERSION` (`mka_types.h`), `mka_build_fill` | `test_mka_version_announced` |
 | MKA-REQ-069 | A peer-list change, SAK install or transmit-gate release is answerable on the next run rather than at the Hello Time (802.1X 9.4 `newInfo`) | `MkaParticipant.new_info`, `cfg.immediate_response`, `wm_Participant_Run` | `test_immediate_response` |
 | MKA-REQ-071 | A reset peer (same SCI, new MI) is admitted alongside its stale entry, which is retired only once the new MI proves liveness | `mka_retire_stale_mi` (`mka_kay.c`) | `test_peer_reset_new_mi` |
+| MKA-REQ-071a | Peer-table entries sharing one SCI are capped at `MKA_MAX_PEERS_PER_SCI`, so a member cycling Member Identifiers cannot exhaust the table | `mka_sci_entry_count`, `mka_admit_peer` (`mka_kay.c`) | `test_peer_entries_capped_per_sci`, `test_peer_table_full` |
 | MKA-REQ-072 | Liveness requires an acceptably recent echoed Message Number, not the MI alone | `mka_mn_recent`, `mka_list_echo` (`MKA_MN_RECENT_WINDOW`) | `test_mn_recency_window` |
 | MKA-REQ-073 | An MKPDU reporting us live on a stale Message Number is discarded without refreshing the peer's Life timer | `mka_stale_live_echo` | `test_mn_recency_window` |
 | MKA-REQ-074 | SecY MACsec statistics are readable through the participant | `wm_Participant_GetSecyStats` / `GetTxScStats` / `GetRxScStats`, `MkaSecyOps.get_*_stats` | `test_macsec_statistics` |
-| MKA-REQ-075 | Participant status is summarised for a management interface | `wm_Participant_GetPaeStatus` (`MkaPaeStatus`) | `test_pae_status` |
+| MKA-REQ-075 | Participant status is summarised for a management interface. `MKA_PAE_RUNNING` means protection is transmitting and holds across a make-before-break rekey; `MKA_PAE_AUTH_FAIL_UNKNOWN_PEER` is reported only while no MKPDU has ever authenticated | `wm_Participant_GetPaeStatus` (`MkaPaeStatus`) | `test_pae_status` |
+| MKA-REQ-082 | AUTOSAR development-error reporting (SWS section 7): every rejected call is reported to Det with its API service ID and a specific error, behind `MKA_DEV_ERROR_DETECT` (default `STD_OFF`); detection is unconditional, so the switch cannot change behaviour | `mka_pae_ok_det`, `mka_ptr_ok_det`, `MKA_DET_REPORT_ERROR` (`src/autosar/Mka.c`) | `phase_det` (`make test-det`) |
+| MKA-REQ-083 | A Connectivity Association failing inside `Mka_MainFunction` is reported (`MKA_E_KAY_RUN_FAILED`) rather than discarded, once on the transition into failure | `Mka_MainFunction` (`src/autosar/Mka.c`) | `phase_kay_run_failure` |
 | MKA-REQ-076 | Losing Connectivity Associations stop transmitting once one establishes MACsec, and resume when it drops | `wm_Kay_SetQuiesceOthers`, `mka_kay_apply_quiesce` | `test_kay_quiesce_others` |
 | MKA-REQ-077 | Under the automotive profile, Key Server priority 255 means never Key Server and 0 means always | `mka_elect_dynamic` (`MKA_PRIORITY_NEVER_KS` / `_ALWAYS_KS`) | `test_ks_priority_extremes` |
 | MKA-REQ-078 | A participant that does not desire MACsec programs no data plane: it declines a distributed SAK | `mka_dist_sak_skip` | `test_kay_macsec_undesired` |
 | MKA-REQ-079 | The Key Server rekeys when a peer that was using the SAK stops reporting it | `mka_note_sak_use`, `mka_sak_use_reports_ours` | `test_rekey_on_lost_sak_use` |
 | MKA-REQ-080 | A new SAK may be distributed before the local SecY is programmed, so both ends install together | `distribute_before_install`, `mka_program_sak` | `test_distribute_before_install`, `test_deferred_install_send_failure` |
 | MKA-REQ-081 | A participant never reports receiving on a key its SecY does not yet hold | `mka_build_sak_use` (gated on `sak_program_pending`) | `test_deferred_install_send_failure` |
+| MKA-REQ-102 | The RNG workspace is caller-supplied and mandatory; a NULL is refused, never replaced by a per-call RNG that would put a WC_RNG on wolfMKA's stack or heap | `mka_cfg_valid`, `wm_Crypto_Random`, `wm_Crypto_GenerateSak` | `test_crypto_invalid_params` ("gen sak NULL rng", "random NULL rng"), `test_fault_crypto_paths` |
+| MKA-REQ-103 | CAK-from-MSK keys the KDF with the whole MSK; an MSK longer than the CAK is refused rather than truncated to a prefix | `wm_Crypto_DeriveCakFromMsk` | `test_eap_derivation` |
+| MKA-REQ-104 | The PAE status reports one peer SCI by a single rule - the first live peer, or the first peer heard from when none is live | `mka_status_peer_sci` (`src/mka_kay.c`) | `test_status_peer_sci_is_first_match` |
+| MKA-REQ-099 | Losing the elected Key Server is reported to the integrator, once, with the SCI that was in force | `key_server_lost` (`MkaEventOps`), `mka_run_election` | `test_key_server_lost_event` |
+| MKA-REQ-100 | A device that resets repeatedly inside the Life Time is not locked out by its own dead incarnations; an entry that proved liveness is never displaced | `mka_evict_stale_sci_entry` (`src/mka_kay.c`) | `test_double_reset_is_not_locked_out`, `test_no_eviction_displaces_a_proven_peer` |
+| MKA-REQ-101 | The constant-time ICV comparison performs no out-of-range unsigned-to-signed conversion | `wm_Crypto_IcvVerify` / `IcvVerifyL2`, `MKA_ICV_ERR_MAG` (`src/mka_crypto.c`) | `test_icv`, `test_icv_l2`, `mka_icv_err_mag_check` (compile-time) |
+| MKA-REQ-096 | At most one MACsec Cipher Suites TLV per Announcement; a second is a parse error | `mka_decode_announce` (`src/mka_pdu.c`) | `test_announce_semantic_negative` |
+| MKA-REQ-097 | A parameter set longer than this revision defines is accepted with its trailing octets ignored, so a newer peer stays decodable | `mka_decode_xpn` (`src/mka_pdu.c`) | `test_decode_forward_compatible_shapes` |
+| MKA-REQ-098 | A peer list that is present but empty decodes as present with a count of zero - the peer stating it sees no live peer | `mka_decode_peer_list` (`src/mka_pdu.c`) | `test_decode_forward_compatible_shapes` |
+| MKA-REQ-093 | A Member Identifier repeated in a received peer list resolves to its first occurrence | `mka_list_echo` (`src/mka_kay.c`) | `test_duplicate_mi_in_peer_list_takes_the_first` |
+| MKA-REQ-094 | The KDF's 255-block / 16-bit output-length bound is enforced for internal callers, not only through the public wrapper | `mka_kdf_run` (`src/mka_crypto.c`) | `test_kdf_errors` ("kdf out len 0", "kdf out big") |
+| MKA-REQ-095 | AUTOSAR: a SecY counter beyond 2^32 saturates rather than wrapping into the 32-bit statistic | `mka_sat32`, `Mka_GetMacSecStatistics` (`src/autosar/Mka.c`) | `phase_config_bounds` |
+| MKA-REQ-105 | A SAK is identified by its full Key Identifier - Key Server MI \|\| Key Number - so a Key Server that restarts and re-issues Key Number 1 is not mistaken for the key already held | `MkaSak.ks_mi`, `mka_dist_sak_skip`, `mka_install_sak` | `test_key_server_restart_reuses_kn` |
+| MKA-REQ-106 | The transmit packet-number-exhaustion rekey is not gated on an outstanding make-before-break handover, so a handover that never completes cannot disable it | `mka_ks_maybe_rekey`, `mka_pn_exhausted` | `test_pn32_exhaustion_rekey` |
+| MKA-REQ-107 | Association Numbers are allocated clear of the Old key as well as the Latest, and the 2-bit field wraps 0-1-2-3-0 without colliding with an installed Secure Association | `mka_ks_generate_sak` | `test_an_allocation_skips_old_key`, `test_an_wraps_across_four_rekeys` |
+| MKA-REQ-108 | A participant that cannot serve as Key Server advertises that on the wire, so two such participants cannot each elect the other and deadlock | `mka_build_fill` (`MKA_PRIORITY_NEVER_KS`) | `test_incapable_ks_does_not_deadlock` |
+| MKA-REQ-112 | AUTOSAR: an unobtainable CMAC or RNG workspace leaves the module down and reported, not up-but-unable-to-create-a-participant | `Mka_Init` (`src/autosar/Mka.c`) | `phase_cmac_pool_exhausted` |
+| MKA-REQ-109 | AUTOSAR: re-initialising the module tears down the previous configuration's Secure Associations rather than stranding them in the data plane, and a rejected `Mka_Init` leaves nothing running | `Mka_Init` (`src/autosar/Mka.c`) | `phase_config_bounds`, `permissive_reinit_tears_down` |
+| MKA-REQ-110 | AUTOSAR: a configuration with a NULL `Ckns` array - which `Mka_Init` accepts - is never dereferenced | `mka_ckn_count`, `mka_find_ckn` (`src/autosar/Mka.c`) | `phase_config_bounds` |
+| MKA-REQ-111 | AUTOSAR: `Mka_SetEnable(idx, FALSE)` tears the data plane down rather than leaving it armed with a key whose control plane has stopped; a link transition deliberately does not | `Mka_SetEnable` (`src/autosar/Mka.c`) | `permissive_reinit_tears_down` |
+| MKA-REQ-084 | A peer's MACsec SAK Use state is forgotten when its MKPDU carries no such parameter set, on every participant and not only the Key Server | `mka_clear_sak_use` (`src/mka_kay.c`) | `test_member_clears_stale_sak_use` |
+| MKA-REQ-085 | Decode is the inverse of encode for the MACsec SAK Use parameter set: no body means no key in use | `mka_decode_sak_use` (`src/mka_pdu.c`) | `test_pdu_more_negative` |
+| MKA-REQ-086 | At most one parameter set of each type per MKPDU (11.11); a repeated type is a parse error, while unknown types stay skippable | `mka_decode_param_sets` (`src/mka_pdu.c`) | `test_pdu_more_negative` |
+| MKA-REQ-087 | A manual rekey restarts the automatic rekey interval, so one requested rekey does not become two | `wm_Participant_Rekey`, `mka_ks_maybe_rekey` (`rekey_time_pending`) | `test_manual_rekey_restarts_the_auto_interval` |
+| MKA-REQ-088 | A transmit attempt costs the cadence whether the build succeeded, the send failed, or the build produced no frame at all | `mka_transmit_step` (`src/mka_kay.c`) | `test_fault_build_failure_is_rate_limited` (`make test-fault`) |
+| MKA-REQ-089 | An out-of-range `macsec_capability` is refused at init rather than truncated into the two-bit wire field | `mka_cfg_valid` (`src/mka_kay.c`) | `test_kay_introspection` |
+| MKA-REQ-090 | AUTOSAR: an unrecognised `EthTrcv_LinkStateType` is refused, not stored and echoed back as `ConnectionStatus` | `Mka_LinkStateChange` (`src/autosar/Mka.c`) | `phase_config_bounds`, `phase_det` |
+| MKA-REQ-091 | AUTOSAR: a PAE with no runnable CA is not started, so permissive timeout cannot open the controlled port on a configuration fault | `Mka_StartPae` (`src/autosar/Mka.c`) | `phase_failures` |
+| MKA-REQ-092 | AUTOSAR: on a started PAE, `Mka_GetCknStatus` reports what the KaY is running rather than the enable flag | `Mka_GetCknStatus` (`src/autosar/Mka.c`) | `phase_failures` |
 | MKA-REQ-070 | OPEN Alliance TC17 Automotive MKA profile: compile-time feature set and startup-timing defaults | `WOLFMKA_AUTOMOTIVE_PROFILE`, `wm_Participant_AutomotiveDefaults` | `test_automotive_defaults`, `test_automotive_fast_startup`, `make test-automotive` |
 | MKA-REQ-067 | No memory leaks / no undefined behaviour | all | valgrind on `runtests` (all configs); ASan+UBSan-clean (`make sanitize`) across the delivered configurations; GCC `-fanalyzer` clean (`make analyze`); libFuzzer smoke pass on the decoder and receive path (`make fuzz`) |
 
@@ -109,9 +146,10 @@ build/quality targets. "Review" denotes a property established by inspection.
 `make test` exercises MKA-REQ-001..056, 059, 065 and 066 (interoperability is
 pinned to RFC and hostapd-derived vectors in the suite — see *Interoperability*
 in the README). The opt-in cipher/capability negotiation requirements
-MKA-REQ-057..058 are exercised by `make test-negotiation`. `make features`, `make test-alloc`,
+MKA-REQ-057..058a are exercised by `make test-negotiation`. `make features`, `make test-alloc`,
 `make test-nomalloc`, `make misra` and a valgrind run cover MKA-REQ-060..064 and
-067. MKA-REQ-068..081 (the announced MKA version, the `newInfo` fast response,
+067. MKA-REQ-068..081, 084..089, 093..104 and 105..108 (the announced MKA version, the `newInfo` fast
+response,
 the OPEN Alliance Automotive profile, peer-reset recovery, the Message Number
 recency window, the MACsec-statistics and PAE-status accessors, and CA
 quiescing) are exercised by `make test` in every
@@ -120,8 +158,15 @@ configuration and additionally by `make test-automotive`; see
 requirement map and its known gaps. With the
 fault-injection build, `make coverage` **enforces** (fails below) 100% line,
 100% decision (branch) **and** 100% **MC/DC** coverage of the core sources
-(`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`). MC/DC is the masking variant accepted
+(`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`, `mka_status.c`), with
+`make coverage-autosar` applying the same bar to `src/autosar/Mka.c` — between
+them, every `.c` file in `src/`. MC/DC is the masking variant accepted
 by DO-178C, measured with GCC's `-fcondition-coverage` / `gcov --conditions`.
 `make coverage-configs` applies the same enforced check to each delivered
 configuration. See `MCDC-AND-COVERAGE.md` for the per-configuration coverage
 status.
+
+Lettered rows (MKA-REQ-034a, -034b, -052a, -071a) refine the requirement they
+hang off rather than adding a new one, and are exercised by the same targets as
+their parent. MKA-REQ-082..083, 090..092, 095 and 109..112 cover the AUTOSAR binding's development-error
+reporting and are exercised by `make test-det`.

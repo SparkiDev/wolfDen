@@ -46,6 +46,7 @@ static void test_status_strings(void)
         {MKA_ERR_NOT_KS, "MKA_ERR_NOT_KS"},
         {MKA_ERR_INTERNAL, "MKA_ERR_INTERNAL"},
         {MKA_ERR_REPLAY, "MKA_ERR_REPLAY"},
+        {MKA_ERR_REKEY_BUSY, "MKA_ERR_REKEY_BUSY"},
     };
     size_t i;
 

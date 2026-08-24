@@ -333,22 +333,22 @@ typedef enum {
     MKA_PS_DISTRIBUTED_CAK = 5,
     MKA_PS_KMD = 6,
     MKA_PS_ANNOUNCEMENT = 7,
-    /* XPN extensions (802.1Xbx / 802.1X-2020) */
+    /** XPN extensions (802.1Xbx / 802.1X-2020) */
     MKA_PS_XPN = 8,
     MKA_PS_ICV_INDICATOR = 255
 } MkaParamSetType;
 
-/* MACsec Capability (Basic Parameter Set, 11.11.1) */
+/** MACsec Capability (Basic Parameter Set, 11.11.1) */
 typedef enum {
     MKA_CAP_NOT_IMPLEMENTED = 0,
     MKA_CAP_INTEGRITY_ONLY = 1,
-    /* + confidentiality, offset 0 */
+    /** + confidentiality, offset 0 */
     MKA_CAP_INTEGRITY_CONF = 2,
-    /* + selectable confidentiality offset */
+    /** + selectable confidentiality offset */
     MKA_CAP_INTEGRITY_CONF_OFFSET = 3
 } MkaMacsecCapability;
 
-/* Confidentiality offsets carried in the Distributed SAK parameter set. */
+/** Confidentiality offsets carried in the Distributed SAK parameter set. */
 typedef enum {
     MKA_CONF_OFFSET_0 = 0,
     MKA_CONF_OFFSET_30 = 1,
@@ -368,30 +368,35 @@ typedef enum {
 
 typedef enum {
     MKA_OK = 0,
-    /* parameter is invalid */
+    /** parameter is invalid */
     MKA_ERR_BAD_ARG = -1,
-    /* underlying wolfSSL failure */
+    /** underlying wolfSSL failure */
     MKA_ERR_CRYPTO = -2,
-    /* output buffer too small */
+    /** output buffer too small */
     MKA_ERR_BUFFER = -3,
-    /* malformed MKPDU */
+    /** malformed MKPDU */
     MKA_ERR_PARSE = -4,
-    /* ICV verification failed */
+    /** ICV verification failed */
     MKA_ERR_ICV = -5,
-    /* unsupported EAPOL/MKA version */
+    /** unsupported EAPOL/MKA version */
     MKA_ERR_VERSION = -6,
-    /* peer not found / not live */
+    /** peer not found / not live */
     MKA_ERR_NO_PEER = -7,
-    /* operation invalid in current state */
+    /** operation invalid in current state */
     MKA_ERR_STATE = -8,
-    /* table full */
+    /** table full */
     MKA_ERR_FULL = -9,
-    /* operation requires being Key Server */
+    /** operation requires being Key Server */
     MKA_ERR_NOT_KS = -10,
-    /* internal error */
+    /** internal error */
     MKA_ERR_INTERNAL = -11,
-    /* stale/replayed MKPDU (Message Number) */
-    MKA_ERR_REPLAY = -12
+    /** stale/replayed MKPDU (Message Number) */
+    MKA_ERR_REPLAY = -12,
+    /** the previous SAK has been adopted but has not reached the wire yet, so a
+     *  second one cannot help. A make-before-break handover that is merely
+     *  still running is *not* this: rekeying out of one is normal, and the
+     *  packet-number-exhaustion rekey depends on being able to */
+    MKA_ERR_REKEY_BUSY = -13
 } MkaStatus;
 
 /* Build a 64-bit unsigned constant from its high and low 32-bit halves. This
@@ -414,37 +419,46 @@ typedef enum {
 /* Common value structs                                                      */
 /* ------------------------------------------------------------------------- */
 
-/* Opaque handle to one RNG object from the crypto layer's pool. Acquired with
+/** Opaque handle to one RNG object from the crypto layer's pool. Acquired with
  * wm_Crypto_RandomInit and passed to the random-consuming functions. */
 typedef struct MkaRandom MkaRandom;
 
-/* Opaque handle to one AES-CMAC context from the crypto layer's pool. Acquired
+/** Opaque handle to one AES-CMAC context from the crypto layer's pool. Acquired
  * with wm_Crypto_CmacInit and passed (required, non-NULL) to the
  * CMAC-consuming functions so the ~1 KB wolfSSL Cmac object always lives in
  * wolfMKA-owned storage - never a wolfSSL stack frame or allocation. */
 typedef struct MkaCmacCtx MkaCmacCtx;
 
-/* Member Identifier + Message Number, the unit used in peer lists. */
+/** Member Identifier + Message Number, the unit used in peer lists. */
 typedef struct {
+    /** Member Identifier: random per participant, redrawn on restart */
     uint8_t mi[MKA_MI_LEN];
+    /** Message Number this member was last heard at */
     uint32_t mn;
 } MkaPeerId;
 
-/* The CAK / CKN pair identifying a Connectivity Association Key. */
+/** The CAK / CKN pair identifying a Connectivity Association Key. */
 typedef struct {
+    /** the Connectivity Association Key itself */
     uint8_t cak[MKA_MAX_CAK_LEN];
-    /* 16 or 32 */
+    /** 16 or 32 */
     size_t cak_len;
+    /** the CAK Name: identifies this CA on the wire, and selects the CAK a
+     *  received MKPDU should be verified with */
     uint8_t ckn[MKA_MAX_CKN_LEN];
-    /* 1..32 */
+    /** 1..32 */
     size_t ckn_len;
 } MkaCakPair;
 
-/* Derived per-CA secret keys (KEK, ICK). */
+/** Derived per-CA secret keys (KEK, ICK). */
 typedef struct {
+    /** Key Encrypting Key: wraps a distributed SAK */
     uint8_t kek[MKA_MAX_CAK_LEN];
+    /** KEK length in octets (16 or 32) */
     size_t kek_len;
+    /** Integrity Check Key: authenticates an MKPDU's ICV */
     uint8_t ick[MKA_MAX_CAK_LEN];
+    /** ICK length in octets (16 or 32) */
     size_t ick_len;
 } MkaDerivedKeys;
 

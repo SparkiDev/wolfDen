@@ -26,6 +26,7 @@
 int g_tests_run = 0;
 int g_tests_failed = 0;
 MkaCmacCtx* g_cmac = NULL;
+MkaRandom* g_rng = NULL;
 
 void run_crypto_tests(void);
 void run_pdu_tests(void);
@@ -42,6 +43,15 @@ int main(void)
     g_cmac = wm_Crypto_CmacInit();
     if (g_cmac == NULL) {
         printf("FAIL: could not acquire CMAC workspace\n");
+        return 1;
+    }
+    /* Likewise the RNG: wolfSSL's WC_RNG never lives on wolfMKA's stack or
+     * heap, so every participant needs one supplied. */
+    g_rng = wm_Crypto_RandomInit();
+    if (g_rng == NULL) {
+        printf("FAIL: could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(g_rng);
+        wm_Crypto_CmacFree(g_cmac);
         return 1;
     }
 

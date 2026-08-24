@@ -64,7 +64,12 @@ The RNG is drawn from a small pool to avoid re-seeding on every call (seeding
 is the costly step). `wm_Crypto_RandomInit()` acquires and seeds one RNG
 object and returns a reference; pass it to the random-consuming functions (or
 via `MkaParticipantConfig.rng`) and release it with `wm_Crypto_RandomFree()`.
-A `NULL` reference falls back to per-call seeding. The pool size is
+The workspace is **required** in every build, exactly as the CMAC one is: a
+`NULL` is rejected with `MKA_ERR_BAD_ARG`, never silently replaced by a per-call
+RNG. wolfSSL's `WC_RNG` would otherwise have to live in wolfMKA's own frame, and
+under `WOLFSSL_NO_MALLOC` it carries its DRBG state inline — hundreds of octets
+of stack in precisely the small-stack/no-malloc build the pool exists to serve,
+while an ordinary build heap-allocates the DRBG on every call. The pool size is
 `WOLFMKA_RANDOM_POOL_SIZE` (default 1, override at build time) — size it for the
 number of concurrent RNG holders.
 
@@ -91,15 +96,39 @@ case, since a participant's CMAC operations do not nest.
   never sent that peers cannot yet decrypt.
 - **Delay protection** *(optional)* — the lowest-acceptable-PN exchange advances
   each receive replay window to bound frame delay; uses the Bounded Hello Time.
+  The LPN a participant *transmits* is what its peer uses, so both the Latest and
+  the Old key report their real packet number from the SecY in every build,
+  including one compiled `WOLFMKA_NO_DELAY_PROTECT` — that switch removes this
+  end's own delay handling, not the far end's.
 - **Extended Packet Numbering** *(optional)* — GCM-AES-XPN-128/256 cipher suites
   with deterministic Short SCI (SSCI) assignment (802.1Xbx). The Salt is derived
   by the SecY from the SAK per 802.1AE-2018, not distributed by MKA.
+- **Keys are identified by KI, not Key Number** — IEEE Std 802.1X-2010 names a
+  SAK by its Key Identifier, KI = (Key Server MI ‖ Key Number). Key Numbers are
+  unique only per Key-Server incarnation: one that restarts comes back with a
+  fresh MI, no stored key, and begins again at KN 1 — with different key bytes.
+  Recognising a key by Key Number alone would make a member decline that install
+  as a duplicate and keep the dead key while the Key Server transmitted on the
+  new one, both ends reporting MACsec up over a silent black-hole. The issuing
+  Key Server's MI is stored with the key and compared alongside the Key Number.
+- **Peer-table fair share** — a device is identified on the wire by its SCI, but
+  its Member Identifier changes on every restart, and peer-reset recovery
+  deliberately admits a returning device's new MI alongside the old one. Entries
+  per SCI are capped at `MKA_MAX_PEERS_PER_SCI` (2) so a member cycling MIs is
+  bounded to its own share of the table rather than crowding out the CA.
+- **Bounded parameter-set parsing** — every set is bounded against where the ICV
+  starts rather than the end of the body, so none can consume the ICV octets; the
+  ICV Indicator must sit immediately before the ICV and declare its length, so a
+  forged one cannot hide the sets behind it; and a body too short to hold an ICV
+  is rejected before anything is authenticated.
 - **Secure key zeroization** — transient secrets (generated/unwrapped SAKs and
   the KDF scratch that holds derived key material) are wiped with
   `wm_Crypto_ForceZero()` — wolfSSL's `wc_ForceZero`, which the optimiser may not
   elide — the moment they are no longer needed; `wm_Participant_Free()` /
   `wm_Kay_Free()` tear down the SecY SAs and wipe a participant's CAK,
-  KEK/ICK and SAKs at end of life.
+  KEK/ICK and SAKs at end of life. A failed `wm_Crypto_UnwrapSak()` wipes the
+  caller's output too, so plaintext from a key that never authenticated is not
+  handed back.
 
 See [`REQUIREMENTS.md`](REQUIREMENTS.md) for the full requirements-to-test
 traceability matrix.
@@ -131,7 +160,7 @@ Some features are **opt-in** (off by default, so the default build is unchanged)
 | `WOLFMKA_ICV_L2_ADDR` | Computes and verifies the MKPDU ICV over an L2 prefix — destination (PAE group address), source (the SCI from the Basic Parameter Set) and EAPOL EtherType — followed by the MKPDU, which is the ICV input wpa_supplicant uses (IEEE Std 802.1X-2010 §11.11.3). Off by default; enable it to interoperate with peers that bind the Ethernet framing into the ICV. It changes what is signed, so **both ends must agree**. `make test-icv-l2` runs the standalone check and `make test-icv-l2-suite` runs the whole suite over this ICV path. |
 | `WOLFMKA_AUTOMOTIVE_PROFILE` | The OPEN Alliance TC17 **Automotive MKA** profile: version 3 MKPDUs and no Secure Announcements / cipher-suite negotiation, plus `wm_Participant_AutomotiveDefaults()` for the profile's startup timing (10 ms → Hello Time ramp and immediate response to a peer-list change). `make test-automotive` builds and tests with it enabled; [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) is the requirement-by-requirement map, including the known gaps. |
 | `WOLFMKA_SUSPENSION` | MKA participant suspension (802.1Xbx-2014): `wm_Participant_Suspend(p, seconds)` / `wm_Participant_Resume(p)`. A suspended participant advertises a suspension time (in the XPN set's MKA Suspension Time field) and goes quiet; peers hold its state past the Life Time so the SAK survives the gap. **Requires XPN** (must not be combined with `WOLFMKA_NO_XPN`). `make test-suspension` builds and tests with it enabled. |
-| `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces offset 0, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, signalled to the SecY as `MKA_CONF_OFFSET_NONE`. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
+| `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces offset 0, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, signalled to the SecY as `MKA_CONF_OFFSET_NONE`. Both values travel inside the Distributed SAK parameter set, so they belong to the key rather than to the CA: a member joining a keyed CA with a *lower* capability than it was negotiated for therefore forces a rekey, which is the only way to move every member to the new offset at once. An ordinary join — one that reduces nothing — still does not rekey. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
 
 The Key Server wraps a group CAK with the CA's KEK and emits it; each member
 unwraps it (a wrong KEK fails the AES Key Unwrap integrity check and is ignored)
@@ -153,6 +182,15 @@ implies `WOLFMKA_NO_EAP`. The retry back-off, Announcements, XPN and delay
 protection all stay in — each is configurable through `Mka_PaeConfigType`
 (`RetryBaseMs`/`RetryCyclicMs`, `AnnounceCipherSuites`, `CipherSuite`,
 `DelayProtect`). `make autosar` builds and tests with this profile.
+
+Development-error reporting (SWS §7) is available behind `MKA_DEV_ERROR_DETECT`,
+which defaults to `STD_OFF` so the binding links without a generated `Det`. Set
+it to `STD_ON` and every condition the module already rejects is also reported
+to Det with the API service ID and a specific error — `MKA_E_UNINIT`,
+`MKA_E_PARAM_POINTER`, `MKA_E_INVALID_PAE_IDX` and the rest — instead of an
+undifferentiated `E_NOT_OK`. Detection itself is identical either way, so the
+switch cannot change behaviour. `make test-det` runs the suite with it on;
+[`AUTOSAR.md`](AUTOSAR.md) documents the error and service IDs.
 
 **`WOLFMKA_AUTOMOTIVE_PROFILE`.** The OPEN Alliance TC17 *Automotive MKA
 Specification* v1.0 profiles 802.1X-2020 MKA for in-vehicle Ethernet: version 3
@@ -296,19 +334,29 @@ agree.
 
 ## Tests
 
-`make test` runs 978 checks across three layers:
+`make test` runs 1408 checks across three layers:
 
 - **crypto** — anchored to published vectors: **RFC 4493** (AES-CMAC) and
   **RFC 3394** (AES Key Wrap), plus KDF determinism, SAK wrap/unwrap roundtrip
-  and ICV tamper detection.
+  and ICV tamper detection. The derivations that have no published vector — the
+  KEK/ICK from a CAK, and the L2-address ICV — carry known-answer tests computed
+  against an independent AES-CMAC oracle rather than against wolfMKA itself, so a
+  change to either fails the suite instead of silently breaking interoperability.
 - **pdu** — MKPDU encode/decode roundtrips (basic-only and full, incl. an
   explicit-cipher-suite 256-bit Distributed SAK), ICV tamper / wrong-key
-  rejection, and the pre-ICV "peek" path used to select a CAK on receive.
+  rejection, and the pre-ICV "peek" path used to select a CAK on receive. Beside
+  the bounds cases there is a set of *semantic* ones — frames that parse cleanly
+  but must not mean what they appear to: a duplicated parameter set, a repeated
+  cipher-suites TLV, a SAK Use whose key-in-use flags have no body behind them,
+  and the forward-compatible shapes (an over-long parameter set, a present but
+  empty peer list) that a future peer may legitimately send.
 - **kay** — a two-participant in-process simulation that runs discovery →
   liveness → Key Server election → SAK distribution and asserts both ends
   install the *same* SAK through their SecY; also covers replay rejection, Tx
   gating, XPN/SSCI, delay protection, a make-before-break **rekey** (Old/Latest
-  handover and retirement), and the **multi-CA manager** routing MKPDUs by CKN.
+  handover and retirement, including the 2-bit Association Number wrapping
+  0-1-2-3-0), peer-reset recovery and its per-device entry cap, the observability
+  hooks at each transition, and the **multi-CA manager** routing MKPDUs by CKN.
 
 **Fault injection.** The `MKA_ERR_CRYPTO` branches only fire when a wolfSSL
 primitive fails, which valid inputs never trigger. `make test-fault` rebuilds
@@ -319,16 +367,20 @@ primitive to fail, exercising those fail-closed paths. In a normal build
 injection symbols in the library.
 
 **Coverage.** With the fault-injection build, **line, decision (branch) and
-MC/DC coverage are all 100%** of `mka_crypto.c`, `mka_kay.c` and `mka_pdu.c` —
+MC/DC coverage are all 100%** of every `.c` file in `src/` — `mka_crypto.c`,
+`mka_kay.c`, `mka_pdu.c` and `mka_status.c` under `make coverage`, and
+`src/autosar/Mka.c` under `make coverage-autosar` —
 both outcomes of every branch are taken, and every operand of each compound
 `&&`/`||` condition is shown to independently affect the result. Run `make
 coverage` to reproduce the figures (gcov `--conditions`, built at `-O0` with
 `-DWOLFMKA_FAULT_INJECT`); the target **fails** below 100% on any of the three
 metrics. `make coverage-configs` re-runs the same enforced check across all eleven
-delivered configurations (cert base, cipher negotiation, small-stack/no-malloc,
-and the `NO_*` feature-off builds). MC/DC is the masking variant accepted by
+delivered configurations (cert base, cipher negotiation, the automotive profile,
+the L2-address ICV, small-stack/no-malloc, and the six `NO_*` feature-off
+builds). MC/DC is the masking variant accepted by
 DO-178C, measured with GCC's `-fcondition-coverage`. Every public function is
-exercised with invalid parameters at each pointer position. Two defensive guards
+exercised with invalid parameters at each pointer position, and — where it takes
+a caller-supplied length — with one past the bound it is checked against. Two defensive guards
 that valid operation cannot reach are covered deliberately: the Key Number
 wrap-around reset (would need 2³² rekeys) by a white-box test that drives the KN
 to its maximum before a rekey, and the EAPOL-body-exceeds-64 KiB buffer check
@@ -497,13 +549,20 @@ memcpy(cfg.sci, my_sci, 8);
 cfg.priority = 16;
 cfg.macsec_desired = 1;
 cfg.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
-cfg.key_server_capable = 1;
+cfg.key_server_capable = 1; /* 0 means *cannot*: advertises priority 255 */
 cfg.sak_len = 16;                   /* GCM-AES-128 */
 cfg.secy = my_secy_ops;            /* install_tx_sa / install_rx_sa / ... */
 cfg.send = my_send_fn;             /* write the frame to EtherType 0x888E   */
 
+/* Both crypto workspaces are caller-owned and required: wolfSSL's ~1 KB Cmac
+ * context and its WC_RNG never live on wolfMKA's stack or heap, so a missing
+ * one is rejected rather than substituted. Acquire once, not per participant.
+ */
+cfg.cmac = wm_Crypto_CmacInit();    /* NULL if the pool is exhausted */
+cfg.rng  = wm_Crypto_RandomInit();  /* NULL if exhausted or seeding failed */
+
 MkaParticipant p;
-wm_Participant_Init(&p, &cfg);
+if (wm_Participant_Init(&p, &cfg) != MKA_OK) { /* bad configuration */ }
 
 /* event loop */
 for (;;) {
@@ -516,8 +575,14 @@ for (;;) {
 Deriving the CAK/CKN from an EAP MSK instead of a PSK:
 
 ```c
-/* cfg.cmac is the caller-owned CMAC workspace (wm_Crypto_CmacInit()). */
-wm_Crypto_DeriveCakFromMsk(cfg.cmac, msk, msk_len, mac_lo, mac_hi,
+/* cfg.cmac is the caller-owned CMAC workspace (wm_Crypto_CmacInit()).
+ * The MSK is the KDF key in full, and its length is what selects AES-128 or
+ * AES-256 CMAC - so supply exactly as much MSK as the CAK you want. Pass more
+ * and the call is refused rather than quietly deriving from a prefix, which
+ * would produce a CAK no other implementation reproduces. hostapd arranges the
+ * same thing from the other end: wpa_supplicant clamps the MSK to the CAK
+ * length before deriving. */
+wm_Crypto_DeriveCakFromMsk(cfg.cmac, msk, 16, mac_lo, mac_hi,
                         cfg.cak.cak, 16);
 wm_Crypto_DeriveCknFromMsk(cfg.cmac, msk, msk_len, eap_session_id, sid_len,
                         mac_lo, mac_hi, cfg.cak.ckn, ckn_len);
@@ -540,7 +605,10 @@ wm_Participant_Init(&p, &cfg);
 
 **Key loss and recovery.** A peer whose MACsec SAK Use stops reporting the key
 has lost it — its data plane restarted, typically — and nothing in the protocol
-brings it back on its own. The Key Server notices and distributes a fresh SAK
+brings it back on its own. A member that still holds a key always
+sends the parameter set, so an MKPDU arriving without one is a statement, and
+every participant - not only the Key Server - drops what it was recording about
+that peer's use of the key rather than letting a stale claim stand. The Key Server notices and distributes a fresh SAK
 (one rekey per loss, not one per MKPDU). Setting `cfg.distribute_before_install`
 additionally has the Key Server put a new SAK on the wire *before* programming
 its own SecY, so a peer behind a slow data plane starts installing at the same

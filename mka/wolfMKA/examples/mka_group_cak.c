@@ -169,7 +169,7 @@ static void on_cak_received(void* ctx, const uint8_t* cak, size_t cak_len,
 /* Build a group-CA participant config from a (just-learned or chosen) CAK. */
 static void group_cfg(MkaParticipantConfig* c, const uint8_t* cak,
     size_t cak_len, const uint8_t* ckn, size_t ckn_len, const uint8_t sci[8],
-    uint8_t priority, Queue* tx, MkaCmacCtx* cmac)
+    uint8_t priority, Queue* tx, MkaCmacCtx* cmac, MkaRandom* rng)
 {
     memset(c, 0, sizeof(*c));
     memcpy(c->cak.cak, cak, cak_len);
@@ -186,6 +186,7 @@ static void group_cfg(MkaParticipantConfig* c, const uint8_t* cak,
     c->send = send_to;
     c->send_ctx = tx;
     c->cmac = cmac;
+    c->rng = rng;
 }
 
 int main(void)
@@ -207,6 +208,7 @@ int main(void)
     MkaKay kayA, kayB;
     MkaParticipantConfig ca, cb;
     MkaCmacCtx* cmac;
+    MkaRandom* rng;
     CakInbox inbox;
     int tick;
     int a_group_started = 0;
@@ -228,16 +230,26 @@ int main(void)
         printf("cmac init failed\n");
         return 1;
     }
+    /* Likewise one RNG workspace: it is required too, since wolfSSL's WC_RNG
+     * never lives on wolfMKA's stack or heap. */
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        printf("rng init failed\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     if ((wm_Kay_Init(&kayA) != MKA_OK) || (wm_Kay_Init(&kayB) != MKA_OK)) {
         printf("kay init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
 
     /* Pairwise CA on each port (A favoured as Key Server: priority 10). */
-    group_cfg(&ca, pw_cak, 16, pw_ckn, 8, sci_a, 10, &a2b, cmac);
-    group_cfg(&cb, pw_cak, 16, pw_ckn, 8, sci_b, 20, &b2a, cmac);
+    group_cfg(&ca, pw_cak, 16, pw_ckn, 8, sci_a, 10, &a2b, cmac, rng);
+    group_cfg(&cb, pw_cak, 16, pw_ckn, 8, sci_b, 20, &b2a, cmac, rng);
     /* B's pairwise participant reports any distributed CAK to our policy. */
     cb.events.cak_received = on_cak_received;
     cb.events.ctx = &inbox;
@@ -246,6 +258,7 @@ int main(void)
         printf("pairwise setup failed\n");
         wm_Kay_Free(&kayA);
         wm_Kay_Free(&kayB);
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -269,7 +282,8 @@ int main(void)
                         7) != MKA_OK) {
                     printf("  [A] DistributeCak failed\n");
                 }
-                group_cfg(&gc, grp_cak, 16, grp_ckn, 7, sci_a, 10, &a2b, cmac);
+                group_cfg(&gc, grp_cak, 16, grp_ckn, 7, sci_a, 10, &a2b, cmac,
+                    rng);
                 if (wm_Kay_AddParticipant(&kayA, &gc, NULL) != MKA_OK) {
                     printf("  [A] group CA add failed\n");
                 }
@@ -292,7 +306,7 @@ int main(void)
             printf(
                 "  [B] integrator starts a group CA for the delivered CAK\n");
             group_cfg(&gc, inbox.cak, inbox.cak_len, inbox.ckn, inbox.ckn_len,
-                sci_b, 20, &b2a, cmac);
+                sci_b, 20, &b2a, cmac, rng);
             if (wm_Kay_AddParticipant(&kayB, &gc, NULL) != MKA_OK) {
                 printf("  [B] group CA add failed\n");
             }
@@ -322,6 +336,7 @@ int main(void)
         }
         wm_Kay_Free(&kayA);
         wm_Kay_Free(&kayB);
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return ok ? 0 : 1;
     }

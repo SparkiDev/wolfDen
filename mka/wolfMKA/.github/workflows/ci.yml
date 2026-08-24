@@ -107,6 +107,12 @@ jobs:
       - name: AUTOSAR Mka binding build + test
         run: make autosar
 
+      - name: AUTOSAR binding with Det development-error reporting
+        # Same suite with MKA_DEV_ERROR_DETECT=STD_ON: detection is unchanged,
+        # so this adds the assertions on which (API service ID, error ID) pair
+        # each rejection reports.
+        run: make test-det
+
       - name: No-malloc build + no-allocation symbol check
         run: make test-nomalloc
 
@@ -134,14 +140,22 @@ jobs:
         run: make sanitize
 
       - name: Fuzz smoke (libFuzzer — decoder + receive path)
-        # Bounded smoke run to catch regressions; lengthen FUZZ_SECONDS or point
+        # Bounded smoke run to catch regressions (three harnesses now, so the
+        # per-harness budget is trimmed to keep the step's wall clock);
+        # lengthen FUZZ_SECONDS or point
         # a corpus directory at the harness for a real campaign.
-        run: make fuzz FUZZ_SECONDS=60
+        run: make fuzz FUZZ_SECONDS=45
 
       - name: Structural coverage — 100% line + decision + MC/DC (all configs)
         # -fcondition-coverage (MC/DC) requires GCC >= 14, so build and measure
         # with the gcc-14 toolchain (gcov-14 must match the compiler).
         run: make coverage-configs CC=gcc-14 GCOV=gcov-14
+
+      - name: Structural coverage — AUTOSAR binding (Det off and on)
+        # src/autosar/Mka.c needs -DWOLFMKA_AUTOSAR and its own suite, so it is
+        # a separate instrumented build held to the same 100% bar - run twice,
+        # since MKA_DEV_ERROR_DETECT adds branches of its own.
+        run: make coverage-autosar CC=gcc-14 GCOV=gcov-14
 
       - name: MISRA C:2012 (cppcheck addon)
         run: make misra

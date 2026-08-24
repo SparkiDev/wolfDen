@@ -19,8 +19,17 @@ USE_MDFILE_AS_MAINPAGE = README.md
 
 # --- C-oriented extraction ------------------------------------------------
 OPTIMIZE_OUTPUT_FOR_C  = YES
-EXTRACT_ALL            = YES
-EXTRACT_STATIC         = YES
+# EXTRACT_ALL is NO deliberately: with it YES, an undocumented member is still
+# rendered (with an empty description) and WARN_IF_UNDOCUMENTED never fires, so
+# the docs gate cannot tell a documented API from an undocumented one. With it
+# NO, every public type, field and enumerator in include/wolfmka must carry a
+# Doxygen comment or `make docs` fails - which is the point of the gate.
+# EXTRACT_STATIC is NO for the same reason in reverse: the file-static helpers
+# and state in src/*.c are implementation notes, documented in prose next to the
+# code rather than in the published manual, and holding them to the public-API
+# bar would only add noise.
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = NO
 EXTRACT_LOCAL_CLASSES  = YES
 JAVADOC_AUTOBRIEF      = YES
 MARKDOWN_SUPPORT       = YES
@@ -31,9 +40,21 @@ SORT_MEMBER_DOCS       = NO
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = NO
+# Feature macros are pinned so the documented API matches the default build.
+# WOLFMKA_ICV_L2_ADDR is defined rather than zeroed - it is an #ifdef gate - so
+# the L2 ICV entry points are documented and covered by the docs gate.
+# STD_ON and STD_OFF are both given the value 1 so that the header's own
+# "MKA_DEV_ERROR_DETECT == STD_ON" test resolves true and the manual shows what
+# MKA_DET_REPORT_ERROR expands to in a build that has Det; the default STD_OFF
+# branch is a no-op, and documenting that would describe the reporting as doing
+# nothing. Defining MKA_DEV_ERROR_DETECT here instead would skip the header's
+# own #ifndef and leave its @def block attached to nothing.
 PREDEFINED             = WOLFMKA_NO_EAP=0 \
                          WOLFMKA_NO_XPN=0 \
-                         WOLFMKA_NO_DELAY_PROTECT=0
+                         WOLFMKA_NO_DELAY_PROTECT=0 \
+                         WOLFMKA_ICV_L2_ADDR \
+                         STD_ON=1 \
+                         STD_OFF=1
 
 # --- Output ---------------------------------------------------------------
 GENERATE_HTML          = YES

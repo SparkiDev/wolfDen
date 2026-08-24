@@ -33,46 +33,8 @@
     #include "wolfmka/mka_kay.h"
     #include "wolfmka/mka_pdu.h"
 
-/* ---- the injection hook the library calls through MKA_FI ---------------- */
-static int g_armed_site = MKA_FI_NONE;
-static int g_armed_code;
+    #include "fault_impl.h"
 
-/* A windowed arm: fail a contiguous run of calls at one site - skip the first
- * `skip`, fail the next `count`, then pass. Lets a test fail specific calls
- * (e.g. the 2nd and 3rd of four). */
-static int g_win_site = MKA_FI_NONE;
-static unsigned g_win_skip;
-static unsigned g_win_count;
-static unsigned g_win_seen;
-static int g_win_code;
-
-int wm_Fault_Eval(int site, int real_value)
-{
-    if ((site != MKA_FI_NONE) && (site == g_win_site)) {
-        unsigned idx = g_win_seen;
-        g_win_seen++;
-        if ((idx >= g_win_skip) && (idx < (g_win_skip + g_win_count))) {
-            return g_win_code;
-        }
-        return real_value;
-    }
-    if ((site != MKA_FI_NONE) && (site == g_armed_site)) {
-        g_armed_site = MKA_FI_NONE; /* one-shot */
-        return g_armed_code;
-    }
-    return real_value;
-}
-void wm_Fault_Arm(int site, int code)
-{
-    g_armed_site = site;
-    g_armed_code = code;
-}
-void wm_Fault_Reset(void)
-{
-    g_armed_site = MKA_FI_NONE;
-    g_win_site = MKA_FI_NONE;
-    g_win_seen = 0U;
-}
 static void mka_fault_arm_window(int site, unsigned skip, unsigned count,
     int code)
 {
@@ -112,15 +74,18 @@ static void test_fault_crypto_paths(void)
     CHECK(wm_Crypto_IcvCompute(g_cmac, kek, 16, sak, 16, icv) == MKA_ERR_CRYPTO,
         "ICV CMAC failure -> CRYPTO");
 
-    /* Per-call RNG init failure (NULL rng) -> SAK generation reports CRYPTO. */
-    wm_Fault_Arm(MKA_FI_RNG_INIT, -1);
-    CHECK(wm_Crypto_GenerateSak(NULL, sak, 16) == MKA_ERR_CRYPTO,
-        "RNG init failure -> CRYPTO");
+    /* A missing RNG workspace is a configuration error, not a crypto failure:
+     * there is no per-call RNG to fall back to, so nothing is injected here. */
+    CHECK(wm_Crypto_GenerateSak(NULL, sak, 16) == MKA_ERR_BAD_ARG,
+        "no RNG workspace -> BAD_ARG");
 
     /* Pool RNG init failure -> RandomInit returns NULL (no slot handed out).
-     * First prove a slot is actually free (an un-armed init succeeds and is
-     * returned), so the NULL below is caused by the injected fault and not by
-     * pool exhaustion - which would return NULL for an unrelated reason. */
+     * The harness holds a slot for the whole run, so give it back first: a
+     * NULL from an exhausted pool would look the same as a NULL from the
+     * injected fault. Proving a slot is free before arming keeps the two
+     * apart. */
+    wm_Crypto_RandomFree(g_rng);
+    g_rng = NULL;
     {
         MkaRandom* r = wm_Crypto_RandomInit();
         CHECK(r != NULL, "pool slot free before the fault is armed");
@@ -128,10 +93,12 @@ static void test_fault_crypto_paths(void)
     }
     wm_Fault_Arm(MKA_FI_RNG_INIT, -1);
     CHECK(wm_Crypto_RandomInit() == NULL, "pool RNG init failure -> NULL");
+    g_rng = wm_Crypto_RandomInit();
+    CHECK(g_rng != NULL, "the harness reclaims its RNG");
 
-    /* RNG block-generation failure. */
+    /* RNG block-generation failure, through a real pool workspace. */
     wm_Fault_Arm(MKA_FI_RNG_GEN, -1);
-    CHECK(wm_Crypto_GenerateSak(NULL, sak, 16) == MKA_ERR_CRYPTO,
+    CHECK(wm_Crypto_GenerateSak(g_rng, sak, 16) == MKA_ERR_CRYPTO,
         "RNG generate failure -> CRYPTO");
 
     /* AES Key Wrap failure. */
@@ -210,6 +177,7 @@ static void test_fault_layered_paths(void)
     cfg.sak_len = 16;
     cfg.send = fault_send;
     cfg.cmac = g_cmac;
+    cfg.rng = g_rng;
     CHECK(wm_Kay_AddParticipant(&kay, &cfg, NULL) == MKA_OK, "add CA");
     wm_Fault_Arm(MKA_FI_CMAC, -1); /* fail the build's ICV */
     rc = wm_Kay_Run(&kay, 0);
@@ -217,6 +185,48 @@ static void test_fault_layered_paths(void)
         "kay_run surfaces the participant CMAC failure");
 
     wm_Fault_Reset();
+}
+
+/* A build that never produces a frame must still cost the transmit cadence, or
+ * the participant retries it on every tick instead of once per Hello Time - a
+ * full parameter-set fill plus an AES-CMAC per tick of the integrator's loop.
+ * The failure is observable through wm_Participant_Run's return value: a tick
+ * that does not attempt a transmit cannot report a transmit error. */
+static void test_fault_build_failure_is_rate_limited(void)
+{
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+
+    printf("fault injection: a failing build still costs the cadence:\n");
+
+    memset(&ca, 0, sizeof ca);
+    memset(ca.cak.cak, 0xCA, 16);
+    ca.cak.cak_len = 16;
+    memcpy(ca.cak.ckn, "ckn", 3);
+    ca.cak.ckn_len = 3;
+    ca.sak_len = 16;
+    ca.macsec_desired = 1;
+    ca.key_server_capable = 1;
+    ca.send = fault_send;
+    ca.cmac = g_cmac;
+    ca.rng = g_rng;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init");
+
+    /* Fail every ICV from here on, so no build can complete. A window rather
+     * than wm_Fault_Arm, which is one-shot: the point of the test is what the
+     * second and third ticks do while the fault is still present. */
+    mka_fault_arm_window(MKA_FI_CMAC, 0U, 1000U, -1);
+    CHECK(wm_Participant_Run(&A, 1000U, NULL) == MKA_ERR_CRYPTO,
+        "the first tick attempts a transmit and reports the build failure");
+    CHECK(wm_Participant_Run(&A, 1001U, NULL) == MKA_OK,
+        "the next tick inside the interval does not attempt one at all");
+    CHECK(wm_Participant_Run(&A, 1002U, NULL) == MKA_OK, "nor the one after");
+    CHECK(wm_Participant_Run(&A, 1000U + MKA_HELLO_TIME_MS, NULL) ==
+              MKA_ERR_CRYPTO,
+        "and the attempt returns once the interval has elapsed");
+
+    wm_Fault_Reset();
+    wm_Participant_Free(&A);
 }
 
 /* Error arms of the `if (rc == MKA_OK)` sequences in init, rekey, SAK
@@ -232,6 +242,32 @@ static void test_fault_sequence_paths(void)
 
     printf("fault injection: mid-sequence error arms:\n");
 
+    /* A KDF that fails part-way must not leave the blocks it already produced
+     * in the caller's buffer: they are real derived key material from a
+     * derivation that never completed, and a caller ignoring the return value
+     * would go on using half a key. 32 octets is two CMAC iterations, so
+     * failing the second leaves the first already copied out. */
+    {
+        uint8_t key[16];
+        uint8_t out[32];
+        size_t i;
+        int nonzero = 0;
+
+        memset(key, 0x5B, sizeof key);
+        memset(out, 0xCC, sizeof out);
+        mka_fault_arm_window(MKA_FI_CMAC, 1U, 1U, -1);
+        CHECK(wm_Crypto_Kdf(g_cmac, key, sizeof key, "IEEE8021 KEK", NULL, 0U,
+                  out, sizeof out) == MKA_ERR_CRYPTO,
+            "the second KDF iteration fails");
+        wm_Fault_Reset();
+        for (i = 0U; i < sizeof out; i++) {
+            if (out[i] != 0U) {
+                nonzero = 1;
+            }
+        }
+        CHECK(nonzero == 0, "and no partial key material is left behind");
+    }
+
     memset(&ca, 0, sizeof ca);
     memset(ca.cak.cak, 0xCA, 16);
     ca.cak.cak_len = 16;
@@ -241,14 +277,17 @@ static void test_fault_sequence_paths(void)
     ca.macsec_desired = 1;
     ca.key_server_capable = 1;
     ca.cmac = g_cmac;
+    ca.rng = g_rng;
 
     /* init: key derivation (CMAC) fails -> init aborts. */
     wm_Fault_Arm(MKA_FI_CMAC, -1);
     CHECK(wm_Participant_Init(&A, &ca) == MKA_ERR_CRYPTO,
         "init: key derivation failure");
 
-    /* init: MI generation (RNG) fails after keys derive cleanly. */
-    wm_Fault_Arm(MKA_FI_RNG_INIT, -1);
+    /* init: MI generation (RNG) fails after keys derive cleanly. The RNG
+     * workspace comes from the pool already seeded, so the failure to inject is
+     * the block generation, not an initialisation. */
+    wm_Fault_Arm(MKA_FI_RNG_GEN, -1);
     CHECK(wm_Participant_Init(&A, &ca) == MKA_ERR_CRYPTO,
         "init: MI generation failure");
 
@@ -304,6 +343,7 @@ static void test_fault_sequence_paths(void)
     cb.macsec_desired = 1;
     cb.key_server_capable = 0;
     cb.cmac = g_cmac;
+    cb.rng = g_rng;
     CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init non-KS B");
     {
         uint8_t sak[16], wrapped[40];
@@ -393,6 +433,7 @@ static void test_fault_kay_run_accumulate(void)
         c.key_server_capable = 1;
         c.send = fault_send;
         c.cmac = g_cmac;
+        c.rng = g_rng;
         CHECK(wm_Kay_AddParticipant(&kay, &c, NULL) == MKA_OK, "add CA");
     }
 
@@ -429,6 +470,7 @@ static void test_fault_run_sak_gen(void)
     c.key_server_capable = 1;
     c.send = fault_send;
     c.cmac = g_cmac;
+    c.rng = g_rng;
     CHECK(wm_Participant_Init(&A, &c) == MKA_OK, "init");
 
     /* Force Key-Server status with a live peer so run() must generate a SAK. */
@@ -437,7 +479,7 @@ static void test_fault_run_sak_gen(void)
     A.peers[0].live = 1;
     A.peer_count = 1;
 
-    wm_Fault_Arm(MKA_FI_RNG_INIT, -1); /* SAK generation fails */
+    wm_Fault_Arm(MKA_FI_RNG_GEN, -1); /* SAK generation fails */
     CHECK(wm_Participant_Run(&A, 0, NULL) == MKA_ERR_CRYPTO,
         "run returns the SAK-generation failure");
     CHECK(wm_Participant_HasSak(&A) == 0, "no SAK installed on failure");
@@ -473,6 +515,59 @@ static void test_fault_icv_l2(void)
 }
     #endif /* WOLFMKA_ICV_L2_ADDR */
 
+/* A participant whose initialisation fails must keep nothing: p->cfg already
+ * holds the caller's plaintext CAK by then, and a failure after DeriveKeys
+ * leaves the derived KEK and ICK beside it. wm_Kay_AddParticipant does not
+ * count a participant that failed, so wm_Kay_Free never walks that slot -
+ * whatever is left there survives teardown of the whole KaY. */
+static void test_fault_init_leaves_no_key_material(void)
+{
+    MkaParticipant p;
+    MkaParticipantConfig cfg;
+    MkaKay kay;
+    uint8_t zero[sizeof(MkaParticipant)];
+
+    printf("fault: failed init wipes the participant:\n");
+    memset(zero, 0, sizeof zero);
+
+    /* DeriveKeys fails: the CAK has already been copied in. */
+    memset(&cfg, 0, sizeof cfg);
+    memset(cfg.cak.cak, 0xC1, 16);
+    cfg.cak.cak_len = 16;
+    memcpy(cfg.cak.ckn, "ckn", 3);
+    cfg.cak.ckn_len = 3;
+    cfg.sak_len = 16;
+    cfg.macsec_desired = 1;
+    cfg.cmac = g_cmac;
+    cfg.rng = g_rng;
+    memset(&p, 0xEE, sizeof p);
+    wm_Fault_Arm(MKA_FI_CMAC, -1);
+    CHECK(wm_Participant_Init(&p, &cfg) == MKA_ERR_CRYPTO, "derive fails");
+    CHECK(memcmp(&p, zero, sizeof p) == 0,
+        "no CAK left behind when key derivation fails");
+    wm_Fault_Reset();
+
+    /* MI generation fails: the KEK and ICK exist by then too. */
+    memset(&p, 0xEE, sizeof p);
+    wm_Fault_Arm(MKA_FI_RNG_GEN, -1);
+    CHECK(wm_Participant_Init(&p, &cfg) == MKA_ERR_CRYPTO, "MI gen fails");
+    CHECK(memcmp(&p, zero, sizeof p) == 0,
+        "no CAK, KEK or ICK left behind when MI generation fails");
+    wm_Fault_Reset();
+
+    /* And the slot the KaY manager would never walk is clean too. */
+    CHECK(wm_Kay_Init(&kay) == MKA_OK, "kay init");
+    memset(&kay.parts[0], 0xEE, sizeof kay.parts[0]);
+    wm_Fault_Arm(MKA_FI_CMAC, -1);
+    CHECK(wm_Kay_AddParticipant(&kay, &cfg, NULL) == MKA_ERR_CRYPTO,
+        "add fails");
+    wm_Fault_Reset();
+    CHECK(wm_Kay_ParticipantCount(&kay) == 0U, "the slot is not counted");
+    CHECK(memcmp(&kay.parts[0], zero, sizeof kay.parts[0]) == 0,
+        "and holds no key material for wm_Kay_Free to miss");
+    wm_Kay_Free(&kay);
+}
+
 void run_fault_tests(void)
 {
     printf("\n== fault injection ==\n");
@@ -481,6 +576,8 @@ void run_fault_tests(void)
     test_fault_sequence_paths();
     test_fault_kay_run_accumulate();
     test_fault_run_sak_gen();
+    test_fault_build_failure_is_rate_limited();
+    test_fault_init_leaves_no_key_material();
     #ifdef WOLFMKA_ICV_L2_ADDR
     test_fault_icv_l2();
     #endif

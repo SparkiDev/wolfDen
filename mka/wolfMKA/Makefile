@@ -64,11 +64,13 @@ EXAMPLE_BIN := $(EXAMPLE_SRC:.c=)
 
 .PHONY: all lib test check examples test-alloc test-nomalloc \
         test-fault test-distcak test-kmd test-suspension test-negotiation \
-        test-icv-l2 test-icv-l2-suite \
+        test-icv-l2 test-icv-l2-suite test-automotive \
         example-distcak example-autosar features cxx misra docs \
-        test-automotive example-distcak example-autosar features cxx misra docs \
-        autosar coverage sanitize analyze fuzz fuzz-pdu fuzz-receive \
-        interop interop-dataplane test-endian footprint format format-check clean FORCE
+        autosar test-det coverage coverage-configs coverage-autosar \
+        cov-impl \
+        sanitize analyze fuzz fuzz-pdu fuzz-receive fuzz-receive-l2 \
+        interop interop-dataplane test-endian footprint format format-check \
+        clean FORCE
 
 # Doxygen tool (override on the command line if not on PATH).
 DOXYGEN    ?= doxygen
@@ -284,10 +286,23 @@ footprint:
 # back-off and Announcements all stay in; only EAP-MSK derivation is compiled
 # out, since the binding keys from a pre-shared CAK).
 autosar:
-	$(CC) $(CFLAGS) -DWOLFMKA_AUTOSAR -DWOLFMKA_CMAC_POOL_SIZE=2 -Itest \
+	$(CC) $(CFLAGS) -DWOLFMKA_AUTOSAR -DWOLFMKA_CMAC_POOL_SIZE=2 -DWOLFMKA_RANDOM_POOL_SIZE=2 -Itest \
 	    $(SRC) src/autosar/Mka.c test/test_autosar.c -o test/runautosar \
 	    $(LDFLAGS) $(LDLIBS)
 	./test/runautosar
+
+# The same suite with development-error detection on (SWS section 7). Detection
+# is identical either way - the switch only adds the Det report - so this build
+# runs every case the default one does, plus phase_det, which asserts the exact
+# (API service ID, error ID) pair for each rejection. test/Det.h stands in for
+# the generated Det module, so what is exercised is Mka.h's own default wiring
+# rather than an override.
+test-det:
+	$(CC) $(CFLAGS) -DWOLFMKA_AUTOSAR -DWOLFMKA_CMAC_POOL_SIZE=2 -DWOLFMKA_RANDOM_POOL_SIZE=2 \
+	    -DMKA_DEV_ERROR_DETECT=STD_ON -Itest \
+	    $(SRC) src/autosar/Mka.c test/test_autosar.c -o test/rundet \
+	    $(LDFLAGS) $(LDLIBS)
+	./test/rundet
 
 # Run the unit suite under AddressSanitizer + UndefinedBehaviorSanitizer. This
 # is the reproducible form of the ASan+UBSan evidence cited in COMPLIANCE.md and
@@ -319,15 +334,25 @@ FUZZ_CC      ?= clang
 FUZZ_SECONDS ?= 30
 FUZZ_FLAGS   := -fsanitize=fuzzer,address,undefined \
                 -fno-sanitize-recover=undefined -O1 -g
-fuzz: fuzz-pdu fuzz-receive
+fuzz: fuzz-pdu fuzz-receive fuzz-receive-l2
 
 fuzz-pdu:
 	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) test/fuzz_pdu.c $(SRC) \
 	    -o test/fuzz_pdu $(LDFLAGS) $(LDLIBS)
 	./test/fuzz_pdu -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
 
+# The same stateful harness with the L2-address ICV in force, so the
+# wpa_supplicant-compatible decode path is fuzzed too; the harness seals frames
+# the way the library verifies them, so it still reaches the state machine.
+fuzz-receive-l2:
+	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) -DWOLFMKA_ICV_L2_ADDR \
+	    -Itest test/fuzz_receive.c $(SRC) \
+	    -o test/fuzz_receive_l2 $(LDFLAGS) $(LDLIBS)
+	./test/fuzz_receive_l2 -max_total_time=$(FUZZ_SECONDS) \
+	    -print_final_stats=1
+
 fuzz-receive:
-	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) test/fuzz_receive.c $(SRC) \
+	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) -Itest test/fuzz_receive.c $(SRC) \
 	    -o test/fuzz_receive $(LDFLAGS) $(LDLIBS)
 	./test/fuzz_receive -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
 
@@ -358,7 +383,11 @@ cxx:
 	@set -e; for f in $(CXX_SRC); do \
 	    $(CXX) $(CXX_STD) -Wall -Wextra -Iinclude -Itest \
 	        -I$(WOLFSSL_DIR)/include -fsyntax-only $$f; \
-	done; echo "all sources compile as C++ ($(CXX) $(CXX_STD))"
+	done
+	@set -e; $(CXX) $(CXX_STD) -Wall -Wextra -Iinclude -Itest \
+	    -I$(WOLFSSL_DIR)/include -DWOLFMKA_AUTOSAR \
+	    -DMKA_DEV_ERROR_DETECT=STD_ON -fsyntax-only src/autosar/Mka.c
+	@echo "all sources compile as C++ ($(CXX) $(CXX_STD)), Det on and off"
 
 misra:
 	@command -v $(CPPCHECK) >/dev/null 2>&1 || { \
@@ -381,6 +410,17 @@ misra:
 	    if [ -n "$$out" ]; then \
 	        echo "[misra]$$cfg"; echo "$$out"; rc=1; fi; \
 	  done; \
+	  for cfg in "$(MISRA_DEFS) -DWOLFMKA_AUTOSAR" \
+	      "$(MISRA_DEFS) -DWOLFMKA_AUTOSAR -DMKA_DEV_ERROR_DETECT=STD_ON"; \
+	  do \
+	    out=$$($(CPPCHECK) --addon=misra --std=c99 --enable=style --quiet \
+	        --suppressions-list=misra-suppressions.txt \
+	        $$cfg -Iinclude -Itest -I$(WOLFSSL_DIR)/include \
+	        src/autosar/Mka.c 2>&1 \
+	        | grep -E "^src/|^include/wolfmka/" || true); \
+	    if [ -n "$$out" ]; then \
+	        echo "[misra]$$cfg"; echo "$$out"; rc=1; fi; \
+	  done; \
 	if [ $$rc -ne 0 ]; then \
 	    echo "MISRA: undocumented findings (see MISRA.md)"; exit 1; \
 	else echo "MISRA: CLEAN in all checked configs (documented deviations only)"; \
@@ -393,7 +433,9 @@ docs:
 	if [ -n "$$warn" ]; then echo "$$warn"; echo "Doxygen: warnings"; exit 1; \
 	else echo "Doxygen: HTML written to doc/html/index.html"; fi
 
-# Structural coverage of the core sources. Builds the suite instrumented for
+# Structural coverage of the core sources - every .c in src/ except the AUTOSAR
+# binding, which needs its own flags and suite (see coverage-autosar below).
+# Builds the suite instrumented for
 # gcov + MC/DC at -O0 (so every error path is reachable and branch/condition
 # data is not perturbed by optimisation), runs it, and FAILS unless every core
 # source reaches 100% line, decision (branch) and MC/DC (condition) coverage.
@@ -401,7 +443,7 @@ docs:
 # branch); MC/DC is the masking variant from GCC's -fcondition-coverage,
 # reported by `gcov --conditions` as "Condition outcomes covered".
 COVDIR := build/coverage
-COV_FILES := src/mka_crypto.c src/mka_kay.c src/mka_pdu.c
+COV_FILES := src/mka_crypto.c src/mka_kay.c src/mka_pdu.c src/mka_status.c
 COV_BASE := -DWOLFMKA_FAULT_INJECT -DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD \
             -DWOLFMKA_SUSPENSION
 
@@ -433,6 +475,48 @@ cov-impl:
 	if [ $$rc -ne 0 ]; then echo "coverage [$(COV_LABEL)]: FAILED (< 100%)"; \
 	    exit 1; fi; \
 	echo "coverage [$(COV_LABEL)]: PASS (100% line + decision + MC/DC)"
+
+# Structural coverage of the AUTOSAR binding. src/autosar/Mka.c cannot ride in
+# cov-impl: it needs -DWOLFMKA_AUTOSAR (which implies WOLFMKA_NO_EAP and changes
+# struct layout) and its own suite, so it is a separate instrumented build held
+# to the same 100% line + decision + MC/DC bar. Without this the binding's
+# coverage is measured by hand and silently regresses - which it had.
+#
+# Run twice: MKA_DEV_ERROR_DETECT adds branches of its own, so 100% with the
+# reporting off says nothing about the build that has it on. Both are
+# instrumented with WOLFMKA_FAULT_INJECT, since a Connectivity Association
+# failing inside Mka_MainFunction needs a wolfSSL failure to produce.
+COVADIR := build/coverage-autosar
+COVA_CFG ?=
+COVA_LABEL ?= autosar
+coverage-autosar:
+	@$(MAKE) --no-print-directory cova-impl COVA_CFG= COVA_LABEL=autosar
+	@$(MAKE) --no-print-directory cova-impl \
+	    COVA_CFG=-DMKA_DEV_ERROR_DETECT=STD_ON COVA_LABEL=autosar-det
+
+cova-impl:
+	@rm -rf $(COVADIR); mkdir -p $(COVADIR)
+	@for f in $(SRC) src/autosar/Mka.c test/test_autosar.c; do \
+	    $(CC) $(CFLAGS) -O0 --coverage -fcondition-coverage -Itest \
+	        -DWOLFMKA_AUTOSAR -DWOLFMKA_CMAC_POOL_SIZE=2 -DWOLFMKA_RANDOM_POOL_SIZE=2 \
+	        -DWOLFMKA_FAULT_INJECT $(COVA_CFG) \
+	        -c $$f -o $(COVADIR)/$$(basename $$f .c).o || exit 1; \
+	done
+	@$(CC) --coverage $(COVADIR)/*.o -o $(COVADIR)/runcov $(LDFLAGS) $(LDLIBS)
+	@$(COVADIR)/runcov >/dev/null
+	@echo "== coverage [$(COVA_LABEL)]: line + decision + MC/DC =="
+	@rc=0; M='(Lines executed|Taken at least once|Condition outcomes covered):';\
+	m=$$($(GCOV) --conditions -b -o $(COVADIR) src/autosar/Mka.c 2>/dev/null); \
+	line=$$(printf '%s\n' "$$m" | awk -v M="$$M" \
+	    '$$0 ~ M {printf "%s  ", $$0} END{print ""}'); \
+	bad=$$(printf '%s\n' "$$m" | awk -v M="$$M" \
+	    '$$0 ~ M && $$0 !~ /:100\.00%/ {n++} END{print n+0}'); \
+	printf '  %-18s %s\n' "src/autosar/Mka.c" "$$line"; \
+	if [ "$$bad" -ne 0 ]; then rc=1; fi; \
+	rm -f *.gcov; \
+	if [ $$rc -ne 0 ]; then echo "coverage [$(COVA_LABEL)]: FAILED (< 100%)"; \
+	    exit 1; fi; \
+	echo "coverage [$(COVA_LABEL)]: PASS (100% line + decision + MC/DC)"
 
 # Default coverage gate: the certification-base configuration.
 coverage:
@@ -507,7 +591,7 @@ clean:
 	rm -f $(OBJ) $(DEP) $(LIB) $(TEST_BIN) $(EXAMPLE_BIN) examples/mka_group_cak examples/mka_autosar \
 	      test/runalloc test/runfault test/rundistcak test/runkmd test/runsusp \
 	      test/runnego test/runauto test/runicvl2 test/runicvl2suite test/runautosar \
-	      test/runsanitize test/fuzz_pdu test/fuzz_receive \
+	      test/runsanitize test/fuzz_pdu test/fuzz_receive test/fuzz_receive_l2 \
 	      test/runendian test/test_endian_be \
 	      src/autosar/Mka.o
 	rm -rf doc build *.gcov
