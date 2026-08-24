@@ -11,7 +11,8 @@ CREATE_SUBDIRS         = NO
 # (COMPLIANCE.md, FMEA.md, ...) resolve into the generated manual.
 INPUT                  = include src README.md COMPLIANCE.md FMEA.md \
                          SECURITY.md REQUIREMENTS.md MISRA.md \
-                         CHANGELOG.md FOOTPRINT.md
+                         CHANGELOG.md FOOTPRINT.md \
+                         AUTOSAR.md OPEN-ALLIANCE.md MCDC-AND-COVERAGE.md
 FILE_PATTERNS          = *.c *.h *.md
 RECURSIVE              = YES
 USE_MDFILE_AS_MAINPAGE = README.md

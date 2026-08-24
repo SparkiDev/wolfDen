@@ -59,6 +59,42 @@ extern "C" {
 #define MKA_SECY_PENDING 0x50454E44
 
 /**
+ * MACsec statistics kept by the SecY for the port as a whole (IEEE Std
+ * 802.1AE-2018, 10.7.9/10.7.10 for the receive counters and 10.7.18/10.7.19 for
+ * the transmit ones). Read through MkaSecyOps.get_secy_stats; wolfMKA never
+ * maintains these itself - the data plane owns them.
+ */
+typedef struct {
+    uint64_t out_pkts_untagged;
+    uint64_t out_pkts_too_long;
+    uint64_t out_octets_protected;
+    uint64_t out_octets_encrypted;
+    uint64_t in_pkts_untagged;
+    uint64_t in_pkts_no_tag;
+    uint64_t in_pkts_bad_tag;
+    uint64_t in_pkts_no_sa;
+    uint64_t in_pkts_no_sa_error;
+    uint64_t in_pkts_overrun;
+    uint64_t in_octets_validated;
+    uint64_t in_octets_decrypted;
+} MkaSecyStats;
+
+/** Per-transmit-Secure-Channel statistics (802.1AE secyTxSCStatsEntry). */
+typedef struct {
+    uint64_t out_pkts_protected;
+    uint64_t out_pkts_encrypted;
+} MkaTxScStats;
+
+/** Per-receive-Secure-Channel statistics (802.1AE secyRxSCStatsEntry). */
+typedef struct {
+    uint64_t in_pkts_ok;
+    uint64_t in_pkts_unchecked;
+    uint64_t in_pkts_late;
+    uint64_t in_pkts_invalid;
+    uint64_t in_pkts_not_valid;
+} MkaRxScStats;
+
+/**
  * Data-plane (SecY) callbacks the KaY drives as a SAK is agreed.
  *
  * Every callback returns 0 on success and a negative value on failure, or the
@@ -131,6 +167,22 @@ typedef struct MkaSecyOps {
      */
     int (*set_cipher_suite)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
         uint64_t cipher_suite, uint32_t ssci, uint8_t confidentiality_offset);
+
+    /* --- Optional: MACsec statistics (802.1AE Clause 10.7) --------------- */
+
+    /**
+     * Read the port's MACsec statistics. Optional; leave NULL when the data
+     * plane exposes no counters. The KaY never calls this on its own - it is
+     * driven by wm_Participant_GetSecyStats() on behalf of a management or
+     * diagnostics interface (OPEN Alliance AutoMKA-07009).
+     */
+    int (*get_secy_stats)(void* ctx, MkaSecyStats* out);
+    /** Read one transmit Secure Channel's statistics. Optional. */
+    int (*get_tx_sc_stats)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
+        MkaTxScStats* out);
+    /** Read one receive Secure Channel's statistics. Optional. */
+    int (*get_rx_sc_stats)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
+        MkaRxScStats* out);
 
     /** Opaque context passed to every callback. */
     void* ctx;

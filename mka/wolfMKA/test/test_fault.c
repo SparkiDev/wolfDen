@@ -313,6 +313,9 @@ static void test_fault_sequence_paths(void)
         CHECK(wm_Crypto_WrapSak(B.keys.kek, B.keys.kek_len, sak, 16, wrapped,
                   &wlen) == MKA_OK,
             "wrap for dist frame");
+        n = sizeof f;
+        CHECK(wm_Participant_BuildMkpdu(&B, f, sizeof f, &n) == MKA_OK,
+            "B emits an MKPDU so it has a Message Number to be echoed");
         memset(&in, 0, sizeof in);
         in.basic.version = 1;
         in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
@@ -327,7 +330,10 @@ static void test_fault_sequence_paths(void)
         in.live_peers.present = 1;
         in.live_peers.count = 1;
         memcpy(in.live_peers.peers[0].mi, B.actor_mi, MKA_MI_LEN);
-        in.live_peers.peers[0].mn = 1;
+        /* Echo a Message Number B has actually emitted: liveness requires an
+         * acceptably recent one (802.1X 9.4.3), so B must have sent an MKPDU
+         * first. */
+        in.live_peers.peers[0].mn = B.actor_mn - 1U;
         in.dist_sak.present = 1;
         in.dist_sak.kn = 1;
         in.dist_sak.distributed_an = 0;

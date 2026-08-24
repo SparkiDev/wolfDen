@@ -5,7 +5,15 @@ This document maps wolfMKA against the **AUTOSAR Classic Platform**
 IEEE Std 802.1X-2020 MKA protocol for automotive use. It is the AUTOSAR-facing
 companion to [`REQUIREMENTS.md`](REQUIREMENTS.md) (the 802.1X requirements
 matrix) and follows the same "supports, not certified" scope discipline as
-[`COMPLIANCE.md`](COMPLIANCE.md).
+[`COMPLIANCE.md`](COMPLIANCE.md). Its sibling for the other automotive profile
+is [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) (OPEN Alliance TC17 Automotive MKA).
+The two are separate profiles of the same core and select different feature
+sets: `WOLFMKA_AUTOSAR` compiles out EAP and keeps Announcements,
+`WOLFMKA_AUTOMOTIVE_PROFILE` compiles out Announcements and announces MKPDU
+version 3. They do compile together, but the combination drops
+`Mka_PaeConfigType.AnnounceCipherSuites` (that field is itself
+`WOLFMKA_NO_ANNOUNCEMENTS`-guarded), so build them together only if the ECU
+genuinely wants both profiles' restrictions.
 
 > wolfMKA is a portable MKA control-plane library, not a generated AUTOSAR BSW
 > module, and is not certified to any AUTOSAR conformance class. It ships an
