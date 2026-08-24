@@ -63,7 +63,8 @@ EXAMPLE_SRC := $(filter-out examples/mka_group_cak.c examples/mka_autosar.c,\
 EXAMPLE_BIN := $(EXAMPLE_SRC:.c=)
 
 .PHONY: all lib test check examples test-alloc test-nomalloc \
-        test-fault test-distcak test-kmd test-suspension test-negotiation test-icv-l2 \
+        test-fault test-distcak test-kmd test-suspension test-negotiation \
+        test-icv-l2 test-icv-l2-suite \
         example-distcak example-autosar features cxx misra docs \
         test-automotive example-distcak example-autosar features cxx misra docs \
         autosar coverage sanitize analyze fuzz fuzz-pdu fuzz-receive \
@@ -195,6 +196,14 @@ test-negotiation:
 # the ICV cover the DA || SA || EtherType L2 prefix ahead of the MKPDU, matching
 # wpa_supplicant / the Linux kernel; off by default. The full suite's PDU/KAY
 # frame builders assume the non-L2 ICV, so this path is pinned on its own.
+# Build and run the full suite with the L2-address ICV in force, so every PDU
+# and KaY test exercises the wpa_supplicant-compatible ICV input rather than
+# only the standalone smoke test below.
+test-icv-l2-suite:
+	$(CC) $(CFLAGS) -DWOLFMKA_ICV_L2_ADDR $(TEST_SRC) \
+	    $(SRC) -o test/runicvl2suite $(LDFLAGS) $(LDLIBS)
+	./test/runicvl2suite
+
 test-icv-l2:
 	$(CC) $(CFLAGS) -DWOLFMKA_ICV_L2_ADDR test/test_icv_l2.c \
 	    $(SRC) -o test/runicvl2 $(LDFLAGS) $(LDLIBS)
@@ -332,7 +341,7 @@ features:
 	    "-DWOLFMKA_NO_ANNOUNCEMENTS" "-DWOLFMKA_NO_AUTO_REKEY" \
 	    "-DWOLFMKA_DISTRIBUTED_CAK" "-DWOLFMKA_KMD" "-DWOLFMKA_SUSPENSION" \
 	    "-DWOLFMKA_CIPHER_NEGOTIATION" "-DWOLFMKA_AUTOMOTIVE_PROFILE" \
-	    "-DWOLFMKA_ICV_L2_ADDR" \"-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
+	    "-DWOLFMKA_ICV_L2_ADDR" "-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC"; do \
 	    printf '  [features]%s\n' " $${cfg:-default}"; \
 	    for f in $(SRC); do $(CC) $(CFLAGS) $$cfg -c $$f -o /tmp/wmka.o; done; \
@@ -361,6 +370,7 @@ misra:
 	@rc=0; for cfg in "$(MISRA_DEFS)" \
 	    "$(MISRA_DEFS) -DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD -DWOLFMKA_SUSPENSION -DWOLFMKA_CIPHER_NEGOTIATION" \
 	    "$(MISRA_DEFS) -DWOLFMKA_AUTOMOTIVE_PROFILE" \
+	    "$(MISRA_DEFS) -DWOLFMKA_ICV_L2_ADDR" \
 	    "$(MISRA_BASE) -DWOLFMKA_BIG_ENDIAN" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC -DWOLFMKA_LITTLE_ENDIAN --max-configs=1"; \
 	  do \
@@ -432,7 +442,7 @@ coverage:
 # Per-configuration structural coverage: enforce 100% line + decision + MC/DC
 # for every delivered configuration. Every WOLFMKA_NO_* feature-off build
 # compiles and runs its suite to PASS under its own flag (feature-specific tests
-# are #ifndef-gated), and all ten configurations below reach - and are forced
+# are #ifndef-gated), and all eleven configurations below reach - and are forced
 # to - 100% line + decision + MC/DC. Three feature-off branches were once short
 # of 100%; all are now resolved (NO_XPN excluded as genuinely dead code with
 # #ifndef; NO_EAP and NO_AUTO_REKEY are reachable paths covered by added tests,
@@ -446,6 +456,8 @@ coverage-configs:
 	@$(MAKE) --no-print-directory cov-impl \
 	    COV_CFG="-DWOLFMKA_FAULT_INJECT -DWOLFMKA_AUTOMOTIVE_PROFILE" \
 	    COV_LABEL=automotive-profile
+	@$(MAKE) --no-print-directory cov-impl \
+	    COV_CFG="$(COV_BASE) -DWOLFMKA_ICV_L2_ADDR" COV_LABEL=icv-l2
 	@$(MAKE) --no-print-directory cov-impl \
 	    COV_CFG="$(COV_BASE) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC" \
 	    COV_LABEL=small-stack-no-malloc
@@ -494,7 +506,7 @@ format-check:
 clean:
 	rm -f $(OBJ) $(DEP) $(LIB) $(TEST_BIN) $(EXAMPLE_BIN) examples/mka_group_cak examples/mka_autosar \
 	      test/runalloc test/runfault test/rundistcak test/runkmd test/runsusp \
-	      test/runnego test/runauto test/runautosar \
+	      test/runnego test/runauto test/runicvl2 test/runicvl2suite test/runautosar \
 	      test/runsanitize test/fuzz_pdu test/fuzz_receive \
 	      test/runendian test/test_endian_be \
 	      src/autosar/Mka.o

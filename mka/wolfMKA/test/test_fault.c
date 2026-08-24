@@ -445,6 +445,34 @@ static void test_fault_run_sak_gen(void)
     wm_Fault_Reset();
 }
 
+    #ifdef WOLFMKA_ICV_L2_ADDR
+/* The L2 ICV builds its CMAC in four streaming steps; a failure at any of them
+ * must propagate out as MKA_ERR_CRYPTO rather than yielding a half-computed
+ * ICV. Arming the hook fails the first step, which is what drives the
+ * "previous step failed" guards through the rest of the sequence. */
+static void test_fault_icv_l2(void)
+{
+    uint8_t ick[16], l2[MKA_ICV_L2_PREFIX_LEN], data[32], icv[16];
+
+    printf("fault: L2 ICV streaming CMAC:\n");
+    memset(ick, 0x11, sizeof ick);
+    memset(l2, 0x33, sizeof l2);
+    memset(data, 0x22, sizeof data);
+
+    wm_Fault_Arm(MKA_FI_CMAC, -1);
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_ERR_CRYPTO,
+        "L2 icv compute reports a CMAC failure");
+    wm_Fault_Reset();
+
+    wm_Fault_Arm(MKA_FI_CMAC, -1);
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_ERR_CRYPTO,
+        "L2 icv verify reports a CMAC failure");
+    wm_Fault_Reset();
+}
+    #endif /* WOLFMKA_ICV_L2_ADDR */
+
 void run_fault_tests(void)
 {
     printf("\n== fault injection ==\n");
@@ -453,6 +481,9 @@ void run_fault_tests(void)
     test_fault_sequence_paths();
     test_fault_kay_run_accumulate();
     test_fault_run_sak_gen();
+    #ifdef WOLFMKA_ICV_L2_ADDR
+    test_fault_icv_l2();
+    #endif
 }
 
 #else /* fault injection compiled out */

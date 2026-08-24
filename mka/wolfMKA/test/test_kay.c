@@ -964,8 +964,7 @@ static void test_kay_ckn_mismatch(void)
         }
     }
     CHECK(found, "located CKN in frame");
-    wm_Crypto_IcvCompute(g_cmac, A.keys.ick, A.keys.ick_len, f, n - 16U,
-        &f[n - 16U]);
+    test_seal_icv(g_cmac, A.keys.ick, A.keys.ick_len, f, n - 16U);
     CHECK(wm_Participant_Receive(&A, f, n, 0) == MKA_ERR_NO_PEER,
         "valid ICV but foreign CKN -> NO_PEER");
 }

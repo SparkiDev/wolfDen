@@ -41,12 +41,14 @@ make misra        # runs the addon across the checked configurations
 The target reports any finding that is **not** a documented deviation below; a
 clean run means the only remaining findings are the approved deviations.
 
-`make misra` analyses five build configurations: the compliant little-endian
+`make misra` analyses six build configurations: the compliant little-endian
 base (`-DWOLFMKA_NO_MALLOC -DWOLFMKA_SMALL_STACK -DWOLFMKA_LITTLE_ENDIAN`), that
 base with the opt-in `-DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD
 -DWOLFMKA_SUSPENSION -DWOLFMKA_CIPHER_NEGOTIATION` features, that base under the
 OPEN Alliance automotive profile (`-DWOLFMKA_AUTOMOTIVE_PROFILE`, which selects a
-different announced MKPDU version and compiles the Announcement code out), a
+different announced MKPDU version and compiles the Announcement code out), that
+base with the L2-address ICV (`-DWOLFMKA_ICV_L2_ADDR`, which adds the streaming
+CMAC path), a
 **big-endian** build of the base (`-DWOLFMKA_BIG_ENDIAN`, which exercises the
 network-order serialization path in the MKPDU codec), and the
 maximally-stripped feature-off build.

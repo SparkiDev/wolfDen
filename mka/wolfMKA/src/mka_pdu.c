@@ -28,13 +28,14 @@
 #include "wolfmka/mka_bytes.h"
 
 #ifdef WOLFMKA_ICV_L2_ADDR
-/* Offset of the sender SCI MAC within the EAPOL PDU: past the EAPOL header, then
- * the 4-octet Basic Parameter Set header that precedes the Actor SCI. */
-#define MKA_L2_SCI_MAC_OFFSET (EAPOL_HDR_LEN + 4U)
+    /* Offset of the sender SCI MAC within the EAPOL PDU: past the EAPOL header,
+     * then the 4-octet Basic Parameter Set header that precedes the Actor SCI.
+     */
+    #define MKA_L2_SCI_MAC_OFFSET (EAPOL_HDR_LEN + 4U)
 /* Build the L2 prefix the ICV covers: PAE group DA || sender SCI MAC || EAPOL
  * EtherType (MKA_ICV_L2_PREFIX_LEN octets). */
 static void mka_build_l2_prefix(uint8_t l2[MKA_ICV_L2_PREFIX_LEN],
-                                const uint8_t* eapol_pdu)
+    const uint8_t* eapol_pdu)
 {
     static const uint8_t pae_group[6] = MKA_PAE_GROUP_ADDR;
     (void)WOLFMKA_MEMCPY(&l2[0], pae_group, sizeof pae_group);
@@ -667,8 +668,8 @@ MkaStatus wm_Pdu_Encode(MkaCmacCtx* cmac, const MkaPdu* pdu, const uint8_t* ick,
     icv_off = w.len;
 #ifdef WOLFMKA_ICV_L2_ADDR
     mka_build_l2_prefix(l2, out);
-    rc = wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, sizeof l2, out,
-                                icv_off, icv);
+    rc = wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, sizeof l2, out, icv_off,
+        icv);
 #else
     rc = wm_Crypto_IcvCompute(cmac, ick, ick_len, out, icv_off, icv);
 #endif
@@ -1187,8 +1188,8 @@ static MkaStatus mka_verify_frame(MkaCmacCtx* cmac, const uint8_t* in,
     covered = (EAPOL_HDR_LEN + *body_len) - MKA_DEFAULT_ICV_LEN;
 #ifdef WOLFMKA_ICV_L2_ADDR
     mka_build_l2_prefix(l2, in);
-    return wm_Crypto_IcvVerifyL2(cmac, ick, ick_len, l2, sizeof l2, in,
-                                 covered, &in[covered]);
+    return wm_Crypto_IcvVerifyL2(cmac, ick, ick_len, l2, sizeof l2, in, covered,
+        &in[covered]);
 #else
     return wm_Crypto_IcvVerify(cmac, ick, ick_len, in, covered, &in[covered]);
 #endif

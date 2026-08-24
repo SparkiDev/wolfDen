@@ -46,6 +46,7 @@ elects a *Key Server*, and securely distributes the *Secure Association Keys
 | MKA participant suspension | 802.1Xbx-2014 | ✅ (opt-in, XPN) |
 | Fast startup: peer-list change answered at once | §9.4 (`newInfo`) | ✅ (opt-in) |
 | Peer-reset recovery (same SCI, new MI) | OA AutoMKA-03006 | ✅ |
+| L2-address ICV (wpa_supplicant-compatible ICV input) | §11.11.3 | ✅ (opt-in) |
 | Liveness requires an acceptably recent echoed MN | §9.4.3 / OA AutoMKA-03005, -04004 | ✅ |
 | SecY MACsec statistics + PAE status accessors | OA AutoMKA-07008, -07009 | ✅ |
 | Losing CAs quiesce once one establishes MACsec | OA AutoMKA-09001, -09002 | ✅ (opt-in) |
@@ -127,6 +128,7 @@ Some features are **opt-in** (off by default, so the default build is unchanged)
 |--------|------|
 | `WOLFMKA_DISTRIBUTED_CAK` | Distributed CAK parameter set (type 5): the `wm_Participant_DistributeCak` Key-Server API, plus a `cak_received` event by which a member reports the unwrapped group CAK to the integrator. `make test-distcak` builds and tests with it enabled. |
 | `WOLFMKA_KMD` | Key Management Domain parameter set (type 6): a configured `kmd` the Key Server advertises, and a `wm_Participant_GetKmd` accessor by which a member reads the received domain name. Informational only (authenticated by the MKPDU ICV; no extra crypto). `make test-kmd` builds and tests with it enabled. |
+| `WOLFMKA_ICV_L2_ADDR` | Computes and verifies the MKPDU ICV over an L2 prefix — destination (PAE group address), source (the SCI from the Basic Parameter Set) and EAPOL EtherType — followed by the MKPDU, which is the ICV input wpa_supplicant uses (IEEE Std 802.1X-2010 §11.11.3). Off by default; enable it to interoperate with peers that bind the Ethernet framing into the ICV. It changes what is signed, so **both ends must agree**. `make test-icv-l2` runs the standalone check and `make test-icv-l2-suite` runs the whole suite over this ICV path. |
 | `WOLFMKA_AUTOMOTIVE_PROFILE` | The OPEN Alliance TC17 **Automotive MKA** profile: version 3 MKPDUs and no Secure Announcements / cipher-suite negotiation, plus `wm_Participant_AutomotiveDefaults()` for the profile's startup timing (10 ms → Hello Time ramp and immediate response to a peer-list change). `make test-automotive` builds and tests with it enabled; [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) is the requirement-by-requirement map, including the known gaps. |
 | `WOLFMKA_SUSPENSION` | MKA participant suspension (802.1Xbx-2014): `wm_Participant_Suspend(p, seconds)` / `wm_Participant_Resume(p)`. A suspended participant advertises a suspension time (in the XPN set's MKA Suspension Time field) and goes quiet; peers hold its state past the Life Time so the SAK survives the gap. **Requires XPN** (must not be combined with `WOLFMKA_NO_XPN`). `make test-suspension` builds and tests with it enabled. |
 | `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces offset 0, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, signalled to the SecY as `MKA_CONF_OFFSET_NONE`. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
@@ -322,7 +324,7 @@ both outcomes of every branch are taken, and every operand of each compound
 `&&`/`||` condition is shown to independently affect the result. Run `make
 coverage` to reproduce the figures (gcov `--conditions`, built at `-O0` with
 `-DWOLFMKA_FAULT_INJECT`); the target **fails** below 100% on any of the three
-metrics. `make coverage-configs` re-runs the same enforced check across all ten
+metrics. `make coverage-configs` re-runs the same enforced check across all eleven
 delivered configurations (cert base, cipher negotiation, small-stack/no-malloc,
 and the `NO_*` feature-off builds). MC/DC is the masking variant accepted by
 DO-178C, measured with GCC's `-fcondition-coverage`. Every public function is

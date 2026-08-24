@@ -74,6 +74,27 @@ exposed in code as `WOLFMKA_VERSION_MAJOR` / `_MINOR` / `_PATCH` /
   as before; the automotive profile selects 3). Receive is unchanged: a peer's
   announced version has never been used to reject a frame.
 
+### Fixed
+
+- **`make features` was broken** — a stray backslash in the configuration list
+  (`\"-DWOLFMKA_AUTOSAR"`) made the shell abort with a syntax error, so the
+  whole feature-matrix gate silently stopped compiling anything, including the
+  AUTOSAR configuration.
+- **`make cxx` was broken** — `test/test_icv_l2.c` needs `WOLFMKA_ICV_L2_ADDR`,
+  but the C++ sweep compiles every test source in the default configuration.
+  The file now self-guards and reports SKIP without the flag.
+- **The L2-address ICV was outside the test and coverage gates.** The suite's
+  `reseal` helper and four other places sealed frames with the non-L2
+  `wm_Crypto_IcvCompute`, so the whole suite failed when built with
+  `WOLFMKA_ICV_L2_ADDR`. They now share `test_seal_icv()`, which signs whatever
+  the library verifies, and the L2 configuration is a first-class build: `make
+  test-icv-l2-suite` runs the full suite over it, `make coverage-configs`
+  enforces 100% MC/DC on it, and `make misra` checks it.
+- **`mka_aes_cmac_l2` could not be fault-injected per stage.** Routing only the
+  result through `MKA_FI` left the three "did the previous step fail" guards of
+  the streaming CMAC unreachable in test builds; each call now goes through the
+  hook, as the reviewer suggested.
+
 ### Changed
 
 - **A participant configured `macsec_desired = false` no longer programs the

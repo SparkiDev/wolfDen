@@ -41,7 +41,7 @@ your system; wolfMKA cannot.
 | Failure-mode analysis (component) | [`FMEA.md`](FMEA.md) | System-level FMEA/FMEDA, hazard & risk analysis, diagnostic coverage figures |
 | Vulnerability handling | [`SECURITY.md`](SECURITY.md) process | Adopt/extend it into your product PSIRT; CVE triage for *your* release |
 | Verification evidence | 728 unit checks (`make test`, including RFC 4493/3394 and hostapd-pinned crypto known-answer vectors), valgrind-clean, ASan+UBSan-clean (`make sanitize`), GCC `-fanalyzer`-clean (`make analyze`), libFuzzer smoke pass on the decoder and receive path (`make fuzz`), assertion strength validated by mutation testing | Integration & system test, target-hardware test, coverage on your toolchain |
-| Structural coverage | 100% line + 100% decision (branch) **+ 100% MC/DC** on the core sources, enforced by `make coverage`; `make coverage-configs` re-checks all ten delivered configurations | Re-run on your target toolchain; structural coverage of your integration code |
+| Structural coverage | 100% line + 100% decision (branch) **+ 100% MC/DC** on the core sources, enforced by `make coverage`; `make coverage-configs` re-checks all eleven delivered configurations | Re-run on your target toolchain; structural coverage of your integration code |
 | Defensive design | param validation on every entry point; `WOLFMKA_NO_MALLOC`; bounded stack; bounded loops; no recursion | Stack-depth budget on your target; WCET if real-time-relevant |
 | Cryptographic primitives | *none* — delegated to wolfSSL | wolfSSL FIPS 140-3 / validation posture; RNG entropy source quality |
 | Threat model / attack surface | partial (hardening rationale in `REQUIREMENTS.md` §Security) | Full threat model of the deployed system (feeds both 4-1 and 61508 hazard analysis) |
@@ -90,7 +90,7 @@ In rough priority order (see the closing section of `REQUIREMENTS.md` and
 
 Structural coverage is no longer in this list: the core sources meet 100% line,
 decision **and** MC/DC, enforced by `make coverage` / `make coverage-configs`
-across all ten delivered configurations (the masking MC/DC variant accepted by
+across all eleven delivered configurations (the masking MC/DC variant accepted by
 DO-178C up to DAL A). The integrator still re-runs it on their target toolchain
 and extends it to their integration code.
 

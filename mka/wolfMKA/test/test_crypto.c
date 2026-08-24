@@ -271,6 +271,9 @@ static void test_eap_derivation(void)
 }
 #endif /* WOLFMKA_NO_EAP */
 
+/* Shorthand for the expected status in argument-validation checks. Do not
+ * declare a local named BAD: it would expand to a variable named after the
+ * enum constant, shadowing it and initialising from itself. */
 #define BAD MKA_ERR_BAD_ARG
 
 /* wm_Crypto_Kdf: exercise every argument-validation branch. */
@@ -553,6 +556,93 @@ static void test_crypto_invalid_params(void)
         "verify icv NULL");
 }
 
+#ifdef WOLFMKA_ICV_L2_ADDR
+/* The L2-inclusive ICV binds the Ethernet framing - destination, source and
+ * EtherType - into the same CMAC as the MKPDU, which is what wpa_supplicant
+ * verifies (IEEE Std 802.1X-2010, 11.11.3). Tampering with either half must
+ * fail, or the prefix would not really be covered; and the prefix length is
+ * fixed, so anything else is rejected rather than silently signed. */
+static void test_icv_l2(void)
+{
+    uint8_t ick[16], l2[MKA_ICV_L2_PREFIX_LEN], data[64], icv[16];
+
+    printf("L2-address ICV (compute / verify / tamper):\n");
+    memset(ick, 0x11, sizeof ick);
+    memset(l2, 0x33, sizeof l2);
+    memset(data, 0x22, sizeof data);
+
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_OK,
+        "L2 icv compute");
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_OK,
+        "L2 icv verifies");
+
+    /* Tamper the prefix: proves the framing is bound into the ICV. */
+    l2[0] ^= 0x01U;
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_ERR_ICV,
+        "L2 icv rejects a tampered prefix");
+    l2[0] ^= 0x01U;
+
+    /* Tamper the data. */
+    data[0] ^= 0x01U;
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_ERR_ICV,
+        "L2 icv rejects tampered data");
+    data[0] ^= 0x01U;
+
+    /* A different ICK must not verify. */
+    ick[0] ^= 0x01U;
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == MKA_ERR_ICV,
+        "L2 icv rejects a wrong ICK");
+    ick[0] ^= 0x01U;
+
+    /* The prefix length is fixed at MKA_ICV_L2_PREFIX_LEN. */
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2 - 1U,
+              data, sizeof data, icv) == BAD,
+        "L2 icv rejects a short prefix");
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2 + 1U,
+              data, sizeof data, icv) == BAD,
+        "L2 icv rejects a long prefix");
+
+    /* Every pointer position, on both entry points. */
+    CHECK(wm_Crypto_IcvComputeL2(NULL, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == BAD,
+        "L2 compute cmac NULL");
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, NULL, sizeof l2, data,
+              sizeof data, icv) == BAD,
+        "L2 compute l2 NULL");
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, NULL,
+              sizeof data, icv) == BAD,
+        "L2 compute data NULL");
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, NULL) == BAD,
+        "L2 compute icv NULL");
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, NULL, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == BAD,
+        "L2 compute ick NULL");
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, 24U, l2, sizeof l2, data,
+              sizeof data, icv) == BAD,
+        "L2 compute bad ick length");
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, NULL) == BAD,
+        "L2 verify icv NULL");
+    CHECK(wm_Crypto_IcvVerifyL2(NULL, ick, sizeof ick, l2, sizeof l2, data,
+              sizeof data, icv) == BAD,
+        "L2 verify cmac NULL");
+
+    /* A zero-length body is still signable: the prefix alone is covered. */
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              0U, icv) == MKA_OK,
+        "L2 icv over an empty body");
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              0U, icv) == MKA_OK,
+        "L2 icv over an empty body verifies");
+}
+#endif /* WOLFMKA_ICV_L2_ADDR */
+
 /* wm_Crypto_ForceZero wipes transient key material (generated/unwrapped
  * SAKs, KDF scratch), so it must clear exactly `len` octets - under-wiping
  * leaks a secret, over-wiping corrupts adjacent state - and tolerate a zero
@@ -589,5 +679,8 @@ void run_crypto_tests(void)
     test_derive_errors();
     test_sak_icv_errors();
     test_crypto_invalid_params();
+#ifdef WOLFMKA_ICV_L2_ADDR
+    test_icv_l2();
+#endif
     test_force_zero();
 }

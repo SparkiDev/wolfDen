@@ -763,20 +763,26 @@ static int mka_aes_cmac_l2(MkaCmacCtx* ctx, const uint8_t* key, size_t key_len,
     word32 out_sz = (word32)MKA_DEFAULT_ICV_LEN;
     int ret;
 
-    ret = wc_InitCmac_ex(&ctx->cmac, key, (word32)key_len, WC_CMAC_AES, NULL,
-                         WOLFMKA_HEAP_HINT, INVALID_DEVID);
+    /* Every stage goes through the fault-injection hook, not just the result.
+     * The non-L2 helper is a single one-shot call, but this one is a four-step
+     * streaming sequence, and its "did the previous step fail" guards are
+     * otherwise unreachable in a test build - nothing can make an intermediate
+     * wolfSSL call fail. MKA_FI is a no-op in production builds. */
+    ret = MKA_FI(MKA_FI_CMAC,
+        wc_InitCmac_ex(&ctx->cmac, key, (word32)key_len, WC_CMAC_AES, NULL,
+            WOLFMKA_HEAP_HINT, INVALID_DEVID));
     if (ret == 0) {
-        ret = wc_CmacUpdate(&ctx->cmac, l2, (word32)l2_len);
+        ret =
+            MKA_FI(MKA_FI_CMAC, wc_CmacUpdate(&ctx->cmac, l2, (word32)l2_len));
     }
     if ((ret == 0) && (data_len > 0U)) {
-        ret = wc_CmacUpdate(&ctx->cmac, data, (word32)data_len);
+        ret = MKA_FI(MKA_FI_CMAC,
+            wc_CmacUpdate(&ctx->cmac, data, (word32)data_len));
     }
     if (ret == 0) {
-        ret = wc_CmacFinal(&ctx->cmac, mac, &out_sz);
+        ret = MKA_FI(MKA_FI_CMAC, wc_CmacFinal(&ctx->cmac, mac, &out_sz));
     }
-    /* Route the result through the fault-injection hook so test builds can
-     * force a CMAC failure here, exactly as the non-L2 mka_aes_cmac does. */
-    return MKA_FI(MKA_FI_CMAC, ret);
+    return ret;
 }
 
 MkaStatus wm_Crypto_IcvComputeL2(MkaCmacCtx* cmac, const uint8_t* ick,
@@ -794,8 +800,8 @@ MkaStatus wm_Crypto_IcvComputeL2(MkaCmacCtx* cmac, const uint8_t* ick,
     if (!mka_key_valid(ick, ick_len)) {
         return MKA_ERR_BAD_ARG;
     }
-    if (mka_aes_cmac_l2(cmac, ick, ick_len, l2, l2_len, data, data_len, icv)
-            != MKA_CMAC_OK) {
+    if (mka_aes_cmac_l2(cmac, ick, ick_len, l2, l2_len, data, data_len, icv) !=
+        MKA_CMAC_OK) {
         return MKA_ERR_CRYPTO;
     }
     return MKA_OK;
@@ -807,7 +813,7 @@ MkaStatus wm_Crypto_IcvVerifyL2(MkaCmacCtx* cmac, const uint8_t* ick,
 {
     uint8_t computed[MKA_DEFAULT_ICV_LEN];
     uint8_t diff = 0U;
-    size_t  i;
+    size_t i;
     uint32_t sel;
     MkaStatus rc;
 
@@ -815,7 +821,7 @@ MkaStatus wm_Crypto_IcvVerifyL2(MkaCmacCtx* cmac, const uint8_t* ick,
         return MKA_ERR_BAD_ARG;
     }
     rc = wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, l2_len, data, data_len,
-                                computed);
+        computed);
     if (rc != MKA_OK) {
         return rc;
     }
