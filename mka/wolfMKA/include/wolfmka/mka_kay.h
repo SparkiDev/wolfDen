@@ -26,7 +26,8 @@
  *   - elects a Key Server (9.5),
  *   - when Key Server, generates and distributes SAKs (9.8),
  *   - installs agreed SAKs into the SecY data plane (Clause 10),
- *   - emits periodic MKPDUs and processes received ones.
+ *   - emits MKPDUs - periodically, and (with immediate_response configured) as
+ *     soon as it has new information to report - and processes received ones.
  *
  * Time is supplied by the caller as a monotonic millisecond clock so the engine
  * has no platform dependencies. Outbound MKPDUs go through a send callback;
@@ -58,6 +59,13 @@ which carries the peers' cipher suites; do not combine it with \
 WOLFMKA_NO_ANNOUNCEMENTS."
 #endif
 
+#if defined(WOLFMKA_CIPHER_NEGOTIATION) && defined(WOLFMKA_AUTOMOTIVE_PROFILE)
+    #error                                                                     \
+        "WOLFMKA_AUTOMOTIVE_PROFILE removes Secure Announcements and cipher- \
+suite negotiation (OPEN Alliance AutoMKA-11001); do not combine it with \
+WOLFMKA_CIPHER_NEGOTIATION."
+#endif
+
 /* Default MKA timers (IEEE Std 802.1X-2010, 9.16 / Table 9-3). Each may be
  * overridden at build time (e.g. -DMKA_HELLO_TIME_MS=1000); keep the Life Time
  * at roughly three Hello Times so a peer is not expired prematurely. */
@@ -72,6 +80,31 @@ WOLFMKA_NO_ANNOUNCEMENTS."
 #ifndef MKA_BOUNDED_HELLO_TIME_MS
     /* used when delay protection is on */
     #define MKA_BOUNDED_HELLO_TIME_MS 500u
+#endif
+/* Key Server priority values the OPEN Alliance profile makes absolute
+ * (AutoMKA-03007): 0 always serves, 255 never does. 0 needs no special handling
+ * - it is the lowest value, so the ordinary "lowest priority wins" comparison
+ * of IEEE Std 802.1X-2010 9.5 already makes it win - but 255 does, since the
+ * base standard treats it as merely the least preferred. Honoured only under
+ * WOLFMKA_AUTOMOTIVE_PROFILE; elsewhere 255 stays an ordinary low preference
+ * and `key_server_capable` is how a participant declines the role. */
+#define MKA_PRIORITY_ALWAYS_KS 0U
+#define MKA_PRIORITY_NEVER_KS  255U
+
+#ifndef MKA_MN_RECENT_WINDOW
+    /* How many of the most recently emitted Message Numbers count as
+     * "acceptably recent" when a peer echoes one back to prove liveness
+     * (IEEE Std 802.1X-2010, 9.4.3). The standard leaves the depth open; the
+     * OPEN Alliance profile fixes it at the last three MKPDUs emitted
+     * (AutoMKA-03005), which is the default here. A window of 1 accepts only
+     * the newest emitted MN and is the strictest useful setting. */
+    #define MKA_MN_RECENT_WINDOW 3U
+#endif
+#ifndef MKA_AUTOMOTIVE_RETRY_BASE_MS
+    /* First step of the startup ramp wm_Participant_AutomotiveDefaults()
+     * installs; it doubles from here to MKA_HELLO_TIME_MS (OPEN Alliance
+     * AutoMKA-03004 proposes 10, 20, 40 ms ... 2 s). */
+    #define MKA_AUTOMOTIVE_RETRY_BASE_MS 10u
 #endif
 
 /* Scratch buffer size for an outgoing MKPDU. Override at build time if needed
@@ -120,6 +153,9 @@ typedef struct {
     bool sak_rx;
     /* peer is transmitting on it */
     bool sak_tx;
+    /* this peer has reported using the SAK now in force; if it later stops,
+     * the key is gone at its end and the Key Server rekeys */
+    bool sak_use_seen;
 #ifdef WOLFMKA_SUSPENSION
     /* MKA Suspension Time this peer last advertised (s) */
     uint8_t suspend_for;
@@ -162,7 +198,11 @@ typedef struct MkaEventOps {
     /** The elected Key Server changed; is_self is true when it is us. */
     void (*key_server_elected)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
         bool is_self);
-    /** A SAK was installed as the Latest key (initial key or rekey). */
+    /** A SAK became the participant's Latest key (initial key or rekey).
+     * Raised when the key is adopted, which is not necessarily when the SecY
+     * has it: under distribute_before_install the data plane is programmed
+     * afterwards, and a SecY that returns MKA_SECY_PENDING finishes later
+     * still. Use macsec_up for the point at which protection is running. */
     void (*sak_installed)(void* ctx, uint32_t kn, uint8_t an,
         uint64_t cipher_suite);
     /** Transmit protection was enabled on the Latest key. */
@@ -242,6 +282,35 @@ typedef struct {
     bool key_server_capable;
     /* enable MACsec delay protection */
     bool delay_protect;
+    /* Transmit on the next wm_Participant_Run() when this participant has new
+     * information to report, instead of waiting out the Hello Time - the
+     * newInfo behaviour of IEEE Std 802.1X-2010, 9.4 (OPEN Alliance
+     * AutoMKA-03003). New information is any of:
+     *   - a peer entering the Potential Peer List, becoming live, or expiring;
+     *   - a SAK installed (the MACsec SAK Use set now names a different key);
+     *   - the transmit gate releasing onto the Latest key.
+     * The last two are what let a CA finish the SAK Use handshake without a
+     * Hello Time between each step, so both ends bring MACsec up promptly.
+     * Off by default, leaving the transmit cadence purely periodic; the
+     * automotive profile turns it on (see wm_Participant_AutomotiveDefaults).
+     */
+    bool immediate_response;
+    /* Put a newly adopted SAK on the wire before programming it into the SecY,
+     * so both ends start installing at the same moment instead of one after the
+     * other (OPEN Alliance AutoMKA-03010). Worth setting when the SecY is slow
+     * to program - an external PHY behind a narrow management interface - and
+     * immaterial otherwise. Off by default, which programs first; the
+     * automotive profile defaults turn it on.
+     *
+     * Only the Key Server defers: a member has nothing to distribute early, and
+     * a member that held its data plane back would stop reporting itself as
+     * receiving, which the Key Server reads as a lost key (AutoMKA-03011).
+     *
+     * Safe either way: while programming is outstanding the MACsec SAK Use does
+     * not report this participant as receiving on the key, so no peer takes it
+     * as leave to send protected frames the data plane could not yet decrypt.
+     */
+    bool distribute_before_install;
 #ifndef WOLFMKA_NO_ANNOUNCEMENTS
     /* emit Announcement set (type 7) */
     bool announce_cipher_suites;
@@ -304,6 +373,42 @@ typedef struct {
     uint64_t cipher_suite;
 } MkaSakInfo;
 
+/**
+ * Overall state of one participant, as reported by wm_Participant_GetPaeStatus.
+ *
+ * These are the states of the OPEN Alliance management interface
+ * (AutoMKA-07008), which is why the set is coarser than the internal state the
+ * accessors expose individually.
+ */
+typedef enum {
+    /* MACsec and/or MKA is not in use on this participant */
+    MKA_PAE_UNDEFINED = 0,
+    /* Waiting for the underlying link. Never reported by wolfMKA, which has no
+     * view of link state; an integrator that gates on link up reports it. */
+    MKA_PAE_WAITING_FOR_LINK_UP = 1,
+    /* No peer has been heard from yet */
+    MKA_PAE_WAITING_FOR_PEER = 2,
+    /* A peer is known; discovery, election or key agreement is under way */
+    MKA_PAE_IN_PROGRESS = 3,
+    /* A SAK is agreed and MACsec is transmitting */
+    MKA_PAE_RUNNING = 4,
+    /* MKPDUs are arriving but failing ICV verification: the peer holds a
+     * different CAK, so no peer can be established */
+    MKA_PAE_AUTH_FAIL_UNKNOWN_PEER = 5
+} MkaPaeState;
+
+/* Participant status, returned by wm_Participant_GetPaeStatus. */
+typedef struct {
+    /* the CAK Name this participant runs */
+    uint8_t ckn[MKA_MAX_CKN_LEN];
+    size_t ckn_len;
+    /* cipher suite in force; 0 unless the state is MKA_PAE_RUNNING */
+    uint64_t cipher_suite;
+    /* the peer's SCI, or all zero when there is no peer */
+    uint8_t peer_sci[MKA_SCI_LEN];
+    MkaPaeState state;
+} MkaPaeStatus;
+
 /* MKA protocol counters, returned by wm_Participant_GetCounters. */
 typedef struct {
     /* MKPDUs received that passed ICV verification */
@@ -312,7 +417,7 @@ typedef struct {
     uint32_t mkpdu_out;
     /* received MKPDUs that failed ICV verification */
     uint32_t icv_failures;
-    /* SAKs installed as the Latest key (rekeys) */
+    /* SAKs adopted as the Latest key (initial key + rekeys) */
     uint32_t sak_installs;
 } MkaCounters;
 
@@ -354,6 +459,20 @@ typedef struct {
     uint8_t actor_mi[MKA_MI_LEN];
     /* elected Key Server's SCI */
     uint8_t ks_sci[MKA_SCI_LEN];
+    /* held silent because another CA on this KaY has MACsec up
+     * (wm_Kay_SetQuiesceOthers); set by wm_Kay_Run, never by the participant */
+    bool quiesced;
+    /* a peer that was using the SAK has stopped reporting it, so the Key
+     * Server rekeys to bring it back (see mka_note_sak_use) */
+    bool sak_lost;
+    /* the Latest key is adopted but not yet programmed into the SecY: it goes
+     * out on the wire first (cfg.distribute_before_install) */
+    bool sak_program_pending;
+    /* something worth announcing has happened since the last MKPDU (a peer
+     * list changed, a SAK was installed, or the transmit gate released). With
+     * cfg.immediate_response the next wm_Participant_Run() transmits rather
+     * than waiting for the interval; cleared by that transmit. */
+    bool new_info;
     /* election has produced a result */
     bool elected;
     /* are we the elected Key Server? */
@@ -410,6 +529,95 @@ MkaStatus wm_Participant_Init(MkaParticipant* p,
     const MkaParticipantConfig* cfg);
 
 /**
+ * Apply the OPEN Alliance TC17 Automotive MKA timing defaults to a config.
+ *
+ * Sets the fields the profile fixes and leaves everything else (CAK/CKN, SCI,
+ * priority, SecY hooks, ...) untouched, so it is called on a partly filled
+ * configuration before wm_Participant_Init():
+ *
+ *   - immediate_response = true, so new information (a peer-list change, a
+ *     newly installed SAK, or the transmit gate releasing) is announced at
+ *     once rather than at the next Hello Time (AutoMKA-03003, AutoMKA-01015);
+ *   - retry_base_ms / retry_cyclic_ms = 10 ms / the Hello Time, giving the
+ *     doubling 10, 20, 40 ms ... ramp up to the nominal rate (AutoMKA-03004).
+ *     Omitted in a WOLFMKA_NO_RETRY build, which has no ramp;
+ *   - distribute_before_install = true, so a new SAK reaches the peer before
+ *     this end programs it and both install together (AutoMKA-03010).
+ *
+ * Together these are what bring link establishment under the profile's startup
+ * budget; the rest of the profile is either compiled in by
+ * WOLFMKA_AUTOMOTIVE_PROFILE or is the integrator's to supply (see
+ * OPEN-ALLIANCE.md). Available in every build - the profile macro is not
+ * required to use these settings.
+ *
+ * @param[in,out] cfg  the configuration to update.
+ * @return MKA_OK, or MKA_ERR_BAD_ARG if cfg is NULL.
+ */
+MkaStatus wm_Participant_AutomotiveDefaults(MkaParticipantConfig* cfg);
+
+/**
+ * Summarise the participant's state for a management or diagnostics interface.
+ *
+ * Collapses what the individual accessors expose into the single status the
+ * OPEN Alliance profile asks for (AutoMKA-07008): the state, the peer's SCI,
+ * the CKN in use, and the cipher suite once running.
+ * MKA_PAE_WAITING_FOR_LINK_UP is never returned - wolfMKA has no view of link
+ * state, so an integrator that gates MKA on the link reports that itself.
+ * @param[in]  p    The participant.
+ * @param[out] out  Receives the status.
+ * @return MKA_OK on success, or MKA_ERR_BAD_ARG if p or out is NULL.
+ */
+MkaStatus wm_Participant_GetPaeStatus(const MkaParticipant* p,
+    MkaPaeStatus* out);
+
+/**
+ * Read the port's MACsec statistics from the SecY.
+ *
+ * wolfMKA keeps no MACsec counters of its own - they belong to the data plane -
+ * so this simply drives MkaSecyOps.get_secy_stats. It exists so a management or
+ * diagnostics interface can reach them through the same object it already holds
+ * (OPEN Alliance AutoMKA-07009). For wolfMKA's own protocol counters, see
+ * wm_Participant_GetCounters().
+ * @param[in]  p    The participant.
+ * @param[out] out  Receives the statistics.
+ * @return MKA_OK on success;
+ *         MKA_ERR_BAD_ARG if p or out is NULL;
+ *         MKA_ERR_STATE if no get_secy_stats hook is configured;
+ *         MKA_ERR_INTERNAL if the hook reports failure.
+ */
+MkaStatus wm_Participant_GetSecyStats(const MkaParticipant* p,
+    MkaSecyStats* out);
+
+/**
+ * Read the statistics of our transmit Secure Channel.
+ * @param[in]  p    The participant (its SCI identifies the channel).
+ * @param[out] out  Receives the statistics.
+ * @return MKA_OK on success;
+ *         MKA_ERR_BAD_ARG if p or out is NULL;
+ *         MKA_ERR_STATE if no get_tx_sc_stats hook is configured;
+ *         MKA_ERR_INTERNAL if the hook reports failure.
+ */
+MkaStatus wm_Participant_GetTxScStats(const MkaParticipant* p,
+    MkaTxScStats* out);
+
+/**
+ * Read the statistics of one peer's receive Secure Channel.
+ *
+ * Peers are indexed as by wm_Participant_GetPeer(), so an enumeration walks
+ * both with the same index.
+ * @param[in]  p      The participant.
+ * @param[in]  index  Zero-based peer index.
+ * @param[out] out    Receives the statistics.
+ * @return MKA_OK on success;
+ *         MKA_ERR_BAD_ARG if p or out is NULL;
+ *         MKA_ERR_NO_PEER if index is past the last peer;
+ *         MKA_ERR_STATE if no get_rx_sc_stats hook is configured;
+ *         MKA_ERR_INTERNAL if the hook reports failure.
+ */
+MkaStatus wm_Participant_GetRxScStats(const MkaParticipant* p, size_t index,
+    MkaRxScStats* out);
+
+/**
  * Tear down a participant when it is no longer needed.
  *
  * Deletes any installed SecY SAs so the data plane keeps no SAK, then securely
@@ -444,8 +652,13 @@ MkaStatus wm_Participant_Receive(MkaParticipant* p, const uint8_t* frame,
  * Periodic engine step.
  *
  * Expires dead peers, runs Key Server election, generates and distributes a SAK
- * when Key Server, and transmits an MKPDU once per Hello interval (or on the
- * first call).
+ * when Key Server, and transmits an MKPDU on the first call and then once per
+ * transmit interval - the Hello Time, the Bounded Hello Time under delay
+ * protection, or the retry back-off while no peer is live. With
+ * MkaParticipantConfig.immediate_response set, it also transmits as soon as
+ * there is new information to report, without waiting for that interval.
+ *
+ * Call it regularly (the loop's tick); it is cheap when nothing is due.
  *
  * @param[in,out] p       The participant.
  * @param[in]     now_ms  Current monotonic time in milliseconds.
@@ -485,6 +698,10 @@ MkaStatus wm_Participant_SecyComplete(MkaParticipant* p);
  * key becomes the Old key and stays installed for in-flight traffic until every
  * peer has moved to the new Latest key. Call e.g. when the SecY reports the
  * transmit packet number nearing exhaustion.
+ *
+ * The new key is programmed into the SecY before it is distributed, unless
+ * distribute_before_install reverses that; either way it returns as soon as the
+ * key is generated, and the handover completes over the following runs.
  *
  * @param[in,out] p  The participant.
  * @return MKA_OK on success;
@@ -671,6 +888,9 @@ MkaStatus wm_Participant_GetCounters(const MkaParticipant* p, MkaCounters* out);
 typedef struct {
     MkaParticipant parts[MKA_MAX_PARTICIPANTS];
     size_t count;
+    /* once one CA has MACsec up, hold the others silent (see
+     * wm_Kay_SetQuiesceOthers) */
+    bool quiesce_others;
 } MkaKay;
 
 /**
@@ -765,6 +985,26 @@ MkaStatus wm_Kay_Run(MkaKay* kay, uint32_t now_ms);
  */
 MkaStatus wm_Kay_Receive(MkaKay* kay, const uint8_t* frame, size_t len,
     uint32_t now_ms);
+
+/**
+ * Stop the losing Connectivity Associations transmitting once one wins.
+ *
+ * A port may run several participants, each with its own CAK/CKN, to find one
+ * the far end also holds. Once any of them establishes MACsec, the rest have
+ * nobody left to negotiate with - on a point-to-point link no other peer can
+ * appear - so keeping them transmitting only spends bandwidth and airtime.
+ * With this enabled, wm_Kay_Run() holds every other participant silent for as
+ * long as one has MACsec up, and releases them all again the moment it drops,
+ * so a link that comes back re-runs the full search (OPEN Alliance
+ * AutoMKA-09001, AutoMKA-09002).
+ *
+ * Off by default: a deployment that deliberately runs several CAs at once
+ * (rather than as alternatives) needs them all to keep running.
+ * @param[in,out] kay     The KaY.
+ * @param[in]     enable  true to quiesce the losers.
+ * @return MKA_OK, or MKA_ERR_BAD_ARG if kay is NULL.
+ */
+MkaStatus wm_Kay_SetQuiesceOthers(MkaKay* kay, bool enable);
 
 /**
  * Number of participants (Connectivity Associations) on this KaY.

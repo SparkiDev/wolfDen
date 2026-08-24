@@ -63,7 +63,9 @@ EXAMPLE_SRC := $(filter-out examples/mka_group_cak.c examples/mka_autosar.c,\
 EXAMPLE_BIN := $(EXAMPLE_SRC:.c=)
 
 .PHONY: all lib test check examples test-alloc test-nomalloc \
-        test-fault test-distcak test-kmd test-suspension test-negotiation test-icv-l2 example-distcak example-autosar features cxx misra docs \
+        test-fault test-distcak test-kmd test-suspension test-negotiation test-icv-l2 \
+        example-distcak example-autosar features cxx misra docs \
+        test-automotive example-distcak example-autosar features cxx misra docs \
         autosar coverage sanitize analyze fuzz fuzz-pdu fuzz-receive \
         interop interop-dataplane test-endian footprint format format-check clean FORCE
 
@@ -198,6 +200,16 @@ test-icv-l2:
 	    $(SRC) -o test/runicvl2 $(LDFLAGS) $(LDLIBS)
 	./test/runicvl2
 
+# Build the suite under the OPEN Alliance TC17 Automotive MKA profile and run
+# it. The profile emits version 3 MKPDUs and removes Secure Announcements and
+# cipher-suite negotiation; the rest of it is runtime configuration applied by
+# wm_Participant_AutomotiveDefaults(). See OPEN-ALLIANCE.md for the
+# requirement-by-requirement conformance map.
+test-automotive:
+	$(CC) $(CFLAGS) -DWOLFMKA_AUTOMOTIVE_PROFILE $(TEST_SRC) \
+	    $(SRC) -o test/runauto $(LDFLAGS) $(LDLIBS)
+	./test/runauto
+
 examples: $(EXAMPLE_BIN)
 
 examples/%: examples/%.c $(LIB)
@@ -319,8 +331,8 @@ features:
 	    "-DWOLFMKA_NO_DELAY_PROTECT" "-DWOLFMKA_NO_RETRY" \
 	    "-DWOLFMKA_NO_ANNOUNCEMENTS" "-DWOLFMKA_NO_AUTO_REKEY" \
 	    "-DWOLFMKA_DISTRIBUTED_CAK" "-DWOLFMKA_KMD" "-DWOLFMKA_SUSPENSION" \
-	    "-DWOLFMKA_CIPHER_NEGOTIATION" "-DWOLFMKA_ICV_L2_ADDR" \
-	    "-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
+	    "-DWOLFMKA_CIPHER_NEGOTIATION" "-DWOLFMKA_AUTOMOTIVE_PROFILE" \
+	    "-DWOLFMKA_ICV_L2_ADDR" \"-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC"; do \
 	    printf '  [features]%s\n' " $${cfg:-default}"; \
 	    for f in $(SRC); do $(CC) $(CFLAGS) $$cfg -c $$f -o /tmp/wmka.o; done; \
@@ -348,6 +360,7 @@ misra:
 	         "$(CPPCHECK_VERSION) (.cppcheck-version); findings may differ"
 	@rc=0; for cfg in "$(MISRA_DEFS)" \
 	    "$(MISRA_DEFS) -DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD -DWOLFMKA_SUSPENSION -DWOLFMKA_CIPHER_NEGOTIATION" \
+	    "$(MISRA_DEFS) -DWOLFMKA_AUTOMOTIVE_PROFILE" \
 	    "$(MISRA_BASE) -DWOLFMKA_BIG_ENDIAN" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC -DWOLFMKA_LITTLE_ENDIAN --max-configs=1"; \
 	  do \
@@ -419,7 +432,7 @@ coverage:
 # Per-configuration structural coverage: enforce 100% line + decision + MC/DC
 # for every delivered configuration. Every WOLFMKA_NO_* feature-off build
 # compiles and runs its suite to PASS under its own flag (feature-specific tests
-# are #ifndef-gated), and all nine configurations below reach - and are forced
+# are #ifndef-gated), and all ten configurations below reach - and are forced
 # to - 100% line + decision + MC/DC. Three feature-off branches were once short
 # of 100%; all are now resolved (NO_XPN excluded as genuinely dead code with
 # #ifndef; NO_EAP and NO_AUTO_REKEY are reachable paths covered by added tests,
@@ -430,6 +443,9 @@ coverage-configs:
 	    COV_LABEL=cert-base
 	@$(MAKE) --no-print-directory cov-impl \
 	    COV_CFG="$(COV_BASE) -DWOLFMKA_CIPHER_NEGOTIATION" COV_LABEL=negotiation
+	@$(MAKE) --no-print-directory cov-impl \
+	    COV_CFG="-DWOLFMKA_FAULT_INJECT -DWOLFMKA_AUTOMOTIVE_PROFILE" \
+	    COV_LABEL=automotive-profile
 	@$(MAKE) --no-print-directory cov-impl \
 	    COV_CFG="$(COV_BASE) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC" \
 	    COV_LABEL=small-stack-no-malloc
@@ -477,7 +493,8 @@ format-check:
 
 clean:
 	rm -f $(OBJ) $(DEP) $(LIB) $(TEST_BIN) $(EXAMPLE_BIN) examples/mka_group_cak examples/mka_autosar \
-	      test/runalloc test/runfault test/rundistcak test/runkmd test/runsusp test/runautosar \
+	      test/runalloc test/runfault test/rundistcak test/runkmd test/runsusp \
+	      test/runnego test/runauto test/runautosar \
 	      test/runsanitize test/fuzz_pdu test/fuzz_receive \
 	      test/runendian test/test_endian_be \
 	      src/autosar/Mka.o

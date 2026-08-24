@@ -25,8 +25,7 @@
 #include "wolfmka/mka_crypto.h"
 #include "wolfmka/mka_mem.h"
 
-#define MKA_AN_MASK        0x3U
-#define MKA_MKA_VERSION_ID 1U
+#define MKA_AN_MASK 0x3U
 
 /* ------------------------------------------------------------------------- */
 /* Event dispatch (optional MkaEventOps hooks; each skipped when NULL)        */
@@ -148,6 +147,8 @@ static MkaPeer* mka_add_peer(MkaParticipant* p, const uint8_t mi[MKA_MI_LEN])
             result->valid = true;
             (void)WOLFMKA_MEMCPY(result->mi, mi, MKA_MI_LEN);
             p->peer_count++;
+            /* newInfo: the Potential Peer List changed. */
+            p->new_info = true;
             break;
         }
     }
@@ -190,6 +191,8 @@ static void mka_drop_peer(MkaParticipant* p, MkaPeer* pe)
         }
     }
     mka_ev_peer_lost(p, pe->mi, pe->live);
+    /* newInfo: a peer left the Potential or Live Peer List. */
+    p->new_info = true;
     (void)WOLFMKA_MEMSET(pe, 0, sizeof(*pe));
     /* mka_drop_peer is only ever called for a tracked peer, so peer_count > 0.
      * Check the invariant in debug builds; release builds just decrement. */
@@ -308,6 +311,143 @@ MkaStatus wm_Participant_GetKmd(const MkaParticipant* p, uint8_t* kmd,
 }
 #endif /* WOLFMKA_KMD */
 
+/**
+ * Pick the SCI to report as "the peer" in the PAE status.
+ *
+ * A live peer is preferred over one merely heard from, so the reported SCI is
+ * the peer actually in the association where there is one.
+ * @param[in]  p    the participant.
+ * @param[out] sci  receives the SCI, left untouched when there is no peer.
+ * @return true if a peer was found.
+ */
+static bool mka_status_peer_sci(const MkaParticipant* p,
+    uint8_t sci[MKA_SCI_LEN])
+{
+    size_t i;
+    const MkaPeer* best = NULL;
+
+    /* A live peer is the association's actual counterpart, so it wins. */
+    for (i = 0U; i < MKA_MAX_PEERS; i++) {
+        const MkaPeer* pe = &p->peers[i];
+        if (pe->valid && pe->live) {
+            best = pe;
+        }
+    }
+    /* Otherwise report whoever has been heard from, so a session still coming
+     * up names the peer it is negotiating with. */
+    if (best == NULL) {
+        for (i = 0U; i < MKA_MAX_PEERS; i++) {
+            const MkaPeer* pe = &p->peers[i];
+            if (pe->valid) {
+                best = pe;
+                break;
+            }
+        }
+    }
+    if (best != NULL) {
+        (void)WOLFMKA_MEMCPY(sci, best->sci, MKA_SCI_LEN);
+    }
+    return best != NULL;
+}
+
+/* The state is derived rather than stored: every input already exists, and a
+ * second copy of the state would be one more thing to keep consistent. */
+MkaStatus wm_Participant_GetPaeStatus(const MkaParticipant* p,
+    MkaPaeStatus* out)
+{
+    if ((p == NULL) || (out == NULL)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    (void)WOLFMKA_MEMSET(out, 0, sizeof(*out));
+
+    if (!p->cfg.macsec_desired) {
+        /* MACsec is not wanted on this participant, so there is no session to
+         * report on. */
+        out->state = MKA_PAE_UNDEFINED;
+        return MKA_OK;
+    }
+
+    (void)WOLFMKA_MEMCPY(out->ckn, p->cfg.cak.ckn, p->cfg.cak.ckn_len);
+    out->ckn_len = p->cfg.cak.ckn_len;
+    (void)mka_status_peer_sci(p, out->peer_sci);
+
+    if (p->latest.valid && p->latest.tx) {
+        out->state = MKA_PAE_RUNNING;
+        out->cipher_suite = p->sak_cipher_suite;
+    }
+    else if (p->peer_count != 0U) {
+        out->state = MKA_PAE_IN_PROGRESS;
+    }
+    else if (p->counters.icv_failures != 0U) {
+        /* Frames are arriving but none authenticate: the far end is configured
+         * with a different CAK, which is a distinct condition from silence. */
+        out->state = MKA_PAE_AUTH_FAIL_UNKNOWN_PEER;
+    }
+    else {
+        out->state = MKA_PAE_WAITING_FOR_PEER;
+    }
+    return MKA_OK;
+}
+
+/* MACsec counters live in the SecY, so each of these is a thin, validated
+ * pass-through to its hook; wolfMKA adds no counting of its own. */
+MkaStatus wm_Participant_GetSecyStats(const MkaParticipant* p,
+    MkaSecyStats* out)
+{
+    if ((p == NULL) || (out == NULL)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    if (p->cfg.secy.get_secy_stats == NULL) {
+        return MKA_ERR_STATE;
+    }
+    (void)WOLFMKA_MEMSET(out, 0, sizeof(*out));
+    if (p->cfg.secy.get_secy_stats(p->cfg.secy.ctx, out) != 0) {
+        return MKA_ERR_INTERNAL;
+    }
+    return MKA_OK;
+}
+
+MkaStatus wm_Participant_GetTxScStats(const MkaParticipant* p,
+    MkaTxScStats* out)
+{
+    if ((p == NULL) || (out == NULL)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    if (p->cfg.secy.get_tx_sc_stats == NULL) {
+        return MKA_ERR_STATE;
+    }
+    (void)WOLFMKA_MEMSET(out, 0, sizeof(*out));
+    if (p->cfg.secy.get_tx_sc_stats(p->cfg.secy.ctx, p->cfg.sci, out) != 0) {
+        return MKA_ERR_INTERNAL;
+    }
+    return MKA_OK;
+}
+
+MkaStatus wm_Participant_GetRxScStats(const MkaParticipant* p, size_t index,
+    MkaRxScStats* out)
+{
+    MkaPeerInfo info;
+    MkaStatus rc;
+
+    if ((p == NULL) || (out == NULL)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    if (p->cfg.secy.get_rx_sc_stats == NULL) {
+        return MKA_ERR_STATE;
+    }
+    /* Reuse the peer enumeration so the index means the same thing here as it
+     * does to wm_Participant_GetPeer, and the SCI comes from one place. */
+    rc = wm_Participant_GetPeer(p, index, &info);
+    if (rc != MKA_OK) {
+        return rc;
+    }
+    (void)WOLFMKA_MEMSET(out, 0, sizeof(*out));
+    if (p->cfg.secy.get_rx_sc_stats(p->cfg.secy.ctx, info.sci, out) != 0) {
+        return MKA_ERR_INTERNAL;
+    }
+    return MKA_OK;
+}
+
 /* Copy the running protocol counters. */
 MkaStatus wm_Participant_GetCounters(const MkaParticipant* p, MkaCounters* out)
 {
@@ -319,31 +459,87 @@ MkaStatus wm_Participant_GetCounters(const MkaParticipant* p, MkaCounters* out)
 }
 
 /**
- * Test whether an MKPDU's peer lists mention our actor MI.
+ * Find a Member Identifier in one of an MKPDU's peer lists.
  *
- * If they do, the sender has heard from us, which makes it a live peer.
- * @param[in] pdu  the decoded MKPDU whose peer lists are searched.
- * @param[in] mi   the Member Identifier to look for (MKA_MI_LEN octets).
- * @return true if mi appears in the Live or Potential Peer List, else false.
+ * Used to see whether a sender has heard from us: our MI in its list, with the
+ * Message Number it quotes alongside, is what proves the link is two-way.
+ * @param[in]  list  the Live or Potential Peer List to search.
+ * @param[in]  mi    the Member Identifier to look for (MKA_MI_LEN octets).
+ * @param[out] mn    receives the Message Number listed against mi; untouched
+ *                   when mi is absent.
+ * @return true if mi appears in the list, else false.
  */
-static bool mka_lists_contain_mi(const MkaPdu* pdu,
-    const uint8_t mi[MKA_MI_LEN])
+static bool mka_list_echo(const MkaPeerList* list, const uint8_t mi[MKA_MI_LEN],
+    uint32_t* mn)
 {
     bool found = false;
     size_t i;
 
-    for (i = 0U; i < pdu->live_peers.count; i++) {
-        if (WOLFMKA_MEMCMP(pdu->live_peers.peers[i].mi, mi, MKA_MI_LEN) == 0) {
-            found = true;
-        }
-    }
-    for (i = 0U; i < pdu->potential_peers.count; i++) {
-        if (WOLFMKA_MEMCMP(pdu->potential_peers.peers[i].mi, mi, MKA_MI_LEN) ==
-            0) {
+    for (i = 0U; i < list->count; i++) {
+        if (WOLFMKA_MEMCMP(list->peers[i].mi, mi, MKA_MI_LEN) == 0) {
+            *mn = list->peers[i].mn;
             found = true;
         }
     }
     return found;
+}
+
+/**
+ * Whether a Message Number echoed back to us is acceptably recent.
+ *
+ * Liveness requires the peer to quote a Message Number this participant
+ * actually emitted recently, not merely its Member Identifier (IEEE Std
+ * 802.1X-2010, 9.4.3); the depth of "recently" is MKA_MN_RECENT_WINDOW (OPEN
+ * Alliance AutoMKA-03005 fixes it at three).
+ * @param[in] p   the participant whose emitted Message Numbers are the
+ *                reference.
+ * @param[in] mn  the Message Number the peer echoed.
+ * @return true if mn is one of the last MKA_MN_RECENT_WINDOW emitted.
+ */
+static bool mka_mn_recent(const MkaParticipant* p, uint32_t mn)
+{
+    bool recent;
+
+    /* Message Numbers start at 1 and advance per MKPDU emitted, so while
+     * actor_mn is still 1 nothing has been sent and no number a peer quotes can
+     * be one of ours. */
+    if (p->actor_mn <= 1U) {
+        recent = false;
+    }
+    else {
+        uint32_t age;
+
+        /* actor_mn is the number the *next* MKPDU will carry, so the newest
+         * value already emitted is actor_mn - 1 and the window covers that and
+         * the MKA_MN_RECENT_WINDOW - 1 values below it. The subtraction is
+         * unsigned, so it stays correct across the 32-bit rollover. */
+        age = (p->actor_mn - 1U) - mn;
+        recent = (age < (uint32_t)MKA_MN_RECENT_WINDOW);
+    }
+    return recent;
+}
+
+/**
+ * Whether this MKPDU is invalid because it reports us live on a stale
+ * Message Number (OPEN Alliance AutoMKA-04004).
+ *
+ * A peer that lists this participant in its *Live* Peer List is asserting
+ * two-way connectivity, so the Message Number it quotes must be one we recently
+ * emitted. When it is not, the MKPDU is not evidence of anything current: it is
+ * discarded without refreshing the peer's Life timer, so a peer looping stale
+ * information cannot hold the association open indefinitely. Being listed in
+ * the Potential Peer List with a stale number is not an error - the peer is
+ * simply reporting what it last heard - so only the Live list is checked here.
+ * @param[in] p    the participant.
+ * @param[in] pdu  the decoded MKPDU.
+ * @return true if the MKPDU must be discarded.
+ */
+static bool mka_stale_live_echo(const MkaParticipant* p, const MkaPdu* pdu)
+{
+    uint32_t mn = 0U;
+
+    return mka_list_echo(&pdu->live_peers, p->actor_mi, &mn) &&
+           (!mka_mn_recent(p, mn));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -504,6 +700,29 @@ MkaStatus wm_Participant_Init(MkaParticipant* p,
     return rc;
 }
 
+/* Only the fields the OPEN Alliance profile fixes are written; the caller's
+ * CAK/CKN, SCI, priority, role and hooks are left alone, so this may be called
+ * on a partly filled configuration. Nothing here needs
+ * WOLFMKA_AUTOMOTIVE_PROFILE: the profile macro selects the compile-time half
+ * (MKPDU version, no Announcements), this is the runtime half. */
+MkaStatus wm_Participant_AutomotiveDefaults(MkaParticipantConfig* cfg)
+{
+    if (cfg == NULL) {
+        return MKA_ERR_BAD_ARG;
+    }
+
+    /* Answer a peer-list change at once instead of at the next Hello Time. */
+    cfg->immediate_response = true;
+    /* Let the peer start installing a new SAK as early as we do. */
+    cfg->distribute_before_install = true;
+#ifndef WOLFMKA_NO_RETRY
+    /* Doubling ramp from 10 ms up to the nominal Hello Time. */
+    cfg->retry_base_ms = MKA_AUTOMOTIVE_RETRY_BASE_MS;
+    cfg->retry_cyclic_ms = MKA_HELLO_TIME_MS;
+#endif
+    return MKA_OK;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Key Server election (9.5)                                                 */
 /* ------------------------------------------------------------------------- */
@@ -546,10 +765,19 @@ static void mka_elect_dynamic(MkaParticipant* p)
     uint8_t best_pri = 0U;
     bool best_is_self = false;
     bool have_candidate = false;
+    bool self_ok;
     size_t i;
 
     /* Self is a candidate if we may be Key Server and want MACsec. */
-    if (p->cfg.key_server_capable && p->cfg.macsec_desired) {
+    self_ok = p->cfg.key_server_capable && p->cfg.macsec_desired;
+#ifdef WOLFMKA_AUTOMOTIVE_PROFILE
+    if (p->cfg.priority == (uint8_t)MKA_PRIORITY_NEVER_KS) {
+        /* Priority 255 is an absolute "never Key Server" in the automotive
+         * profile, not merely the least preferred value (AutoMKA-03007). */
+        self_ok = false;
+    }
+#endif
+    if (self_ok) {
         best_sci = p->cfg.sci;
         best_pri = p->cfg.priority;
         best_is_self = true;
@@ -558,7 +786,13 @@ static void mka_elect_dynamic(MkaParticipant* p)
 
     for (i = 0U; i < MKA_MAX_PEERS; i++) {
         const MkaPeer* pe = &p->peers[i];
-        if (pe->valid && pe->live && pe->macsec_desired) {
+        bool peer_ok = pe->valid && pe->live && pe->macsec_desired;
+#ifdef WOLFMKA_AUTOMOTIVE_PROFILE
+        if (pe->priority == (uint8_t)MKA_PRIORITY_NEVER_KS) {
+            peer_ok = false;
+        }
+#endif
+        if (peer_ok) {
             if ((!have_candidate) ||
                 (mka_ks_cmp(pe->priority, pe->sci, best_pri, best_sci) < 0)) {
                 best_sci = pe->sci;
@@ -788,11 +1022,19 @@ static void mka_delete_sak_sas(MkaParticipant* p, const MkaSak* k)
     }
 }
 
+static void mka_program_sak(MkaParticipant* p);
+
 /**
- * Install a new SAK as the Latest key (transmit gated, receive enabled).
+ * Adopt a new SAK as the Latest key, and program the data plane with it.
  *
  * The current Latest key (if any) becomes the Old key and stays installed for
  * in-flight traffic - make-before-break (IEEE Std 802.1X-2010, 9.x).
+ *
+ * Adoption and programming are separate steps: with
+ * MkaParticipantConfig.distribute_before_install the key is adopted here and
+ * mka_program_sak() runs later, once the MKPDU carrying it has been sent
+ * (AutoMKA-03010). Either way transmit protection stays gated until every live
+ * peer reports receiving on the key.
  * @param[in,out] p        participant.
  * @param[in]     sak      The Secure Association Key.
  * @param[in]     sak_len  Length of the SAK in octets.
@@ -802,9 +1044,6 @@ static void mka_delete_sak_sas(MkaParticipant* p, const MkaSak* k)
 static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
     size_t sak_len, uint8_t an, uint32_t kn)
 {
-    const MkaSecyOps* s = &p->cfg.secy;
-    size_t i;
-
     /* Demote the current Latest to Old; force-retire any unfinished Old. A new
      * SAK always carries a fresh Key Number, so a valid Latest is always a
      * different key here. */
@@ -821,6 +1060,9 @@ static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
     p->latest.sak_len = sak_len;
     p->latest.an = an;
     p->latest.kn = kn;
+    /* newInfo: the MACsec SAK Use set now names a different key, which the CA
+     * needs before the transmit gate on either end can release. */
+    p->new_info = true;
     /* gated until peers receive on it */
     p->latest.tx = false;
     p->counters.sak_installs++;
@@ -832,6 +1074,48 @@ static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
         (mka_min_capability(p) <= (uint8_t)MKA_CAP_INTEGRITY_ONLY);
 #endif
 
+    if (p->cfg.distribute_before_install && p->is_key_server &&
+        (p->cfg.send != NULL)) {
+        /* Hold the data plane back until the key is on the wire: both ends then
+         * start programming at the same moment instead of one after the other
+         * (OPEN Alliance AutoMKA-03010). mka_program_sak() runs it once the
+         * MKPDU carrying the key has been sent.
+         *
+         * Only the Key Server defers. A member has nothing to distribute, so
+         * waiting would only delay its own data plane - and while deferred a
+         * participant does not report itself receiving, which the Key Server
+         * would read as the member having lost the key and answer with another
+         * rekey. */
+        p->sak_program_pending = true;
+        /* Raised on adoption, as in the immediate path, so the event means the
+         * same thing in both: the key is the participant's Latest. */
+        mka_ev_sak_installed(p, kn, an, p->sak_cipher_suite);
+        return;
+    }
+    mka_program_sak(p);
+    mka_ev_sak_installed(p, kn, an, p->sak_cipher_suite);
+}
+
+/**
+ * Program the data plane with the key already adopted as Latest.
+ *
+ * Split out of mka_install_sak() so the SecY work can be deferred until after
+ * the Distributed SAK is on the wire. Nothing here reads the caller's key
+ * material - it all comes from p->latest - so the point at which it runs is
+ * free to move.
+ * @param[in,out] p  the participant whose Latest key is programmed.
+ */
+static void mka_program_sak(MkaParticipant* p)
+{
+    const MkaSecyOps* s = &p->cfg.secy;
+    size_t i;
+
+    p->sak_program_pending = false;
+    /* newInfo: the MACsec SAK Use can now report us receiving on the key, which
+     * is what releases the peer's transmit gate. Waiting for the next periodic
+     * MKPDU here would give back more than distributing early won. */
+    p->new_info = true;
+
     /* Transmit SC/SA for the Latest key (transmit stays disabled until every
      * live peer reports receiving on it, so we never black-hole traffic). */
     if (s->create_tx_sc != NULL) {
@@ -839,8 +1123,8 @@ static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
     }
     mka_apply_cipher_suite(p, p->cfg.sci);
     if (s->install_tx_sa != NULL) {
-        mka_secy_track(p,
-            s->install_tx_sa(s->ctx, p->cfg.sci, an, kn, sak, sak_len));
+        mka_secy_track(p, s->install_tx_sa(s->ctx, p->cfg.sci, p->latest.an,
+                              p->latest.kn, p->latest.sak, p->latest.sak_len));
     }
 
     /* Receive SAs for the Latest key on every live peer. */
@@ -854,8 +1138,6 @@ static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
             mka_install_rx_key(p, pe, &p->latest);
         }
     }
-
-    mka_ev_sak_installed(p, kn, an, p->sak_cipher_suite);
 }
 
 /**
@@ -907,6 +1189,9 @@ static void mka_maybe_enable_tx(MkaParticipant* p)
             }
             p->old.tx = false;
         }
+        /* newInfo: our SAK Use now reports transmitting on the Latest key,
+         * which is what the peer is waiting for to release its own gate. */
+        p->new_info = true;
         mka_ev_macsec_up(p, p->latest.kn, p->latest.an);
     }
 }
@@ -1056,15 +1341,24 @@ static MkaStatus mka_ks_generate_sak(MkaParticipant* p)
 
 /**
  * Whether a received Distributed SAK should be skipped without installing: it
- * carries no key (a "MACsec not in use" indication), or it re-advertises the
- * Latest key that is already installed.
+ * carries no key (a "MACsec not in use" indication), it re-advertises the
+ * Latest key that is already installed, or this participant does not want
+ * MACsec.
+ *
+ * The last case is what lets MKA run with MACsec switched off (OPEN Alliance
+ * AutoMKA-12002). A participant configured `macsec_desired = false` takes no
+ * part in protecting traffic: it never becomes Key Server, and it must not act
+ * on a key another one distributes either - installing it would create the
+ * Secure Channels and program the SAs it was configured not to have. Declining
+ * the key here keeps every downstream SecY call from happening, since they all
+ * hang off an installed Latest key.
  * @param[in] p  participant.
  * @param[in] d  the received Distributed SAK parameter set.
  * @return true to skip installation, false to proceed.
  */
 static bool mka_dist_sak_skip(const MkaParticipant* p, const MkaDistSak* d)
 {
-    return (d->wrapped_len == 0U) ||
+    return (d->wrapped_len == 0U) || (!p->cfg.macsec_desired) ||
            (p->latest.valid && (d->kn == p->latest.kn));
 }
 
@@ -1143,6 +1437,76 @@ static void mka_process_dist_cak(const MkaParticipant* p, const MkaDistCak* d)
 /* ------------------------------------------------------------------------- */
 /* Receive                                                                   */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * Whether an MKPDU reports the peer using the SAK currently in force.
+ *
+ * Written as successive rejections rather than one compound test so each reason
+ * a peer might not be using our key stands on its own: it sent no MACsec SAK
+ * Use at all, we hold no key for it to use, it is neither receiving nor
+ * transmitting, or the Key Number it names is not one we issued.
+ *
+ * A peer mid-handover legitimately still names the Old key - it has not
+ * installed the new one yet - so that Key Number counts as ours too. Treating
+ * it as unknown would make every make-before-break rekey look like a key loss
+ * and trigger another rekey, and so on.
+ * @param[in] p    the participant holding the key in force.
+ * @param[in] pdu  the decoded MKPDU.
+ * @return true if the peer reports a key we issued as in use.
+ */
+static bool mka_sak_use_reports_ours(const MkaParticipant* p, const MkaPdu* pdu)
+{
+    const MkaSakUse* su = &pdu->sak_use;
+
+    if (!su->present) {
+        return false;
+    }
+    if (!p->latest.valid) {
+        return false;
+    }
+    if (!(MKA_SAK_USE_IS_LATEST_RX(su) || MKA_SAK_USE_IS_LATEST_TX(su))) {
+        /* present but empty: the peer reports no key in use */
+        return false;
+    }
+    if (su->latest_kn == p->latest.kn) {
+        return true;
+    }
+    /* Still on the Old key while the handover completes. */
+    return p->old.valid && (su->latest_kn == p->old.kn);
+}
+
+/**
+ * Track whether a peer is still using the SAK, and ask for a rekey when one
+ * that was using it stops (OPEN Alliance AutoMKA-03011).
+ *
+ * A peer whose MACsec SAK Use goes missing, empty, or refers to some other Key
+ * Number has lost the key - typically its data plane restarted. Nothing in the
+ * protocol brings it back on its own: this participant would keep reporting the
+ * peer as using a key it no longer holds, and traffic to it would stay
+ * undecryptable until something else forced a rekey. Distributing a fresh SAK
+ * is what recovers it.
+ *
+ * The flag is only raised for a peer that *was* using the key, so a member that
+ * has not received one yet - the normal case during bring-up - never triggers a
+ * rekey. Clearing sak_use_seen at the same time bounds it to one rekey per loss
+ * rather than one per MKPDU.
+ * @param[in,out] p    the participant.
+ * @param[in,out] pe   the sending peer.
+ * @param[in]     pdu  the decoded MKPDU.
+ */
+static void mka_note_sak_use(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu)
+{
+    if (mka_sak_use_reports_ours(p, pdu)) {
+        pe->sak_use_seen = true;
+    }
+    else if (pe->sak_use_seen) {
+        pe->sak_use_seen = false;
+        p->sak_lost = true;
+    }
+    else {
+        /* it never held this key, so there is nothing to recover */
+    }
+}
 
 /**
  * Record a peer's MACsec SAK Use state and apply delay protection.
@@ -1253,6 +1617,9 @@ static MkaStatus mka_admit_peer(MkaParticipant* p, const MkaPdu* pdu,
 static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
     uint32_t now_ms, bool added)
 {
+    uint32_t echo_mn = 0U;
+    bool echoed;
+
     pe->mn = pdu->basic.mn;
     pe->mn_seen = true;
     (void)WOLFMKA_MEMCPY(pe->sci, pdu->basic.sci, MKA_SCI_LEN);
@@ -1283,6 +1650,7 @@ static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
      * or not carrying an XPN set), so expiry holds it that much longer. */
     pe->suspend_for = pdu->xpn.suspension_time;
 #endif
+    mka_note_sak_use(p, pe, pdu);
     if (pdu->sak_use.present) {
         mka_apply_sak_use(p, pe, &pdu->sak_use, &pdu->xpn);
     }
@@ -1290,9 +1658,21 @@ static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
         mka_ev_peer_added(p, pe->mi, pe->sci);
     }
 
-    /* A peer becomes live once it echoes our MI, proving bidirectional
-     * connectivity (9.4.3). */
-    pe->live = mka_lists_contain_mi(pdu, p->actor_mi);
+    /* A peer becomes live once it echoes our MI together with a Message Number
+     * we recently emitted, proving bidirectional connectivity (9.4.3). Either
+     * list carries that proof.
+     *
+     * The Live list needs no recency test here: mka_stale_live_echo() has
+     * already discarded the whole MKPDU if our MI appeared there with a stale
+     * number (AutoMKA-04004), so finding it now means the number was recent.
+     * Re-testing it would be a condition that can never be false. The Potential
+     * list is not covered by that rule, so it is checked here. */
+    echoed = mka_list_echo(&pdu->live_peers, p->actor_mi, &echo_mn);
+    if (!echoed) {
+        echoed = mka_list_echo(&pdu->potential_peers, p->actor_mi, &echo_mn) &&
+                 mka_mn_recent(p, echo_mn);
+    }
+    pe->live = echoed;
     return pe->live;
 }
 
@@ -1325,6 +1705,39 @@ static void mka_reapply_xpn_ssci(MkaParticipant* p)
 #endif
 
 /**
+ * Retire a peer's previous incarnation once its new one is live.
+ *
+ * A device that resets comes back with a fresh Member Identifier but the same
+ * SCI. Its old entry would otherwise sit in the table until the Life Time
+ * expired it - holding a stale live peer, keeping the Key Server waiting on a
+ * member that is gone, and costing up to three Hello Times of downtime (OPEN
+ * Alliance AutoMKA-03006).
+ *
+ * The old entry is removed only once the new MI has proven liveness, never on
+ * first sight of it: an attacker replaying or forging an MKPDU with an unknown
+ * MI can therefore never evict a working peer, since a forged frame cannot echo
+ * this participant's own MI and Message Number back to it.
+ *
+ * Called before the new peer's receive SA is installed, because both entries
+ * share an SCI and the SecY keys its SAs by (SCI, AN) - retiring afterwards
+ * would delete the SA just installed for the new MI.
+ * @param[in,out] p     the participant owning the peer table.
+ * @param[in]     kept  the newly live peer whose SCI identifies the device.
+ */
+static void mka_retire_stale_mi(MkaParticipant* p, const MkaPeer* kept)
+{
+    size_t i;
+
+    for (i = 0U; i < MKA_MAX_PEERS; i++) {
+        MkaPeer* pe = &p->peers[i];
+        if (pe->valid && (pe != kept) &&
+            (WOLFMKA_MEMCMP(pe->sci, kept->sci, MKA_SCI_LEN) == 0)) {
+            mka_drop_peer(p, pe);
+        }
+    }
+}
+
+/**
  * React to a refreshed MKPDU: re-run election, install a receive SA for a newly
  * live peer, and act on a distributed SAK (and group CAK) from the Key Server.
  *
@@ -1345,8 +1758,14 @@ static MkaStatus mka_react_to_pdu(MkaParticipant* p, MkaPeer* pe,
 
     /* If we hold a SAK and this peer just became live, give it an SA. */
     if (now_live && (!was_live)) {
+        /* First drop any earlier incarnation of the same device (AutoMKA-03006)
+         * so its teardown cannot delete the SA installed just below. */
+        mka_retire_stale_mi(p, pe);
         mka_install_peer_rx(p, pe);
         mka_ev_peer_live(p, pe->mi);
+        /* newInfo: the Live Peer List changed. As Key Server this is the
+         * moment the Distributed SAK becomes worth sending. */
+        p->new_info = true;
 #ifndef WOLFMKA_NO_XPN
         /* A new member shifts XPN SSCI ranks (an SSCI is the SCI's rank in the
          * live membership), so reprogram the existing channels. For non-XPN
@@ -1409,6 +1828,14 @@ static MkaStatus mka_receive_process(MkaParticipant* p, const MkaPdu* pdu,
     bool was_live;
     bool now_live;
     MkaStatus rc;
+
+    /* Checked before the peer table is touched at all, so an MKPDU rejected
+     * here leaves no trace: no slot allocated, no Life timer refreshed
+     * (AutoMKA-04004). Our own MKPDUs never list our MI, so a loopback frame
+     * cannot trip this. */
+    if (mka_stale_live_echo(p, pdu)) {
+        return MKA_ERR_REPLAY;
+    }
 
     rc = mka_admit_peer(p, pdu, &pe, &added);
     if ((rc != MKA_OK) || (pe == NULL)) {
@@ -1566,7 +1993,14 @@ static void mka_build_sak_use(const MkaParticipant* p, MkaPdu* pdu)
 
     pdu->sak_use.present = true;
     pdu->sak_use.latest_an = p->latest.an;
-    MKA_SAK_USE_SET_LATEST_RX(&pdu->sak_use);
+    /* Only claim to be receiving once the SecY actually holds the key. Under
+     * distribute_before_install the MKPDU that carries a new SAK goes out
+     * before the data plane is programmed, and a peer takes this flag as leave
+     * to start transmitting protected frames - which we could not yet decrypt.
+     * The claim follows one MKPDU later, as soon as programming is done. */
+    if (!p->sak_program_pending) {
+        MKA_SAK_USE_SET_LATEST_RX(&pdu->sak_use);
+    }
     if (p->latest.tx) {
         MKA_SAK_USE_SET_LATEST_TX(&pdu->sak_use);
     }
@@ -1725,7 +2159,7 @@ static MkaStatus mka_build_fill(const MkaParticipant* p, MkaPdu* pdu)
 
     (void)WOLFMKA_MEMSET(pdu, 0, sizeof(*pdu));
 
-    pdu->basic.version = (uint8_t)MKA_MKA_VERSION_ID;
+    pdu->basic.version = (uint8_t)WOLFMKA_MKA_VERSION;
     pdu->basic.priority = p->cfg.priority;
     pdu->basic.key_server = p->is_key_server;
     pdu->basic.macsec_desired = p->cfg.macsec_desired;
@@ -1841,8 +2275,11 @@ static bool mka_expire_peers(MkaParticipant* p, uint32_t now_ms)
 
 /**
  * Build and send one MKPDU through the transmit callback.
+ *
+ * A transmit callback that fails is not an error - the next tick retries - so
+ * it is reported through @c sent rather than the return code.
  * @param[in,out] p     participant.
- * @param[out]    sent  optional; set to 1 if a frame was transmitted.
+ * @param[out]    sent  set to true if a frame reached the wire (required).
  * @return MKA_OK or an error from build/allocation.
  */
 static MkaStatus mka_transmit_mkpdu(MkaParticipant* p, bool* sent)
@@ -1858,9 +2295,7 @@ static MkaStatus mka_transmit_mkpdu(MkaParticipant* p, bool* sent)
         rc = wm_Participant_BuildMkpdu(p, frame, MKA_MKPDU_MAX_LEN, &flen);
         if (rc == MKA_OK) {
             if (p->cfg.send(p->cfg.send_ctx, frame, flen) == 0) {
-                if (sent != NULL) {
-                    *sent = true;
-                }
+                *sent = true;
             }
         }
     }
@@ -1908,7 +2343,10 @@ static bool mka_pn_exhausted(const MkaParticipant* p)
 static MkaStatus mka_ks_maybe_rekey(MkaParticipant* p, uint32_t now_ms,
     bool removed_live)
 {
-    bool gen = (!p->latest.valid) || removed_live;
+    /* A peer that has stopped reporting the SAK has lost it, and only a fresh
+     * distribution brings it back (AutoMKA-03011) - so it forces a rekey on the
+     * same footing as a departed peer, in every build. */
+    bool gen = (!p->latest.valid) || removed_live || p->sak_lost;
     MkaStatus rc = MKA_OK;
 
 #ifndef WOLFMKA_NO_AUTO_REKEY
@@ -1934,6 +2372,9 @@ static MkaStatus mka_ks_maybe_rekey(MkaParticipant* p, uint32_t now_ms,
         rc = mka_ks_generate_sak(p);
         if (rc == MKA_OK) {
             p->last_rekey_ms = now_ms;
+            /* Whatever prompted this rekey is answered; peers re-report their
+             * SAK Use against the new key. */
+            p->sak_lost = false;
         }
     }
     return rc;
@@ -1956,17 +2397,40 @@ static MkaStatus mka_transmit_step(MkaParticipant* p, uint32_t now_ms,
 #ifndef WOLFMKA_NO_RETRY
     bool was_started = p->started;
 #endif
+    /* Whether a frame actually reached the wire. The transmit callback's
+     * failure is not an error for the state machine - the next tick retries -
+     * so it never shows up in rc, but the deferred SAK programming must not
+     * proceed without it. */
+    bool did_send = false;
     MkaStatus rc = MKA_OK;
 
 #ifdef WOLFMKA_NO_RETRY
     (void)not_established;
 #endif
     if (p->cfg.send != NULL) {
-        rc = mka_transmit_mkpdu(p, sent);
+        rc = mka_transmit_mkpdu(p, &did_send);
+    }
+    if (sent != NULL) {
+        *sent = did_send;
     }
     if (rc == MKA_OK) {
         p->started = true;
         p->last_tx_ms = now_ms;
+        /* Whatever changed is now on the wire, so the newInfo condition is
+         * satisfied until the next state change sets it again. */
+        p->new_info = false;
+        if (p->sak_program_pending && did_send) {
+            /* The MKPDU carrying the key has gone out, so the data plane can be
+             * programmed now (AutoMKA-03010). Deferring until the send succeeds
+             * means a key is never installed that no peer has been told about;
+             * a failed send leaves it pending and the next tick retries.
+             *
+             * Ordered after the newInfo clear above, not before: programming
+             * raises newInfo again so the MACsec SAK Use reporting us able to
+             * receive follows at once, and clearing afterwards would discard
+             * it. */
+            mka_program_sak(p);
+        }
 #ifndef WOLFMKA_NO_RETRY
         /* Grow the back-off toward the cyclic ceiling. The first
          * (immediate) transmit leaves the interval at the base so the next
@@ -2015,7 +2479,12 @@ static MkaStatus mka_advance_state(MkaParticipant* p, uint32_t now_ms,
 /**
  * The transmit interval for this tick: the Hello Time, shortened to the Bounded
  * Hello Time under delay protection, or the growing MKA retry back-off until a
- * peer is established (AUTOSAR CP_SWS_Mka_00012).
+ * peer is established (AUTOSAR CP_SWS_Mka_00012; the OPEN Alliance startup ramp
+ * of AutoMKA-03004 is this back-off configured to 10 ms .. Hello Time).
+ *
+ * This is the periodic cadence only. A participant with
+ * MkaParticipantConfig.immediate_response may transmit inside the interval when
+ * it has new information - see wm_Participant_Run.
  * @param[in,out] p                the participant (its retry delay may update).
  * @param[in]     not_established  true while no peer is live.
  * @return the transmit interval in milliseconds.
@@ -2073,11 +2542,21 @@ MkaStatus wm_Participant_Run(MkaParticipant* p, uint32_t now_ms, bool* sent)
         return rc;
     }
 
-    /* Transmit on the first run and then every interval (Hello / Bounded Hello
-     * / retry back-off, per mka_tx_interval). */
     not_established = (wm_Participant_LivePeerCount(p) == 0U);
     hello = mka_tx_interval(p, not_established);
-    do_tx = (!p->started) || ((now_ms - p->last_tx_ms) >= hello);
+    /* Transmit on the first run; when there is new information to report and
+     * the participant is configured to answer at once (the newInfo behaviour of
+     * IEEE Std 802.1X-2010, 9.4; OPEN Alliance AutoMKA-03003); or when the
+     * interval has elapsed (Hello / Bounded Hello / retry back-off, per
+     * mka_tx_interval). */
+    do_tx = (!p->started) || (p->cfg.immediate_response && p->new_info) ||
+            ((now_ms - p->last_tx_ms) >= hello);
+    if (p->quiesced) {
+        /* Another CA on this port has MACsec up, so this one has nothing to
+         * negotiate with and stays silent (AutoMKA-09001). Timers and peer
+         * expiry still run, so it resumes cleanly when released. */
+        do_tx = false;
+    }
 #ifdef WOLFMKA_SUSPENSION
     /* While suspended, transmit only the one-shot suspension announcement, then
      * go quiet (802.1Xbx-2014). */
@@ -2203,6 +2682,11 @@ MkaStatus wm_Kay_Init(MkaKay* kay)
         return MKA_ERR_BAD_ARG;
     }
     kay->count = 0U;
+    /* Every field wm_Kay_Init does not deliberately leave to the participants
+     * must be set here: the participant array is not zeroed (it is large, and
+     * wm_Kay_AddParticipant initialises each entry as it is added), so anything
+     * missed here keeps the caller's stack contents. */
+    kay->quiesce_others = false;
     return MKA_OK;
 }
 
@@ -2308,6 +2792,46 @@ MkaStatus wm_Kay_RemoveParticipant(MkaKay* kay, const uint8_t* ckn,
 
 /* Runs every participant; keeps the first non-OK status but still steps the
  * rest (one CA's failure must not stall the others). */
+MkaStatus wm_Kay_SetQuiesceOthers(MkaKay* kay, bool enable)
+{
+    if (kay == NULL) {
+        return MKA_ERR_BAD_ARG;
+    }
+    kay->quiesce_others = enable;
+    if (!enable) {
+        /* Release anything already held, so turning the policy off takes
+         * effect without waiting for a session to drop. */
+        size_t i;
+        for (i = 0U; i < kay->count; i++) {
+            kay->parts[i].quiesced = false;
+        }
+    }
+    return MKA_OK;
+}
+
+/**
+ * Apply the quiesce policy for this tick: while one participant has MACsec up,
+ * every other one is held silent; otherwise none is.
+ * @param[in,out] kay  the KaY.
+ */
+static void mka_kay_apply_quiesce(MkaKay* kay)
+{
+    const MkaParticipant* winner = NULL;
+    size_t i;
+
+    for (i = 0U; i < kay->count; i++) {
+        const MkaParticipant* p = &kay->parts[i];
+        if (p->latest.valid && p->latest.tx) {
+            winner = p;
+            break;
+        }
+    }
+    for (i = 0U; i < kay->count; i++) {
+        MkaParticipant* p = &kay->parts[i];
+        p->quiesced = (winner != NULL) && (p != winner);
+    }
+}
+
 MkaStatus wm_Kay_Run(MkaKay* kay, uint32_t now_ms)
 {
     MkaStatus rc = MKA_OK;
@@ -2315,6 +2839,9 @@ MkaStatus wm_Kay_Run(MkaKay* kay, uint32_t now_ms)
 
     if (kay == NULL) {
         return MKA_ERR_BAD_ARG;
+    }
+    if (kay->quiesce_others) {
+        mka_kay_apply_quiesce(kay);
     }
     for (i = 0U; i < kay->count; i++) {
         MkaStatus s = wm_Participant_Run(&kay->parts[i], now_ms, NULL);
