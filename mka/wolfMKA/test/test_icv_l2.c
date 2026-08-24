@@ -38,6 +38,16 @@ int g_tests_failed = 0;
  * the header links cleanly. */
 MkaCmacCtx* g_cmac = NULL;
 
+#ifndef WOLFMKA_ICV_L2_ADDR
+/* Built by `make test-icv-l2`, which supplies -DWOLFMKA_ICV_L2_ADDR. Without it
+ * there is nothing to test, but the file must still compile: `make cxx` and the
+ * feature sweep build every test source in the default configuration. */
+int main(void)
+{
+    printf("wolfMKA L2 ICV test: SKIP (build with -DWOLFMKA_ICV_L2_ADDR)\n");
+    return 0;
+}
+#else
 int main(void)
 {
     uint8_t ick[16], l2[MKA_ICV_L2_PREFIX_LEN], data[64], icv[16];
@@ -55,26 +65,27 @@ int main(void)
     memset(l2, 0x33, sizeof(l2));
     memset(data, 0x22, sizeof(data));
 
-    CHECK(wm_Crypto_IcvComputeL2(cmac, ick, sizeof(ick), l2, sizeof(l2),
-              data, sizeof(data), icv) == MKA_OK,
+    CHECK(wm_Crypto_IcvComputeL2(cmac, ick, sizeof(ick), l2, sizeof(l2), data,
+              sizeof(data), icv) == MKA_OK,
         "icv L2 compute");
-    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2),
-              data, sizeof(data), icv) == MKA_OK,
+    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2), data,
+              sizeof(data), icv) == MKA_OK,
         "icv L2 verify ok");
     /* A prefix length other than 14 octets is rejected. */
     CHECK(wm_Crypto_IcvComputeL2(cmac, ick, sizeof(ick), l2, sizeof(l2) - 1U,
               data, sizeof(data), icv) == MKA_ERR_BAD_ARG,
         "icv L2 wrong prefix length rejected");
-    /* Tamper the L2 prefix: the ICV must fail (proves the prefix is bound in). */
+    /* Tamper the L2 prefix: the ICV must fail (proves the prefix is bound in).
+     */
     l2[0] ^= 0x01;
-    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2),
-              data, sizeof(data), icv) == MKA_ERR_ICV,
+    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2), data,
+              sizeof(data), icv) == MKA_ERR_ICV,
         "icv L2 verify tamper prefix");
     l2[0] ^= 0x01;
     /* Tamper the data: the ICV must fail. */
     data[0] ^= 0x01;
-    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2),
-              data, sizeof(data), icv) == MKA_ERR_ICV,
+    CHECK(wm_Crypto_IcvVerifyL2(cmac, ick, sizeof(ick), l2, sizeof(l2), data,
+              sizeof(data), icv) == MKA_ERR_ICV,
         "icv L2 verify tamper data");
 
     wm_Crypto_CmacFree(cmac);
@@ -84,3 +95,4 @@ int main(void)
         g_tests_failed == 0 ? "PASS" : "FAIL");
     return g_tests_failed == 0 ? 0 : 1;
 }
+#endif /* WOLFMKA_ICV_L2_ADDR */

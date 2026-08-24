@@ -96,6 +96,11 @@ jobs:
       - name: OPEN Alliance TC17 Automotive MKA profile
         run: make test-automotive
 
+      - name: L2-address ICV (wpa_supplicant-compatible ICV input)
+        run: |
+          make test-icv-l2
+          make test-icv-l2-suite
+
       - name: Redefinable allocator test
         run: make test-alloc
 

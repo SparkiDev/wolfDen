@@ -429,10 +429,8 @@ static void test_pdu_edge_cases(void)
     body = (pos + MKA_DEFAULT_ICV_LEN) - EAPOL_HDR_LEN;
     frm[2] = (uint8_t)(body >> 8);
     frm[3] = (uint8_t)(body & 0xFFU);
-    CHECK(wm_Crypto_IcvCompute(g_cmac, ick, sizeof(ick), frm, pos, icv) ==
-              MKA_OK,
-        "sign spliced frame");
-    memcpy(&frm[pos], icv, MKA_DEFAULT_ICV_LEN);
+    test_seal_icv(g_cmac, ick, sizeof(ick), frm, pos);
+    memcpy(icv, &frm[pos], MKA_DEFAULT_ICV_LEN);
     out_len = pos + MKA_DEFAULT_ICV_LEN;
 
     /* The unknown set is skipped: decode succeeds and the Basic set still
@@ -453,9 +451,14 @@ static void test_pdu_edge_cases(void)
 
 /* Recompute the trailing ICV after surgically corrupting a frame, so the
  * decoder passes ICV verification and reaches the parameter-set parser. */
+/* Recompute a frame's ICV in place after the test has altered its body, so the
+ * decoder rejects on the field under test rather than on the seal. It must seal
+ * the same input the library verifies: with WOLFMKA_ICV_L2_ADDR that includes
+ * the L2 prefix the PDU layer derives from the frame (DA || SA || EtherType,
+ * the SA taken from the SCI in the Basic Parameter Set). */
 static void reseal(uint8_t* f, size_t len, const uint8_t* ick)
 {
-    wm_Crypto_IcvCompute(g_cmac, ick, 16, f, len - 16U, &f[len - 16U]);
+    test_seal_icv(g_cmac, ick, 16, f, len - 16U);
 }
 
 /* Targeted malformed data exercising each parse-error branch of
@@ -1193,7 +1196,7 @@ static void test_announce_suite_cap(void)
  * is rejected as a parse error rather than overflowing it. */
 static void test_dist_cak(void)
 {
-    uint8_t ick[16], buf[256], frm[256], icv[16];
+    uint8_t ick[16], buf[256], frm[256];
     size_t out_len = sizeof(buf);
     size_t basic_end, pos, body, i;
     MkaPdu in, out;
@@ -1244,8 +1247,7 @@ static void test_dist_cak(void)
     body = (pos + MKA_DEFAULT_ICV_LEN) - EAPOL_HDR_LEN;
     frm[2] = (uint8_t)(body >> 8);
     frm[3] = (uint8_t)(body & 0xFFU);
-    (void)wm_Crypto_IcvCompute(g_cmac, ick, sizeof(ick), frm, pos, icv);
-    memcpy(&frm[pos], icv, MKA_DEFAULT_ICV_LEN);
+    test_seal_icv(g_cmac, ick, sizeof(ick), frm, pos);
     out_len = pos + MKA_DEFAULT_ICV_LEN;
     CHECK(wm_Pdu_Decode(g_cmac, frm, out_len, ick, sizeof(ick), &out) ==
               MKA_ERR_PARSE,
@@ -1259,7 +1261,7 @@ static void test_dist_cak(void)
  * rejected rather than overflowing it. */
 static void test_kmd(void)
 {
-    uint8_t ick[16], buf[256], frm[256], icv[16];
+    uint8_t ick[16], buf[256], frm[256];
     size_t out_len = sizeof(buf);
     size_t basic_end, pos, body;
     MkaPdu in, out;
@@ -1306,8 +1308,7 @@ static void test_kmd(void)
     body = (pos + MKA_DEFAULT_ICV_LEN) - EAPOL_HDR_LEN;
     frm[2] = (uint8_t)(body >> 8);
     frm[3] = (uint8_t)(body & 0xFFU);
-    (void)wm_Crypto_IcvCompute(g_cmac, ick, sizeof(ick), frm, pos, icv);
-    memcpy(&frm[pos], icv, MKA_DEFAULT_ICV_LEN);
+    test_seal_icv(g_cmac, ick, sizeof(ick), frm, pos);
     out_len = pos + MKA_DEFAULT_ICV_LEN;
     CHECK(wm_Pdu_Decode(g_cmac, frm, out_len, ick, sizeof(ick), &out) ==
               MKA_ERR_PARSE,

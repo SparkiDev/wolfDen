@@ -3,7 +3,7 @@
 The core sources (`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`) meet **100% line,
 decision (branch) and MC/DC** coverage (DO-178C DAL A), and the build
 **enforces** it: `make coverage` fails below 100% on any of the three metrics,
-and `make coverage-configs` re-checks the same across all ten delivered
+and `make coverage-configs` re-checks the same across all eleven delivered
 configurations. This document describes how MC/DC is measured and records the
 evidence behind the 100% figures — in particular how the cipher-negotiation code
 and the feature-off builds were brought to full coverage.
@@ -24,6 +24,7 @@ coverage, not just DAL-B.
 | **Certification base** (`FAULT_INJECT DISTRIBUTED_CAK KMD SUSPENSION`) | **100%** | **100%** | **100%** |
 | + `CIPHER_NEGOTIATION` | **100%** | **100%** | **100%** |
 | + `AUTOMOTIVE_PROFILE` | **100%** | **100%** | **100%** |
+| + `ICV_L2_ADDR` | **100%** | **100%** | **100%** |
 | + `SMALL_STACK NO_MALLOC` | **100%** | **100%** | **100%** |
 | Feature-off `NO_*` builds | **all six enforced at 100%** (table below) | | |
 
@@ -66,7 +67,7 @@ cppcheck does not flag MISRA 18.1 on the resulting single-condition loops.
 DO-178C requires structural coverage of the **delivered** configuration. `make
 coverage-configs` applies the enforced 100% line + decision + MC/DC check, via a
 parameterised worker (`cov-impl`) driven by recursive make, to each delivered
-configuration. Every feature-specific test is `#ifndef`-gated, so all ten
+configuration. Every feature-specific test is `#ifndef`-gated, so all eleven
 configurations compile and run their suites to `failures: 0 => PASS` under their
 own flag. Reachability-driven vectors were added in the process (e.g. an
 empty-context KDF call and an explicit XPN make-before-break "old key" emission),

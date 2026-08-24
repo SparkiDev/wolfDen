@@ -27,6 +27,7 @@
 #include <stddef.h>
 
 #include "wolfmka/mka_types.h"
+#include "wolfmka/mka_crypto.h"
 
 extern int g_tests_run;
 extern int g_tests_failed;
@@ -62,6 +63,38 @@ static inline void print_hex(const char* tag, const uint8_t* p, size_t n)
     for (i = 0; i < n; i++)
         printf("%02x", p[i]);
     printf("\n");
+}
+
+/* Re-seal a frame's ICV in place after a test has altered its body, so the
+ * decoder rejects on the field under test rather than on a broken seal.
+ *
+ * It signs exactly what the library verifies. Under WOLFMKA_ICV_L2_ADDR that
+ * includes the L2 prefix the PDU layer derives from the frame itself - the PAE
+ * group address, the SA taken from the SCI in the Basic Parameter Set, and the
+ * EAPOL EtherType - so a test that sealed only the PDU body would fail the ICV
+ * instead of reaching the check it is aiming at.
+ * @param[in]     cmac     CMAC workspace.
+ * @param[in]     ick      the ICK to sign with.
+ * @param[in]     ick_len  its length in octets.
+ * @param[in,out] f        the frame; its trailing ICV is overwritten.
+ * @param[in]     covered  octets of f the ICV covers (the ICV follows them).
+ */
+static inline void test_seal_icv(MkaCmacCtx* cmac, const uint8_t* ick,
+    size_t ick_len, uint8_t* f, size_t covered)
+{
+#ifdef WOLFMKA_ICV_L2_ADDR
+    static const uint8_t pae_group[6] = MKA_PAE_GROUP_ADDR;
+    uint8_t l2[MKA_ICV_L2_PREFIX_LEN];
+
+    memcpy(&l2[0], pae_group, sizeof pae_group);
+    memcpy(&l2[6], &f[EAPOL_HDR_LEN + 4U], 6);
+    l2[12] = (uint8_t)(EAPOL_ETHERTYPE >> 8);
+    l2[13] = (uint8_t)(EAPOL_ETHERTYPE & 0xFFU);
+    (void)wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, sizeof l2, f, covered,
+        &f[covered]);
+#else
+    (void)wm_Crypto_IcvCompute(cmac, ick, ick_len, f, covered, &f[covered]);
+#endif
 }
 
 /* Parse a hex string (no separators) into buf; returns byte count. */

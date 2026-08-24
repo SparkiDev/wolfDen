@@ -273,8 +273,9 @@ MkaStatus wm_Crypto_IcvVerify(MkaCmacCtx* cmac, const uint8_t* ick,
     const uint8_t icv[MKA_DEFAULT_ICV_LEN]);
 
 #ifdef WOLFMKA_ICV_L2_ADDR
-/* The L2 prefix is a fixed 14 octets: DA(6) || SA(6) || EAPOL EtherType(2). */
-#define MKA_ICV_L2_PREFIX_LEN 14U
+    /* The L2 prefix is a fixed 14 octets: DA(6) || SA(6) || EAPOL EtherType(2).
+     */
+    #define MKA_ICV_L2_PREFIX_LEN 14U
 /**
  * Compute/verify the MKPDU ICV over an L2 prefix (@p l2 = DA || SA || EAPOL
  * EtherType, MKA_ICV_L2_PREFIX_LEN octets) then @p data. @p l2_len must equal
