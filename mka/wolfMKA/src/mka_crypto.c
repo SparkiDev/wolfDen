@@ -751,3 +751,81 @@ MkaStatus wm_Crypto_IcvVerify(MkaCmacCtx* cmac, const uint8_t* ick,
     sel = (0U - (((uint32_t)diff + 0xFFU) >> 8U)) & (uint32_t)MKA_ERR_ICV;
     return (MkaStatus)(int32_t)sel;
 }
+
+#ifdef WOLFMKA_ICV_L2_ADDR
+/* AES-CMAC(ICK) over an L2 prefix (DA || SA || EAPOL EtherType) then the MKPDU,
+ * via the streaming API so no scratch buffer is needed. Matches the ICV input
+ * wpa_supplicant uses (IEEE Std 802.1X-2010, 11.11.3). */
+static int mka_aes_cmac_l2(MkaCmacCtx* ctx, const uint8_t* key, size_t key_len,
+    const uint8_t* l2, size_t l2_len, const uint8_t* data, size_t data_len,
+    uint8_t mac[MKA_DEFAULT_ICV_LEN])
+{
+    word32 out_sz = (word32)MKA_DEFAULT_ICV_LEN;
+    int ret;
+
+    ret = wc_InitCmac_ex(&ctx->cmac, key, (word32)key_len, WC_CMAC_AES, NULL,
+                         WOLFMKA_HEAP_HINT, INVALID_DEVID);
+    if (ret == 0) {
+        ret = wc_CmacUpdate(&ctx->cmac, l2, (word32)l2_len);
+    }
+    if ((ret == 0) && (data_len > 0U)) {
+        ret = wc_CmacUpdate(&ctx->cmac, data, (word32)data_len);
+    }
+    if (ret == 0) {
+        ret = wc_CmacFinal(&ctx->cmac, mac, &out_sz);
+    }
+    /* Route the result through the fault-injection hook so test builds can
+     * force a CMAC failure here, exactly as the non-L2 mka_aes_cmac does. */
+    return MKA_FI(MKA_FI_CMAC, ret);
+}
+
+MkaStatus wm_Crypto_IcvComputeL2(MkaCmacCtx* cmac, const uint8_t* ick,
+    size_t ick_len, const uint8_t* l2, size_t l2_len, const uint8_t* data,
+    size_t data_len, uint8_t icv[MKA_DEFAULT_ICV_LEN])
+{
+    if ((cmac == NULL) || (l2 == NULL) || (data == NULL) || (icv == NULL)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    /* The L2 prefix is a fixed 14 octets (DA || SA || EtherType); reject any
+     * other length so callers cannot silently ICV the wrong input. */
+    if (l2_len != MKA_ICV_L2_PREFIX_LEN) {
+        return MKA_ERR_BAD_ARG;
+    }
+    if (!mka_key_valid(ick, ick_len)) {
+        return MKA_ERR_BAD_ARG;
+    }
+    if (mka_aes_cmac_l2(cmac, ick, ick_len, l2, l2_len, data, data_len, icv)
+            != MKA_CMAC_OK) {
+        return MKA_ERR_CRYPTO;
+    }
+    return MKA_OK;
+}
+
+MkaStatus wm_Crypto_IcvVerifyL2(MkaCmacCtx* cmac, const uint8_t* ick,
+    size_t ick_len, const uint8_t* l2, size_t l2_len, const uint8_t* data,
+    size_t data_len, const uint8_t icv[MKA_DEFAULT_ICV_LEN])
+{
+    uint8_t computed[MKA_DEFAULT_ICV_LEN];
+    uint8_t diff = 0U;
+    size_t  i;
+    uint32_t sel;
+    MkaStatus rc;
+
+    if (icv == NULL) {
+        return MKA_ERR_BAD_ARG;
+    }
+    rc = wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, l2_len, data, data_len,
+                                computed);
+    if (rc != MKA_OK) {
+        return rc;
+    }
+    for (i = 0U; i < MKA_DEFAULT_ICV_LEN; i++) {
+        diff |= (uint8_t)(computed[i] ^ icv[i]);
+    }
+    wm_Crypto_ForceZero(computed, sizeof computed);
+    /* Branchless constant-time select, matching wm_Crypto_IcvVerify: yields
+     * MKA_ERR_ICV when any octet differed, MKA_OK otherwise. */
+    sel = (0U - (((uint32_t)diff + 0xFFU) >> 8U)) & (uint32_t)MKA_ERR_ICV;
+    return (MkaStatus)(int32_t)sel;
+}
+#endif /* WOLFMKA_ICV_L2_ADDR */

@@ -44,10 +44,12 @@ DEPFLAGS := -MMD -MP
 # changes, so it triggers a rebuild on a flag change but not on every run.
 FLAGSTAMP := build/.cflags
 
-# test_custom_alloc.c and test_autosar.c are standalone programs (own main), and
-# the fuzz_*.c harnesses define a libFuzzer entry point (no main); exclude them
-# all from the normal runner and build via their own targets instead.
+# test_custom_alloc.c, test_autosar.c and test_icv_l2.c are standalone programs
+# (own main), and the fuzz_*.c harnesses define a libFuzzer entry point (no
+# main); exclude them all from the normal runner and build via their own targets
+# instead.
 TEST_SRC := $(filter-out test/test_custom_alloc.c test/test_autosar.c \
+                         test/test_icv_l2.c \
                          test/fuzz_pdu.c test/fuzz_receive.c test/test_endian.c,\
                          $(wildcard test/*.c))
 TEST_BIN := test/runtests
@@ -61,8 +63,9 @@ EXAMPLE_SRC := $(filter-out examples/mka_group_cak.c examples/mka_autosar.c,\
 EXAMPLE_BIN := $(EXAMPLE_SRC:.c=)
 
 .PHONY: all lib test check examples test-alloc test-nomalloc \
-        test-fault test-distcak test-kmd test-suspension test-automotive \
+        test-fault test-distcak test-kmd test-suspension test-negotiation test-icv-l2 \
         example-distcak example-autosar features cxx misra docs \
+        test-automotive example-distcak example-autosar features cxx misra docs \
         autosar coverage sanitize analyze fuzz fuzz-pdu fuzz-receive \
         interop interop-dataplane test-endian footprint format format-check clean FORCE
 
@@ -187,6 +190,15 @@ test-negotiation:
 	$(CC) $(CFLAGS) -DWOLFMKA_CIPHER_NEGOTIATION $(TEST_SRC) \
 	    $(SRC) -o test/runnego $(LDFLAGS) $(LDLIBS)
 	./test/runnego
+
+# Build and run the standalone L2-address ICV test. WOLFMKA_ICV_L2_ADDR makes
+# the ICV cover the DA || SA || EtherType L2 prefix ahead of the MKPDU, matching
+# wpa_supplicant / the Linux kernel; off by default. The full suite's PDU/KAY
+# frame builders assume the non-L2 ICV, so this path is pinned on its own.
+test-icv-l2:
+	$(CC) $(CFLAGS) -DWOLFMKA_ICV_L2_ADDR test/test_icv_l2.c \
+	    $(SRC) -o test/runicvl2 $(LDFLAGS) $(LDLIBS)
+	./test/runicvl2
 
 # Build the suite under the OPEN Alliance TC17 Automotive MKA profile and run
 # it. The profile emits version 3 MKPDUs and removes Secure Announcements and
@@ -320,7 +332,7 @@ features:
 	    "-DWOLFMKA_NO_ANNOUNCEMENTS" "-DWOLFMKA_NO_AUTO_REKEY" \
 	    "-DWOLFMKA_DISTRIBUTED_CAK" "-DWOLFMKA_KMD" "-DWOLFMKA_SUSPENSION" \
 	    "-DWOLFMKA_CIPHER_NEGOTIATION" "-DWOLFMKA_AUTOMOTIVE_PROFILE" \
-	    "-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
+	    "-DWOLFMKA_ICV_L2_ADDR" \"-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC"; do \
 	    printf '  [features]%s\n' " $${cfg:-default}"; \
 	    for f in $(SRC); do $(CC) $(CFLAGS) $$cfg -c $$f -o /tmp/wmka.o; done; \
