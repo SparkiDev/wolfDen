@@ -27,5 +27,16 @@ misra-c2012-21.15:include/wolfmka/mka_bytes.h
 # and only when <stdbool.h> is absent. NOT present in the compliant C99
 # configuration (where <stdbool.h> is included). Documented deviation (MISRA.md).
 misra-c2012-21.1:include/wolfmka/mka_types.h
+# 11.5 cast from void* - the AUTOSAR binding's send bridge. MkaSendFn passes an
+# opaque void* context, which the bridge must recover as the PAE that set it;
+# there is no way to express a typed callback context through a generic hook.
+# Scoped to that file. Documented deviation (see MISRA.md).
+misra-c2012-11.5:src/autosar/Mka.c
+
+# Not a MISRA rule: cppcheck suggests `const void* ctx` for the send bridge, but
+# the signature is fixed by MkaSendFn - the callback the KaY invokes - so const
+# there would need the function pointer cast, which is worse than the parameter.
+constParameterCallback:src/autosar/Mka.c
+
 # Not a MISRA rule: noise from system headers we do not own.
 missingIncludeSystem

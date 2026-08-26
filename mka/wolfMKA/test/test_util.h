@@ -35,6 +35,9 @@ extern int g_tests_failed;
 /* A shared CMAC workspace, acquired once in main(). The CMAC-consuming APIs
  * require a caller-supplied workspace, so the tests pass this. */
 extern MkaCmacCtx* g_cmac;
+/* The RNG workspace is mandatory too (MkaParticipantConfig::rng), so the
+ * harness acquires one for the whole run just as it does the CMAC context. */
+extern MkaRandom* g_rng;
 
 #define CHECK(cond, msg)                                                       \
     do {                                                                       \

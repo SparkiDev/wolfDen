@@ -206,6 +206,7 @@ int main(void)
     MkaParticipant A, B;
     MkaParticipantConfig ca, cb;
     MkaCmacCtx* cmac;
+    MkaRandom* rng;
     int tick;
     int rc;
 
@@ -222,6 +223,13 @@ int main(void)
         printf("cmac init failed\n");
         return 1;
     }
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        fprintf(stderr, "could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     /* Shared CAK/CKN (in practice provisioned out of band or via EAP). */
     memset(&ca, 0, sizeof(ca));
@@ -230,6 +238,7 @@ int main(void)
     memcpy(ca.cak.ckn, "demo-connectivity-association", 29);
     ca.cak.ckn_len = 29;
     ca.cmac = cmac;
+    ca.rng = rng;
     cb = ca; /* same CAK/CKN and (shared) CMAC workspace */
 
     /* Endpoint A: priority 10 (favoured as Key Server). */
@@ -265,6 +274,7 @@ int main(void)
     if (wm_Participant_Init(&A, &ca) != MKA_OK ||
         wm_Participant_Init(&B, &cb) != MKA_OK) {
         printf("init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -310,6 +320,7 @@ int main(void)
     }
     wm_Participant_Free(&A);
     wm_Participant_Free(&B);
+    wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
     return rc;
 }

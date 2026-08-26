@@ -40,17 +40,170 @@
 extern "C" {
 #endif
 
-/* Module / vendor identification (placeholders; set per integration). The
- * software version mirrors the library's WOLFMKA_VERSION_* (mka_types.h, pulled
- * in via mka_kay.h) so there is a single source of truth. */
-#define MKA_VENDOR_ID        0U
-#define MKA_MODULE_ID        0xFFU
+/**
+ * @name Module identification
+ * Reported by Mka_GetVersionInfo(), and used by Det to attribute a development
+ * error to this module. The vendor and module IDs are placeholders: a real
+ * integration overrides them with the values its BSW configuration assigns, or
+ * Det reports arrive labelled as somebody else's module.
+ * @{
+ */
+#ifndef MKA_VENDOR_ID
+    /** Vendor ID; override to match the BSW configuration. */
+    #define MKA_VENDOR_ID 0U
+#endif
+#ifndef MKA_MODULE_ID
+    /** Module ID; override to match the BSW configuration. */
+    #define MKA_MODULE_ID 0xFFU
+#endif
+#ifndef MKA_INSTANCE_ID
+    /** Which instance of the module a report comes from. One instance is the
+     *  norm - a single Mka module manages every PAE - so this stays 0 unless an
+     *  integration runs more than one. */
+    #define MKA_INSTANCE_ID 0U
+#endif
+/** Major version; mirrors the library's WOLFMKA_VERSION_MAJOR, so the module
+ *  and the library it wraps cannot report different versions. */
 #define MKA_SW_MAJOR_VERSION WOLFMKA_VERSION_MAJOR
+/** Minor version; mirrors WOLFMKA_VERSION_MINOR. */
 #define MKA_SW_MINOR_VERSION WOLFMKA_VERSION_MINOR
+/** Patch version; mirrors WOLFMKA_VERSION_PATCH. */
 #define MKA_SW_PATCH_VERSION WOLFMKA_VERSION_PATCH
+/** @} */
 
-/* Maximum number of PAEs (controlled ports) the module manages. */
+/* ------------------------------------------------------------------------- */
+/* Development error detection (SWS section 7)                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @def MKA_DEV_ERROR_DETECT
+ * Whether the module reports development errors to Det. STD_OFF by default, so
+ * the binding builds and links with no Det present and the reporting compiles
+ * away to nothing; set it to STD_ON in a build that has one.
+ *
+ * Detection itself does not depend on this switch. Every condition below is
+ * checked, and rejected with E_NOT_OK, in both settings - the switch only
+ * controls whether the rejection is also *reported*. So turning it off cannot
+ * change what the module does, only what a developer gets told about it.
+ */
+#ifndef MKA_DEV_ERROR_DETECT
+    #define MKA_DEV_ERROR_DETECT STD_OFF
+#endif
+
+/**
+ * @def MKA_DET_REPORT_ERROR(sid, err)
+ * How a development error reaches Det: `MKA_DET_REPORT_ERROR(sid,
+ * err)`.
+ *
+ * With MKA_DEV_ERROR_DETECT == STD_ON - the definition shown here - it
+ * is the standard `Det_ReportError(MKA_MODULE_ID, MKA_INSTANCE_ID, sid,
+ * err)`, and `Det.h` is included for it. Define this macro yourself
+ * before including Mka.h to route reports somewhere else (a project Det
+ * wrapper, a trace buffer, a test double); `Det.h` is then not included
+ * at all. With the switch STD_OFF it expands instead to a no-op that
+ * still consumes both arguments, so neither goes unused.
+ * @param sid  API service ID of the reporting function (MKA_SID_*).
+ * @param err  development error ID (MKA_E_*).
+ */
+#if (MKA_DEV_ERROR_DETECT == STD_ON)
+    #ifndef MKA_DET_REPORT_ERROR
+        #include "Det.h"
+        #define MKA_DET_REPORT_ERROR(sid, err)                                 \
+            ((void)Det_ReportError((uint16)MKA_MODULE_ID,                      \
+                (uint8)MKA_INSTANCE_ID, (uint8)(sid), (uint8)(err)))
+    #endif
+#else
+    #ifndef MKA_DET_REPORT_ERROR
+        #define MKA_DET_REPORT_ERROR(sid, err)                                 \
+            do {                                                               \
+                (void)(sid);                                                   \
+                (void)(err);                                                   \
+            } while (0)
+    #endif
+#endif
+
+/* Development error IDs. The values follow the usual AUTOSAR numbering for
+ * these conditions; each is overridable so an integration can align them with
+ * the exact SWS revision or Det configuration it is built against. 0x80 and
+ * above are vendor-specific. */
+#ifndef MKA_E_UNINIT
+    /** an API was called before Mka_Init, or after it refused a configuration
+     */
+    #define MKA_E_UNINIT 0x01U
+#endif
+#ifndef MKA_E_PARAM_POINTER
+    /** a NULL pointer was passed where a buffer or configuration was required
+     */
+    #define MKA_E_PARAM_POINTER 0x02U
+#endif
+#ifndef MKA_E_INVALID_PAE_IDX
+    /** MkaPaeIdx is outside 0 .. PaeCount-1 */
+    #define MKA_E_INVALID_PAE_IDX 0x03U
+#endif
+#ifndef MKA_E_INIT_FAILED
+    /** Mka_Init refused the configuration; the module is left uninitialised */
+    #define MKA_E_INIT_FAILED 0x04U
+#endif
+#ifndef MKA_E_PARAM_INVALID
+    /** a parameter was outside its permitted range or enumeration */
+    #define MKA_E_PARAM_INVALID 0x05U
+#endif
+#ifndef MKA_E_KAY_RUN_FAILED
+    /** vendor-specific: a Connectivity Association failed inside
+     *  Mka_MainFunction (e.g. SAK generation hit a crypto error). Reported once
+     *  on the transition into failure, not every tick it persists, and the
+     *  remaining PAEs are still stepped. */
+    #define MKA_E_KAY_RUN_FAILED 0x80U
+#endif
+
+/**
+ * @name API service IDs
+ * Which API a Det report came from, passed as Det_ReportError's ApiId. The
+ * error IDs above are shared between several APIs, so on their own they would
+ * not say where the mistake was made.
+ * @{
+ */
+/** Mka_Init() */
+#define MKA_SID_INIT                        0x01U
+/** Mka_GetVersionInfo() */
+#define MKA_SID_GET_VERSION_INFO            0x02U
+/** Mka_MainFunction() */
+#define MKA_SID_MAIN_FUNCTION               0x03U
+/** Mka_SetEnable() */
+#define MKA_SID_SET_ENABLE                  0x04U
+/** Mka_GetEnable() */
+#define MKA_SID_GET_ENABLE                  0x05U
+/** Mka_SetCknStatus() */
+#define MKA_SID_SET_CKN_STATUS              0x06U
+/** Mka_GetCknStatus() */
+#define MKA_SID_GET_CKN_STATUS              0x07U
+/** Mka_StartPae() */
+#define MKA_SID_START_PAE                   0x08U
+/** Mka_GetPaeStatus() */
+#define MKA_SID_GET_PAE_STATUS              0x09U
+/** Mka_SetPaePermissiveMode() */
+#define MKA_SID_SET_PAE_PERMISSIVE_MODE     0x0AU
+/** Mka_GetMacSecStatistics() */
+#define MKA_SID_GET_MACSEC_STATISTICS       0x0BU
+/** Mka_LinkStateChange() */
+#define MKA_SID_LINK_STATE_CHANGE           0x0CU
+/** Mka_RxIndication() */
+#define MKA_SID_RX_INDICATION               0x0DU
+/** Mka_TxConfirmation() */
+#define MKA_SID_TX_CONFIRMATION             0x0EU
+/** Mka_GetMacSecStatisticsNotification() */
+#define MKA_SID_GET_MACSEC_STATISTICS_NOTIF 0x0FU
+/** Mka_MacSecUpdateSecYNotification() */
+#define MKA_SID_MACSEC_UPDATE_SECY_NOTIF    0x10U
+/** Mka_MacSecAddTxSaNotification() */
+#define MKA_SID_MACSEC_ADD_TX_SA_NOTIF      0x11U
+/** Mka_MacSecAddRxSaNotification() */
+#define MKA_SID_MACSEC_ADD_RX_SA_NOTIF      0x12U
+/** @} */
+
 #ifndef MKA_MAX_PAES
+    /** Maximum number of PAEs (controlled ports) the module manages. Sizes the
+     *  static runtime array, so a configured PaeCount above it is clamped. */
     #define MKA_MAX_PAES 4U
 #endif
 
@@ -143,7 +296,9 @@ typedef struct {
     MkaRole Role;
     /** SAK size: 16 or 32 */
     uint8 SakLength;
-    /** MkaConfidentialityOffset (0/30/50) */
+    /** Confidentiality offset as the MkaConfidentialityOffset *encoding* -
+     *  MKA_CONF_OFFSET_0 / _30 / _50, i.e. 0, 1 or 2 - not the octet count it
+     *  names. The core rejects anything above MKA_CONF_OFFSET_50. */
     uint8 ConfidentialityOffset;
     /** 0 => default by SakLength */
     uint64_t CipherSuite;
@@ -181,7 +336,8 @@ typedef struct {
     const Mka_PaeConfigType* Paes;
     /** number of PAEs */
     uint8 PaeCount;
-    /** Mka_MainFunction tick */
+    /** Mka_MainFunction tick in milliseconds; must be non-zero - it is what
+     *  advances the KaY's clock, so a zero stops every timer */
     uint32 MainFunctionPeriodMs;
 } Mka_ConfigType;
 
@@ -193,7 +349,10 @@ typedef struct {
  * 8.3.1 Initialise the Mka module from its configuration.
  *
  * Stores the configuration, resets every PAE and creates an empty KaY per PAE.
- * A NULL @p ConfigPtr leaves the module un-initialised.
+ * The module is left un-initialised, with no diagnostic, by a NULL
+ * @p ConfigPtr, by a non-zero @c PaeCount with a NULL @c Paes, or by a zero
+ * @c MainFunctionPeriodMs (which would pin the KaY's clock and stop every timer
+ * firing). A @c PaeCount above @c MKA_MAX_PAES is clamped, not refused.
  * @param[in] ConfigPtr  The post-build configuration (must outlive the module).
  */
 void Mka_Init(const Mka_ConfigType* ConfigPtr);
@@ -232,8 +391,18 @@ Std_ReturnType Mka_GetCknStatus(uint8 MkaPaeIdx, const uint8* Ckn,
 
 /**
  * 8.3.5 Enable or disable a PAE.
+ *
+ * Disabling tears the PAE down: every participant is freed, which deletes the
+ * Secure Associations it installed in the SecY and wipes its key material. The
+ * controlled port is therefore no longer protecting traffic when this returns -
+ * disabling means the connection is not viable, not that MKA is paused. The PAE
+ * must be started again with Mka_StartPae() to run, which re-instantiates its
+ * enabled CKNs.
+ *
+ * Contrast Mka_LinkStateChange(), which deliberately leaves a CA intact: a link
+ * bounce does not change whether the far end still holds the CAK.
  * @param[in] MkaPaeIdx  Index of the PAE (0 .. PaeCount-1).
- * @param[in] Enable     TRUE to enable the PAE, FALSE to disable it.
+ * @param[in] Enable     TRUE to enable the PAE, FALSE to disable and tear down.
  * @return E_OK on success; E_NOT_OK if not initialised or bad index.
  */
 Std_ReturnType Mka_SetEnable(uint8 MkaPaeIdx, boolean Enable);
@@ -264,7 +433,8 @@ Std_ReturnType Mka_GetPaeStatus(uint8 MkaPaeIdx,
  * MKA_PERMISSIVE_MODE_NEVER keeps it blocked. Establishing MACsec clears it.
  * @param[in] MkaPaeIdx       Index of the PAE (0 .. PaeCount-1).
  * @param[in] PermissiveMode  The mode to apply.
- * @return E_OK on success; E_NOT_OK if not initialised or bad index.
+ * @return E_OK on success; E_NOT_OK if not initialised, the index is bad, or
+ *         PermissiveMode is not one of the Mka_PermissiveModeType values.
  */
 Std_ReturnType Mka_SetPaePermissiveMode(uint8 MkaPaeIdx,
     Mka_PermissiveModeType PermissiveMode);
@@ -293,8 +463,11 @@ Std_ReturnType Mka_GetMacSecStatistics(uint8 MkaPaeIdx,
 /**
  * 8.3.11 Notify the module of a transceiver link-state change.
  * @param[in] MkaPaeIdx             Index of the PAE (0 .. PaeCount-1).
- * @param[in] TransceiverLinkState  The new link state.
- * @return E_OK on success; E_NOT_OK if not initialised or bad index.
+ * @param[in] TransceiverLinkState  The new link state; must be one of the
+ *                                  EthTrcv_LinkStateType values.
+ * @return E_OK on success; E_NOT_OK if not initialised, the index is out of
+ *         range, or TransceiverLinkState is not one of the
+ *         EthTrcv_LinkStateType values.
  */
 Std_ReturnType Mka_LinkStateChange(uint8 MkaPaeIdx,
     EthTrcv_LinkStateType TransceiverLinkState);

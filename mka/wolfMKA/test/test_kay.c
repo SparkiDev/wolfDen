@@ -82,6 +82,8 @@ typedef struct {
     uint32_t next_pn;
     int set_lowest_pn_calls;
     uint64_t last_lowest_pn;
+    /* which Secure Association the bound was applied to */
+    uint8_t last_lpn_an;
     /* XPN: 64-bit transmit PN reported to the KaY */
     uint64_t xpn_val;
     /* SA deletion (rekey retirement) */
@@ -89,6 +91,11 @@ typedef struct {
     uint8_t last_del_an;
     /* async SecY: when set, install_tx_sa reports MKA_SECY_PENDING */
     int tx_sa_async;
+    /* async SecY: when set, install_rx_sa reports MKA_SECY_PENDING */
+    int rx_sa_async;
+    /* how many times get_next_pn has been called (the hook is not promised to
+     * be idempotent, so the count is part of the contract) */
+    int pn_calls;
 } Secy;
 
 static int secy_tx_sc(void* c, const uint8_t* sci)
@@ -126,7 +133,8 @@ static int secy_rx_sa(void* c, const uint8_t* sci, uint8_t an, uint32_t kn,
     memcpy(s->rx_sak, sak, len);
     s->rx_sak_len = len;
     s->rx_installed = 1;
-    return 0;
+    /* Model an asynchronous data plane: accept now, complete later. */
+    return s->rx_sa_async ? MKA_SECY_PENDING : 0;
 }
 static int secy_en_tx(void* c, uint8_t an, bool en)
 {
@@ -178,6 +186,7 @@ static int secy_get_pn_xpn(void* c, uint8_t an, uint64_t* pn)
 {
     Secy* s = (Secy*)c;
     (void)an;
+    s->pn_calls++;
     *pn = s->xpn_val;
     return 0;
 }
@@ -186,8 +195,8 @@ static int secy_set_lpn(void* c, const uint8_t* sci, uint8_t an, uint64_t lpn)
 {
     Secy* s = (Secy*)c;
     (void)sci;
-    (void)an;
     s->last_lowest_pn = lpn;
+    s->last_lpn_an = an;
     s->set_lowest_pn_calls++;
     return 0;
 }
@@ -249,6 +258,14 @@ static int secy_get_pn_const(void* c, uint8_t an, uint64_t* pn)
     (void)c;
     (void)an;
     *pn = 0x12345678U;
+    return 0;
+}
+/* Per-AN packet numbers in the 32-bit range, so a test can tell the Old key's
+ * PN read from the Latest key's in any build. */
+static int secy_get_pn_byan(void* c, uint8_t an, uint64_t* pn)
+{
+    (void)c;
+    *pn = (an == 0U) ? 0x00ABCDEFU : 0x00123456U;
     return 0;
 }
 #ifndef WOLFMKA_NO_XPN
@@ -324,6 +341,7 @@ static void test_two_party_agreement(void)
     ca.send = send_a;
     ca.send_ctx = &a2b;
     ca.cmac = g_cmac;
+    ca.rng = g_rng;
 
     /* B: lower priority (higher number). */
     memset(&cb, 0, sizeof(cb));
@@ -341,6 +359,7 @@ static void test_two_party_agreement(void)
     cb.send = send_b;
     cb.send_ctx = &b2a;
     cb.cmac = g_cmac;
+    cb.rng = g_rng;
 
     CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
     CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
@@ -414,6 +433,7 @@ static void test_non_ks_capable(void)
     ca.sak_len = 16;
     ca.secy = make_secy(&secy_a);
     ca.cmac = g_cmac;
+    ca.rng = g_rng;
 
     CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init");
     wm_Participant_Run(&A, 0, &sent);
@@ -438,6 +458,8 @@ static void cfg_part(MkaParticipantConfig* c, Secy* s, Wire* tx, MkaSendFn snd,
     c->send = snd;
     c->send_ctx = tx;
     c->cmac = g_cmac;
+    c->rng = g_rng;
+    c->rng = g_rng;
 }
 
 /* Equal priority -> Key Server decided by the numerically lower SCI (IEEE Std
@@ -633,6 +655,9 @@ static void test_replay_protection(void)
 }
 
 /* Helper: run A and B to convergence, optionally observing Tx gating. */
+static size_t craft_sak_use(uint8_t* f, size_t cap, MkaParticipant* victim,
+    const MkaParticipant* peer, int mode, uint32_t sender_mn);
+
 static void run_pair(MkaParticipant* A, MkaParticipant* B, Wire* a2b, Wire* b2a,
     int ticks, int* gated_seen)
 {
@@ -985,8 +1010,10 @@ static void test_peer_table_full(void)
     cfg_part(&ca, &s, NULL, NULL, 0x0A, 10);
     wm_Participant_Init(&A, &ca);
 
-    /* Each fresh sender shares A's CAK+CKN (so its ICV verifies) but gets a new
-     * random MI, so A allocates a new peer slot per frame. */
+    /* Each fresh sender shares A's CAK+CKN (so its ICV verifies) but is a
+     * distinct device - its own SCI and a new random MI - so A allocates a new
+     * peer slot per frame. Distinct SCIs matter: one device may only hold
+     * MKA_MAX_PEERS_PER_SCI entries. */
     for (i = 0; i < (int)MKA_MAX_PEERS + 1; i++) {
         Secy ss;
         MkaParticipant S;
@@ -994,7 +1021,7 @@ static void test_peer_table_full(void)
         uint8_t f[512];
         size_t n = sizeof f;
         memset(&ss, 0, sizeof ss);
-        cfg_part(&cs, &ss, NULL, NULL, 0x0B, 20);
+        cfg_part(&cs, &ss, NULL, NULL, (uint8_t)(0x40 + i), 20);
         wm_Participant_Init(&S, &cs);
         CHECK(wm_Participant_BuildMkpdu(&S, f, sizeof f, &n) == MKA_OK,
             "build sender frame");
@@ -1005,6 +1032,20 @@ static void test_peer_table_full(void)
     }
     CHECK(all_added, "the first MKA_MAX_PEERS peers are admitted");
     CHECK(last == MKA_ERR_FULL, "peer beyond MKA_MAX_PEERS -> FULL");
+
+    /* A full peer table must still be encodable. If MKA_MKPDU_MAX_LEN cannot
+     * hold the membership the participant stops transmitting altogether, which
+     * takes the CA down rather than degrading it (skoll M: MKA_MAX_PEERS could
+     * never be encoded within MKA_MKPDU_MAX_LEN). */
+    {
+        uint8_t frame[MKA_MKPDU_MAX_LEN];
+        size_t flen = sizeof frame;
+        CHECK(wm_Participant_PeerCount(&A) == (size_t)MKA_MAX_PEERS,
+            "the peer table is full");
+        CHECK(wm_Participant_BuildMkpdu(&A, frame, sizeof frame, &flen) ==
+                  MKA_OK,
+            "a full membership still encodes");
+    }
 }
 
 /* Make a crafted single-frame peer the victim's elected Key Server: advertise
@@ -1306,9 +1347,60 @@ static void test_kay_dist_sak_bad_offset(void)
     CHECK_EQ_MEM(A.latest.sak, saved_sak, 16, "in-force SAK unchanged");
 }
 
-#ifndef WOLFMKA_NO_XPN
 /* Build a crafted live-peer frame from SCI `sci` that echoes the victim's MI
  * (so it is seen as live) and carries no parameter sets; returns its length. */
+/* As craft_live_member, but the Basic Parameter Set carries an explicit Message
+ * Number so the same Member Identifier can send more than once. */
+static size_t craft_live_member_mn(uint8_t* f, size_t cap, MkaParticipant* v,
+    const uint8_t* sci, uint8_t mi_fill, uint32_t mn)
+{
+    MkaPdu in;
+    size_t n = cap;
+
+    memset(&in, 0, sizeof in);
+    in.basic.version = 1;
+    in.basic.priority = 20;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, v->cfg.cak.ckn, v->cfg.cak.ckn_len);
+    in.basic.ckn_len = v->cfg.cak.ckn_len;
+    memcpy(in.basic.sci, sci, 8);
+    memset(in.basic.mi, mi_fill, MKA_MI_LEN);
+    in.basic.mn = mn;
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memcpy(in.live_peers.peers[0].mi, v->actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[0].mn = echo_mn(v);
+    CHECK(wm_Pdu_Encode(g_cmac, &in, v->keys.ick, v->keys.ick_len, f, cap,
+              &n) == MKA_OK,
+        "encode live-member frame");
+    return n;
+}
+
+/* A member that authenticates but never echoes our Member Identifier, so it
+ * stays Potential and never proves liveness. */
+static size_t craft_potential_member(uint8_t* f, size_t cap, MkaParticipant* v,
+    const uint8_t* sci, uint8_t mi_fill)
+{
+    MkaPdu in;
+    size_t n = cap;
+
+    memset(&in, 0, sizeof in);
+    in.basic.version = 1;
+    in.basic.priority = 20;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, v->cfg.cak.ckn, v->cfg.cak.ckn_len);
+    in.basic.ckn_len = v->cfg.cak.ckn_len;
+    memcpy(in.basic.sci, sci, 8);
+    memset(in.basic.mi, mi_fill, MKA_MI_LEN);
+    in.basic.mn = 1;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, v->keys.ick, v->keys.ick_len, f, cap,
+              &n) == MKA_OK,
+        "encode potential-member frame");
+    return n;
+}
+
 static size_t craft_live_member(uint8_t* f, size_t cap, MkaParticipant* v,
     const uint8_t* sci, uint8_t mi_fill)
 {
@@ -1333,6 +1425,180 @@ static size_t craft_live_member(uint8_t* f, size_t cap, MkaParticipant* v,
               &n) == MKA_OK,
         "encode live-member frame");
     return n;
+}
+
+#ifndef WOLFMKA_NO_XPN
+
+/* An SSCI is the rank of an SCI within the live membership, so it has to be
+ * recomputed whenever that set changes - in both directions. The join direction
+ * was always handled; the departure direction was not, and on a Key Server that
+ * went unnoticed because a departure forces a rekey which reapplies the suite
+ * to every channel. A member never rekeys, so its ranks went stale and it kept
+ * transmitting XPN frames with a rank nobody else computed. Note the peer here
+ * leaves by *expiry*: the not-live transition needs an MKPDU from the peer to
+ * run at all, so a peer that simply goes quiet never reaches it. */
+/* The SecY packet-number hook is read once per key per MKPDU, whatever the
+ * cipher suite. mka_build_sak_use used to read the Latest (and Old) PN for the
+ * SAK Use set, then mka_build_xpn read the same ANs again for the upper halves
+ * - four calls per MKPDU during a handover. mka_secy.h promises the hook no
+ * idempotence: this suite's own shim counts calls, and a real backend may read
+ * a clear-on-read register or pay a management-bus round trip each time. */
+/* The Association Number is a 2-bit field, so it cycles 0-1-2-3-0 across
+ * successive rekeys. The wrap itself is worth pinning: it is where a new key
+ * could land on an Association Number whose Secure Associations are still
+ * installed, and the arithmetic is a mask rather than a comparison, so an
+ * off-by-one would show only on the fourth rekey. */
+static void test_an_wraps_across_four_rekeys(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t seen[4];
+    int i;
+
+    printf("Association Number wraps 0-1-2-3-0:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is the Key Server");
+    CHECK(A.latest.an == 0U, "the first key takes AN 0");
+
+    /* Four more rekeys, letting each handover finish so the Old key retires and
+     * the next rekey is allowed. The clock has to keep moving forward across
+     * all of them - run_pair restarts at tick 0, so calling it repeatedly would
+     * rewind time and expire the peer. */
+    {
+        int tick = 12;
+        for (i = 0; i < 4; i++) {
+            int settle;
+            seen[i] = A.latest.an;
+            CHECK(wm_Participant_Rekey(&A) == MKA_OK, "rekey");
+            for (settle = 0; settle < 8; settle++) {
+                uint8_t f[512];
+                size_t n;
+                uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+                tick++;
+                wm_Participant_Run(&A, t, NULL);
+                wm_Participant_Run(&B, t, NULL);
+                while (wire_pop(&a2b, f, &n))
+                    wm_Participant_Receive(&B, f, n, t);
+                while (wire_pop(&b2a, f, &n))
+                    wm_Participant_Receive(&A, f, n, t);
+            }
+            CHECK(A.latest.an != seen[i], "the new key takes a different AN");
+            CHECK(!A.old.valid || (A.old.an != A.latest.an),
+                "and never the Old key's");
+        }
+    }
+    CHECK((seen[0] == 0U) && (seen[1] == 1U) && (seen[2] == 2U) &&
+              (seen[3] == 3U),
+        "the four Association Numbers are used in order");
+    CHECK(A.latest.an == 0U, "and the fifth key wraps back to AN 0");
+}
+
+static void test_pn_hook_read_once_per_key(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig c;
+    uint8_t f[512];
+    size_t n;
+    int before;
+
+    printf("the PN hook is read once per key per MKPDU:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&c, &s, &tx, send_a, 0x0A, 10);
+    c.cipher_suite = MKA_CIPHER_GCM_AES_XPN_128;
+    c.secy.get_next_pn = secy_get_pn_xpn;
+    s.xpn_val = 0x0000000700000009ull;
+    CHECK(wm_Participant_Init(&A, &c) == MKA_OK, "init A (XPN)");
+    A.is_key_server = 1;
+    A.elected = 1;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "a first SAK");
+
+    /* One key in force: one read. */
+    s.pn_calls = 0;
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&A, f, sizeof f, &n) == MKA_OK, "build");
+    CHECK(s.pn_calls == 1, "one key, one read");
+
+    /* Mid-handover, two keys: two reads, not four. */
+    A.old = A.latest;
+    A.old.valid = true;
+    A.old.an = (uint8_t)(A.latest.an ^ 1U);
+    s.pn_calls = 0;
+    before = s.pn_calls;
+    (void)before;
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&A, f, sizeof f, &n) == MKA_OK, "build");
+    CHECK(s.pn_calls == 2, "two keys, two reads - not one per consumer");
+}
+
+static void test_xpn_ssci_stale_after_departure(void)
+{
+    Wire a2m, m2a;
+    Secy sa, sm;
+    MkaParticipant A, M;
+    MkaParticipantConfig ca, cm;
+    uint8_t r_sci[8] = {0, 0, 0, 0, 0, 0x0A, 0, 1};
+    uint8_t f[512];
+    size_t n;
+    int tick;
+    uint32_t joined_ssci;
+
+    printf("XPN SSCI after a member departs (no rekey on this end):\n");
+    memset(&a2m, 0, sizeof a2m);
+    memset(&m2a, 0, sizeof m2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sm, 0, sizeof sm);
+    cfg_part(&ca, &sa, &a2m, send_a, 0x05, 10); /* A: Key Server, SCI 0x05 */
+    cfg_part(&cm, &sm, &m2a, send_b, 0x0B, 20); /* M: member,     SCI 0x0B */
+    ca.cipher_suite = MKA_CIPHER_GCM_AES_XPN_128;
+    cm.cipher_suite = MKA_CIPHER_GCM_AES_XPN_128;
+    ca.secy.get_next_pn = secy_get_pn_xpn;
+    cm.secy.get_next_pn = secy_get_pn_xpn;
+    sa.xpn_val = 1;
+    sm.xpn_val = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&M, &cm) == MKA_OK, "init M");
+    memcpy(sm.my_sci, cm.sci, 8);
+
+    run_pair(&A, &M, &a2m, &m2a, 12, NULL);
+    CHECK(wm_Participant_HasSak(&M), "M installed the XPN SAK");
+    CHECK(!wm_Participant_IsKeyServer(&M), "M is a member, so it never rekeys");
+    CHECK(sm.tx_ssci == 2U, "M ranks 2 of {0x05, 0x0B}");
+
+    /* A third member R (SCI 0x0A, between the two) joins M's view. The join
+     * direction is handled: M's rank becomes 3. */
+    n = craft_live_member(f, sizeof f, &M, r_sci, 0xAA);
+    CHECK(wm_Participant_Receive(&M, f, n, 12U * MKA_HELLO_TIME_MS) == MKA_OK,
+        "R becomes live on M");
+    joined_ssci = sm.tx_ssci;
+    CHECK(joined_ssci == 3U, "M ranks 3 of {0x05, 0x0A, 0x0B}");
+
+    /* R now goes silent while A keeps M company. Once R's Life Time expires,
+     * M's live set is {0x05, 0x0B} again and its rank must return to 2. */
+    for (tick = 13; tick < 30; tick++) {
+        uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&M, t, NULL);
+        while (wire_pop(&a2m, f, &n))
+            wm_Participant_Receive(&M, f, n, t);
+        while (wire_pop(&m2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(wm_Participant_LivePeerCount(&M) == 1U, "R has expired on M");
+    CHECK(sm.tx_ssci == 2U,
+        "M's SSCI returns to its rank in the reduced membership");
 }
 
 /* XPN SSCI consistency on a staggered join: an SSCI is the rank of a member's
@@ -1592,6 +1858,44 @@ static void test_kay_introspection(void)
         CHECK(wm_Participant_Init(&X, &cx) == MKA_ERR_BAD_ARG,
             "invalid confidentiality offset rejected");
     }
+
+    /* So is an out-of-range MACsec Capability. The field is two bits on the
+     * wire, so anything larger would be advertised as its low two bits while
+     * the local comparison kept the raw value - here 4 would go out as
+     * MKA_CAP_NOT_IMPLEMENTED. */
+    {
+        MkaParticipant X;
+        MkaParticipantConfig cx;
+        Secy sx;
+        memset(&sx, 0, sizeof sx);
+        cfg_part(&cx, &sx, NULL, NULL, 0x0C, 30);
+        cx.macsec_capability = 4U; /* > MKA_CAP_INTEGRITY_CONF_OFFSET */
+        CHECK(wm_Participant_Init(&X, &cx) == MKA_ERR_BAD_ARG,
+            "invalid MACsec Capability rejected");
+        cx.macsec_capability = (uint8_t)MKA_CAP_INTEGRITY_CONF_OFFSET;
+        CHECK(wm_Participant_Init(&X, &cx) == MKA_OK,
+            "and the largest valid one is accepted");
+        wm_Participant_Free(&X);
+    }
+
+    /* Both crypto workspaces are caller-allocated and mandatory. wolfSSL's
+     * ~1 KB Cmac context and its WC_RNG never live on wolfMKA's stack or heap,
+     * so a missing one cannot be substituted - it is refused at init rather
+     * than at the first ICV or the first rekey. */
+    {
+        MkaParticipant X;
+        MkaParticipantConfig cx;
+        Secy sx;
+        memset(&sx, 0, sizeof sx);
+        cfg_part(&cx, &sx, NULL, NULL, 0x0C, 30);
+        cx.cmac = NULL;
+        CHECK(wm_Participant_Init(&X, &cx) == MKA_ERR_BAD_ARG,
+            "a missing CMAC workspace is rejected at init");
+        cfg_part(&cx, &sx, NULL, NULL, 0x0C, 30);
+        cx.rng = NULL;
+        CHECK(wm_Participant_Init(&X, &cx) == MKA_ERR_BAD_ARG,
+            "and so is a missing RNG workspace");
+    }
 }
 
 /* Recorder for the MkaEventOps callbacks. */
@@ -1601,6 +1905,8 @@ typedef struct {
     int lost;
     int lost_livecount; /* losses where was_live was set */
     int ks;
+    int ks_lost;
+    uint8_t last_ks_lost_sci[MKA_SCI_LEN];
     int sak;
     int up;
     int fail;
@@ -1639,6 +1945,12 @@ static void ev_ks(void* c, const uint8_t* sci, bool is_self)
     e->last_ks_self = is_self;
     memcpy(e->last_ks_sci, sci, MKA_SCI_LEN);
 }
+static void ev_ks_lost(void* c, const uint8_t* sci)
+{
+    EvRec* e = (EvRec*)c;
+    e->ks_lost++;
+    memcpy(e->last_ks_lost_sci, sci, MKA_SCI_LEN);
+}
 static void ev_sak(void* c, uint32_t kn, uint8_t an, uint64_t cs)
 {
     EvRec* e = (EvRec*)c;
@@ -1665,6 +1977,7 @@ static void set_events(MkaParticipantConfig* c, EvRec* e)
     c->events.peer_live = ev_live;
     c->events.peer_lost = ev_lost;
     c->events.key_server_elected = ev_ks;
+    c->events.key_server_lost = ev_ks_lost;
     c->events.sak_installed = ev_sak;
     c->events.macsec_up = ev_up;
     c->events.auth_fail = ev_fail;
@@ -1743,10 +2056,140 @@ static void test_kay_events(void)
     }
     ea.lost = 0;
     ea.lost_livecount = 0;
+    CHECK(ea.ks > 0, "A: a Key Server was elected earlier");
+    CHECK(ea.ks_lost == 0, "A: and not yet reported lost");
     /* Run A far in the future with no inbound frames: B and S both expire. */
     (void)wm_Participant_Run(&A, MKA_LIFE_TIME_MS * 100U, NULL);
     CHECK(ea.lost == 2, "A: peer_lost for both peers");
     CHECK(ea.lost_livecount == 1, "A: exactly one lost peer was live");
+    /* A is key_server_capable, so it is always a candidate in its own
+     * election - losing every peer does not cost it the role, and nothing is
+     * reported. The participant that can lose one is covered below. */
+    CHECK(A.elected && ea.ks_lost == 0,
+        "A: a capable participant keeps electing itself");
+}
+
+/* The other edge of the election. A participant that cannot serve as Key Server
+ * has no candidate of its own, so when the peer it was following goes away the
+ * association has no Key Server at all. That transition used to fire nothing:
+ * mka_election_changed is guarded on p->elected, so it only ever reported an
+ * election being made. An integrator gating a controlled port or a status
+ * indicator on key_server_elected saw it made and never saw it lost, and
+ * p->ks_sci keeps its stale value across the gap. */
+static void test_key_server_lost_event(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    EvRec ea;
+
+    printf("losing the elected Key Server is reported:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    memset(&ea, 0, sizeof ea);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    ca.key_server_capable = 0; /* A cannot serve, so B must */
+    set_events(&ca, &ea);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(A.elected && !wm_Participant_IsKeyServer(&A), "A follows B");
+    CHECK(ea.ks == 1, "A: the election was reported once");
+    CHECK_EQ_MEM(ea.last_ks_sci, B.cfg.sci, MKA_SCI_LEN, "A: naming B");
+    CHECK(ea.ks_lost == 0, "A: and nothing lost yet");
+
+    /* B goes away. Run A with no inbound frames until B's Life Time expires. */
+    (void)wm_Participant_Run(&A, MKA_LIFE_TIME_MS * 100U, NULL);
+    CHECK(!A.elected, "A: no Key Server is elected any more");
+    CHECK(ea.ks_lost == 1, "A: key_server_lost fired");
+    CHECK_EQ_MEM(ea.last_ks_lost_sci, B.cfg.sci, MKA_SCI_LEN,
+        "A: reported against the Key Server that was in force, not a stale "
+        "self-SCI");
+    CHECK(ea.ks == 1, "A: and key_server_elected did not fire again");
+
+    /* Only on the transition - staying without one is not news. */
+    (void)wm_Participant_Run(&A, (MKA_LIFE_TIME_MS * 100U) + 1U, NULL);
+    CHECK(ea.ks_lost == 1, "A: not repeated on the next run");
+
+    /* The hooks are optional, so the same transition on a participant that
+     * installed none must simply do nothing. */
+    {
+        Wire c2b, b2c;
+        Secy sc, sb2;
+        MkaParticipant C, B2;
+        MkaParticipantConfig cc, cb2;
+
+        memset(&c2b, 0, sizeof c2b);
+        memset(&b2c, 0, sizeof b2c);
+        memset(&sc, 0, sizeof sc);
+        memset(&sb2, 0, sizeof sb2);
+        cfg_part(&cc, &sc, &c2b, send_a, 0x0C, 10);
+        cfg_part(&cb2, &sb2, &b2c, send_b, 0x0D, 20);
+        cc.key_server_capable = 0; /* no set_events: every hook is NULL */
+        CHECK(wm_Participant_Init(&C, &cc) == MKA_OK, "init C");
+        CHECK(wm_Participant_Init(&B2, &cb2) == MKA_OK, "init B2");
+        run_pair(&C, &B2, &c2b, &b2c, 12, NULL);
+        CHECK(C.elected, "C follows B2");
+        (void)wm_Participant_Run(&C, MKA_LIFE_TIME_MS * 100U, NULL);
+        CHECK(!C.elected, "and loses it without a hook to report it to");
+    }
+}
+
+/* Which peer wm_Participant_GetPaeStatus reports is a single rule, applied the
+ * same way twice: the first live peer, or - with none live - the first peer
+ * heard from at all. The two loops used to disagree, the live one taking the
+ * last match and the fallback the first, so in a multi-peer CA the reported SCI
+ * depended on peer-table slot order in a way that could change when an
+ * unrelated peer was dropped and its slot reused. */
+static void test_status_peer_sci_is_first_match(void)
+{
+    static const uint8_t sci_p[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0xA1, 0, 1};
+    static const uint8_t sci_q[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0xA2, 0, 1};
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    MkaPaeStatus st;
+    uint8_t f[512];
+    size_t n;
+
+    printf("the reported peer SCI is the first match, both ways:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    wm_Participant_Run(&A, 0U, NULL);
+
+    /* Two peers that never prove liveness: the fallback loop applies. */
+    n = craft_potential_member(f, sizeof f, &A, sci_p, 0xF1);
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "first peer seen");
+    n = craft_potential_member(f, sizeof f, &A, sci_q, 0xF2);
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "second peer seen");
+    CHECK(wm_Participant_PeerCount(&A) == 2U, "two entries");
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK_EQ_MEM(st.peer_sci, sci_p, MKA_SCI_LEN,
+        "with none live, the first peer heard from is reported");
+
+    /* Now make the second one live. A live peer outranks a merely-seen one, so
+     * it wins even though it sits in the later slot. */
+    n = craft_live_member_mn(f, sizeof f, &A, sci_q, 0xF2, 2U);
+    CHECK(wm_Participant_Receive(&A, f, n, 200U) == MKA_OK, "second goes live");
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U, "exactly one live peer");
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK_EQ_MEM(st.peer_sci, sci_q, MKA_SCI_LEN, "a live peer outranks");
+
+    /* And with the first one live too, the earlier slot wins again - the same
+     * first-match rule, not the last. */
+    n = craft_live_member_mn(f, sizeof f, &A, sci_p, 0xF1, 2U);
+    CHECK(wm_Participant_Receive(&A, f, n, 200U) == MKA_OK, "first goes live");
+    CHECK(wm_Participant_LivePeerCount(&A) == 2U, "both live");
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK_EQ_MEM(st.peer_sci, sci_p, MKA_SCI_LEN,
+        "the first live peer is reported, not the last");
 }
 
 /* The Key Server election event also fires when the elected *remote* Key Server
@@ -2134,6 +2577,7 @@ static void cfg_ca(MkaParticipantConfig* c, Secy* s, Wire* tx, MkaSendFn snd,
     c->send = snd;
     c->send_ctx = tx;
     c->cmac = g_cmac;
+    c->rng = g_rng;
 }
 
 /* Two Connectivity Associations sharing one port: each MKPDU is routed to the
@@ -2250,6 +2694,12 @@ static void test_kay_manager(void)
         CHECK((survivor != NULL) && wm_Participant_HasSak(survivor),
             "ckn-two kept its SAK across compaction");
     }
+    /* Tear both managers down: the multi-CA teardown path, not just the
+     * single-participant one test_free covers. */
+    wm_Kay_Free(&A);
+    wm_Kay_Free(&B);
+    CHECK(wm_Kay_ParticipantCount(&A) == 0, "A emptied");
+    CHECK(wm_Kay_ParticipantCount(&B) == 0, "B emptied");
 }
 
 /* A peer that does not desire MACsec is skipped by the Key Server election (and
@@ -2800,6 +3250,39 @@ static void test_pn32_exhaustion_rekey(void)
         }
     }
     CHECK(A.latest.kn > kn_before, "32-bit PN exhaustion triggered auto-rekey");
+
+    /* ...and it must still fire while a handover is stuck. Nothing bounds how
+     * long the Old key stays valid: mka_retire_old needs every live peer to
+     * report transmitting on the Latest key, so one that never does - a member
+     * configured macsec_desired = false, an async SecY whose completion never
+     * arrives, a third-party peer that reports Latest Rx but not Latest Tx -
+     * pins it forever. If PN exhaustion waited for that, exhaustion protection
+     * would switch off silently and permanently while this end kept
+     * transmitting toward GCM nonce reuse (skoll HIGH: auto-rekey disabled
+     * whenever the Old key cannot be retired). One tick only, so the peer's
+     * Life timer cannot expire and rekey it for a different reason. */
+    A.old = A.latest;
+    A.old.valid = true;
+    A.old.tx = true;
+    A.old.an = (uint8_t)(A.latest.an ^ 1U);
+    /* Not reporting Latest Tx, and never having reported a key at all - a peer
+     * that *stops* latches sak_lost, which forces a rekey by itself and would
+     * mask whether PN exhaustion did anything. */
+    A.peers[0].sak_tx = 0;
+    A.peers[0].latest_kn = 0U;
+    A.peers[0].sak_use_seen = 0;
+    A.sak_lost = 0;
+
+    kn_before = A.latest.kn;
+    sa.next_pn = 0xC0000000u;
+    /* The very next tick after the loop above: any later and the peer's Life
+     * timer expires, and a departed peer forces a rekey on its own. */
+    wm_Participant_Run(&A, (uint32_t)tick * MKA_HELLO_TIME_MS, NULL);
+    CHECK(A.old.valid,
+        "the handover is still outstanding: the Old key cannot retire");
+    CHECK(!A.sak_lost, "and no lost-SAK rekey was triggered instead");
+    CHECK(A.latest.kn > kn_before,
+        "PN exhaustion rekeys even with a handover outstanding");
 }
 #endif /* WOLFMKA_NO_AUTO_REKEY */
 
@@ -3651,6 +4134,310 @@ static void test_cipher_negotiation(void)
     }
 }
 
+/* Announcements are optional in any given MKPDU, so a constraint a peer has
+ * already stated must outlive the next MKPDU that omits it - otherwise the
+ * negotiated suite depends on which frame happened to arrive last before the
+ * rekey, and a peer that announced 128-only can be handed a 256-bit SAK (skoll
+ * L: cipher-suite negotiation is not sticky). */
+static void test_cipher_announcement_is_sticky(void)
+{
+    static const uint64_t a_prefs[2] = {MKA_CIPHER_GCM_AES_256,
+        MKA_CIPHER_GCM_AES_128};
+    static const uint64_t b_128[1] = {MKA_CIPHER_GCM_AES_128};
+    Wire a2b, b2a;
+    Secy secy_a, secy_b;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    int tick;
+    uint32_t t;
+
+    printf("an announced cipher-suite constraint outlives a silent MKPDU:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&secy_a, 0, sizeof secy_a);
+    memset(&secy_b, 0, sizeof secy_b);
+    cfg_part(&ca, &secy_a, &a2b, send_a, 0x0A, 10);
+    ca.cipher_suite = 0;
+    ca.cipher_prefs = a_prefs;
+    ca.cipher_pref_count = 2;
+    ca.announce_cipher_suites = 1;
+    cfg_part(&cb, &secy_b, &b2a, send_b, 0x0B, 20);
+    cb.cipher_suite = 0;
+    cb.cipher_prefs = b_128;
+    cb.cipher_pref_count = 1;
+    cb.announce_cipher_suites = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    for (tick = 0; tick < 12; tick++) {
+        t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, t);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(wm_Participant_IsKeyServer(&A) == 1, "A is key server");
+    CHECK(A.sak_cipher_suite == MKA_CIPHER_GCM_AES_128,
+        "B's announcement held A down to 128");
+    CHECK(A.peers[0].adv_count == 1U, "A recorded one announced suite");
+
+    /* B now goes quiet about its suites and A rekeys. */
+    B.cfg.announce_cipher_suites = 0;
+    t = 12U * MKA_HELLO_TIME_MS;
+    wm_Participant_Run(&B, t, NULL);
+    while (wire_pop(&b2a, f, &n))
+        wm_Participant_Receive(&A, f, n, t);
+    CHECK(A.peers[0].adv_count == 1U, "the constraint survived a silent MKPDU");
+
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "A rekeys");
+    CHECK(A.sak_cipher_suite == MKA_CIPHER_GCM_AES_128,
+        "and still honours 128");
+    CHECK(A.latest.sak_len == 16U, "a 128-bit SAK");
+}
+
+/* An Announcement whose cipher-suites TLV is too short to hold a single entry
+ * carries no constraint, so it must not be treated as one. Marking it present
+ * would clear the peer's recorded suites and read as "accepts anything" - a
+ * CAK holder could erase a stated 128-only constraint with one malformed frame
+ * and be handed a 256-bit SAK (skoll M: empty Cipher Suites TLV decodes as
+ * present with count 0). */
+static void test_empty_announce_keeps_constraint(void)
+{
+    static const uint64_t a_prefs[2] = {MKA_CIPHER_GCM_AES_256,
+        MKA_CIPHER_GCM_AES_128};
+    static const uint64_t b_128[1] = {MKA_CIPHER_GCM_AES_128};
+    Wire a2b, b2a;
+    Secy secy_a, secy_b;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    MkaPdu in;
+    uint8_t f[512];
+    size_t n;
+    int tick;
+    uint32_t t;
+
+    printf("an empty cipher-suites TLV carries no constraint:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&secy_a, 0, sizeof secy_a);
+    memset(&secy_b, 0, sizeof secy_b);
+    cfg_part(&ca, &secy_a, &a2b, send_a, 0x0A, 10);
+    ca.cipher_suite = 0;
+    ca.cipher_prefs = a_prefs;
+    ca.cipher_pref_count = 2;
+    ca.announce_cipher_suites = 1;
+    cfg_part(&cb, &secy_b, &b2a, send_b, 0x0B, 20);
+    cb.cipher_suite = 0;
+    cb.cipher_prefs = b_128;
+    cb.cipher_pref_count = 1;
+    cb.announce_cipher_suites = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    for (tick = 0; tick < 12; tick++) {
+        t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, t);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(A.sak_cipher_suite == MKA_CIPHER_GCM_AES_128,
+        "B's announcement held A down to 128");
+    CHECK(A.peers[0].adv_count == 1U, "A recorded the constraint");
+
+    /* An Announcement set whose cipher-suites TLV declares zero entries. */
+    memset(&in, 0, sizeof in);
+    in.basic.priority = cb.priority;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, ca.cak.ckn, ca.cak.ckn_len);
+    in.basic.ckn_len = ca.cak.ckn_len;
+    memcpy(in.basic.sci, cb.sci, MKA_SCI_LEN);
+    memcpy(in.basic.mi, B.actor_mi, MKA_MI_LEN);
+    in.basic.mn = B.actor_mn + 1U;
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memcpy(in.live_peers.peers[0].mi, A.actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[0].mn = echo_mn(&A);
+    in.announce.present = 1;
+    in.announce.count = 1U;
+    in.announce.suites[0].cipher_suite = MKA_CIPHER_GCM_AES_256;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode an announcement with one suite");
+    /* The encoder will not emit an empty TLV, so shorten the one it did emit to
+     * a length that cannot hold an entry. Its header is
+     * (MKA_ANN_TLV_CIPHER_SUITES << 9) | 10 == 0xE00A, which is distinctive
+     * enough to find; rewrite the length to 4 and blank the orphaned entry so
+     * the rest of the body walks as empty TLVs. */
+    {
+        size_t i;
+        int patched = 0;
+        for (i = 0U; (i + 12U) <= n; i++) {
+            if ((f[i] == 0xE0U) && (f[i + 1U] == 0x0AU)) {
+                f[i + 1U] = 0x04U;
+                memset(&f[i + 2U], 0, 10U);
+                patched = 1;
+                break;
+            }
+        }
+        CHECK(patched == 1, "found the cipher-suites TLV to shorten");
+    }
+    test_seal_icv(g_cmac, A.keys.ick, A.keys.ick_len, f,
+        n - MKA_DEFAULT_ICV_LEN);
+    t = (uint32_t)12 * MKA_HELLO_TIME_MS;
+    CHECK(wm_Participant_Receive(&A, f, n, t) == MKA_OK, "A accepts the frame");
+    CHECK(A.peers[0].adv_count == 1U,
+        "and keeps the constraint rather than clearing it");
+
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "A rekeys");
+    CHECK(A.sak_cipher_suite == MKA_CIPHER_GCM_AES_128,
+        "still honouring 128, not upgraded to 256");
+}
+
+/* Under WOLFMKA_CIPHER_NEGOTIATION the confidentiality offset and the
+ * integrity-only decision are settled when a SAK is installed, from the live
+ * membership at that moment - and both travel inside the Distributed SAK
+ * parameter set, so they belong to the key. No message changes them for a key
+ * already issued. A member joining with a capability *below* what the CA
+ * negotiated for therefore has to force a rekey; without one the Key Server
+ * would keep protecting with the offset it chose before while the joiner
+ * programmed its own data plane from its own capability. A join that reduces
+ * nothing still does not rekey - see test_kay_join_no_rekey. */
+static void test_late_join_capability_mismatch(void)
+{
+    Wire a2b, b2a, c2a;
+    Secy sa, sb, sc;
+    MkaParticipant A, B, C;
+    MkaParticipantConfig ca, cb, cc;
+    uint8_t f[512];
+    size_t n;
+    int tick;
+
+    printf("a less-capable member joining mid-life:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&c2a, 0, sizeof c2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    memset(&sc, 0, sizeof sc);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10); /* A: Key Server */
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    cfg_part(&cc, &sc, &c2a, send_c, 0x0C, 30);
+    ca.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cb.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    ca.confidentiality_offset = MKA_CONF_OFFSET_50;
+    cb.confidentiality_offset = MKA_CONF_OFFSET_50;
+    /* C can do integrity only - no confidentiality at all. */
+    cc.macsec_capability = MKA_CAP_INTEGRITY_ONLY;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    CHECK(wm_Participant_Init(&C, &cc) == MKA_OK, "init C");
+
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(A.latest.valid, "A and B converged");
+    CHECK(!A.sak_integrity_only, "on a confidentiality cipher suite");
+
+    /* C joins mid-life, with B still live throughout - a departure would make
+     * the Key Server rekey, which re-runs the negotiation and would mask the
+     * very thing under test. A's frames go to both members. */
+    for (tick = 12; tick < 30; tick++) {
+        uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        wm_Participant_Run(&C, t, NULL);
+        while (wire_pop(&a2b, f, &n)) {
+            wm_Participant_Receive(&B, f, n, t);
+            wm_Participant_Receive(&C, f, n, t);
+        }
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+        while (wire_pop(&c2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(wm_Participant_LivePeerCount(&A) == 2U,
+        "both members are live at once");
+    CHECK(C.latest.valid, "C installed the SAK");
+    CHECK(A.sak_integrity_only == C.sak_integrity_only,
+        "both ends agree whether the CA is integrity-only");
+    CHECK(sa.conf_offset == sc.conf_offset,
+        "and program the same confidentiality offset");
+    CHECK(A.sak_integrity_only,
+        "the CA dropped to integrity-only for the less-capable member");
+    CHECK(A.latest.kn > 1U,
+        "which took a fresh SAK, since the offset is in it");
+}
+
+/* The same rule reached the other way: a joiner that can do confidentiality but
+ * not a *selectable* offset (MKA_CAP_INTEGRITY_CONF) leaves the CA on
+ * confidentiality - so the integrity-only decision does not move - while
+ * forcing the offset down from 50 to 0. That still belongs to the key, so it
+ * still has to rekey. */
+static void test_late_join_offset_only_reduction(void)
+{
+    Wire a2b, b2a, c2a;
+    Secy sa, sb, sc;
+    MkaParticipant A, B, C;
+    MkaParticipantConfig ca, cb, cc;
+    uint8_t f[512];
+    size_t n;
+    int tick;
+    uint32_t kn_before;
+
+    printf("a joiner that reduces only the confidentiality offset:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&c2a, 0, sizeof c2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    memset(&sc, 0, sizeof sc);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    cfg_part(&cc, &sc, &c2a, send_c, 0x0C, 30);
+    ca.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cb.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    ca.confidentiality_offset = MKA_CONF_OFFSET_50;
+    cb.confidentiality_offset = MKA_CONF_OFFSET_50;
+    cc.macsec_capability = MKA_CAP_INTEGRITY_CONF; /* no selectable offset */
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    CHECK(wm_Participant_Init(&C, &cc) == MKA_OK, "init C");
+
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(A.sak_conf_offset == (uint8_t)MKA_CONF_OFFSET_50,
+        "A and B settled on offset 50");
+    kn_before = A.latest.kn;
+
+    for (tick = 12; tick < 30; tick++) {
+        uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        wm_Participant_Run(&C, t, NULL);
+        while (wire_pop(&a2b, f, &n)) {
+            wm_Participant_Receive(&B, f, n, t);
+            wm_Participant_Receive(&C, f, n, t);
+        }
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+        while (wire_pop(&c2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(wm_Participant_LivePeerCount(&A) == 2U, "both members are live");
+    CHECK(!A.sak_integrity_only,
+        "the CA still does confidentiality - only the offset moved");
+    CHECK(A.sak_conf_offset == (uint8_t)MKA_CONF_OFFSET_0,
+        "reduced to the only offset the joiner supports");
+    CHECK(A.latest.kn > kn_before, "which took a rekey to carry");
+    CHECK(sa.conf_offset == sc.conf_offset, "and both ends programmed it");
+}
+
 /* The Key Server reduces the confidentiality offset (and drops to
  * integrity-only) to the lowest MACsec Capability in the CA. */
 static void test_capability_negotiation(void)
@@ -4076,6 +4863,222 @@ static void test_automotive_fast_startup(void)
  * must survive until the new MI proves liveness (so a forged MI cannot evict a
  * working peer) and must be retired the moment it does — not left to age out at
  * the Life Time (OPEN Alliance AutoMKA-03006). */
+/* IEEE Std 802.1X-2010 identifies a SAK by its Key Identifier, KI = (Key Server
+ * MI || Key Number) - not by the Key Number alone. Key Numbers restart at 1 for
+ * a freshly-initialised Key Server, so if the member compares KN only, a Key
+ * Server restart re-issues KN 1 carrying *different* key bytes and the member
+ * skips the install, keeping a key nobody else holds. Both ends then report
+ * MACsec running over a silent black-hole (skoll HIGH: SAK de-duplicated by Key
+ * Number alone). */
+static void test_key_server_restart_reuses_kn(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    uint32_t t;
+    uint8_t first_sak[MKA_MAX_CAK_LEN];
+    uint32_t first_kn;
+
+    printf("Key Server restart re-using a Key Number:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    /* A is priority 10, so A is the Key Server; B (20) can never self-promote.
+     */
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is the Key Server");
+    CHECK(A.latest.valid && B.latest.valid, "both ends hold a key");
+    CHECK_EQ_MEM(A.latest.sak, B.latest.sak, A.latest.sak_len,
+        "and it is the same key");
+    first_kn = A.latest.kn;
+    memcpy(first_sak, A.latest.sak, MKA_MAX_CAK_LEN);
+
+    /* The Key Server restarts: same CAK, same SCI, fresh MI, no stored key. Its
+     * next SAK therefore carries Key Number 1 again - with new key bytes. */
+    memset(&sa, 0, sizeof sa);
+    memset(&a2b, 0, sizeof a2b);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "re-init A after restart");
+    for (t = 12U; t < 60U; t++) {
+        uint32_t now = t * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, now, NULL);
+        wm_Participant_Run(&B, now, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, now);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, now);
+    }
+    CHECK(A.latest.valid, "the restarted Key Server issued a new SAK");
+    CHECK(A.latest.kn == first_kn, "re-using the Key Number, as it must");
+    CHECK(memcmp(A.latest.sak, first_sak, A.latest.sak_len) != 0,
+        "but the key bytes are different");
+    /* The member must adopt the new key, not keep the dead one. */
+    CHECK(B.latest.valid, "the member still holds a key");
+    CHECK_EQ_MEM(A.latest.sak, B.latest.sak, A.latest.sak_len,
+        "and it is the Key Server's new key, not the one it replaced");
+}
+
+/* key_server_capable = false means "I cannot serve", not "I would rather not".
+ * The local election already excludes self, but nothing used to say so on the
+ * wire: the participant advertised its configured priority, so an attractive
+ * one made the peer elect it, while it elected the peer - both ends believing
+ * the other was Key Server, and no SAK ever agreed (skoll M: key_server_capable
+ * is invisible on the wire). */
+static void test_incapable_ks_does_not_deadlock(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+
+    printf("a participant that cannot serve says so on the wire:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    /* A has the more attractive priority but cannot serve; B can. */
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    ca.key_server_capable = 0;
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    cb.key_server_capable = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+
+    CHECK(!wm_Participant_IsKeyServer(&A), "the incapable end does not serve");
+    CHECK(wm_Participant_IsKeyServer(&B),
+        "and the capable one does, despite the worse configured priority");
+    CHECK(B.peers[0].priority == (uint8_t)MKA_PRIORITY_NEVER_KS,
+        "because it advertised never-Key-Server, not its own priority");
+    CHECK(wm_Participant_HasSak(&A) && wm_Participant_HasSak(&B),
+        "so the CA reaches a SAK instead of deadlocking");
+    CHECK_EQ_MEM(A.latest.sak, B.latest.sak, A.latest.sak_len,
+        "the same SAK on both ends");
+}
+
+/* The transmit gate and the advertised receive claim must use the same
+ * readiness test. mka_maybe_enable_tx refuses to enable local transmit while
+ * secy_pending != 0; mka_build_sak_use used to consult only
+ * sak_program_pending, which mka_program_sak clears *before* issuing
+ * create_rx_sc / install_rx_sa / enable_receive - any of which may return
+ * MKA_SECY_PENDING. Since the Latest-Rx bit is what releases the *peer's*
+ * transmit gate, that asymmetry ran the unsafe way: this end would not send on
+ * an SA the hardware lacked, but told the peer that it could. */
+static void test_rx_claim_waits_for_async_install(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    MkaPdu out;
+    uint8_t f[512];
+    size_t n;
+    int tick;
+
+    printf("SAK Use must not claim Latest-Rx while the SecY is still "
+           "installing:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10); /* A: Key Server */
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20); /* B: member */
+    sb.rx_sa_async = 1;                         /* B's data plane is async */
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    for (tick = 0; tick < 12; tick++) {
+        uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, t);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+
+    CHECK(B.latest.valid, "the member installed the SAK");
+    CHECK(B.secy_pending > 0U,
+        "and its receive-SA install is still outstanding");
+
+    /* What does the member now tell the Key Server? */
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&B, f, sizeof f, &n) == MKA_OK, "build");
+    memset(&out, 0, sizeof out);
+    CHECK(wm_Pdu_Decode(g_cmac, f, n, B.keys.ick, B.keys.ick_len, &out) ==
+              MKA_OK,
+        "decode");
+    CHECK(out.sak_use.present, "it emits a SAK Use set");
+    CHECK(!MKA_SAK_USE_IS_LATEST_RX(&out.sak_use),
+        "and must NOT claim Latest-Rx before the install completes");
+}
+
+/* The new Association Number is derived from p->latest.an alone. That is safe
+ * on the normal path, where mka_install_sak demotes Latest into Old so the two
+ * stay one apart - but the sak_program_pending branch *discards* the
+ * un-programmed Latest and leaves Old in place, so they stop tracking each
+ * other and the 2-bit AN can wrap onto an AN whose SAs are still installed. The
+ * guard is at the entry point rather than in the allocator:
+ * wm_Participant_Rekey refuses while a key is undelivered, which is also the
+ * honest answer, since a second key cannot help before the first has reached
+ * the peers. */
+static void test_an_allocation_skips_old_key(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    int i;
+    int collided = 0;
+
+    printf("a new Association Number must not land on the Old key's:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    ca.distribute_before_install = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is the Key Server");
+    CHECK(A.latest.valid, "and holds a programmed key");
+
+    /* The transmit path now fails, so a deferred key is never delivered and
+     * every later rekey takes the discard-the-pending-Latest branch while the
+     * Old key stays put. */
+    A.cfg.send = send_fail;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "the first rekey is accepted");
+    for (i = 0; i < 6; i++) {
+        /* Every further rekey is refused while the last one is still
+         * undelivered - the discard-the-pending-Latest path is what let the
+         * Association Numbers diverge. */
+        CHECK(wm_Participant_Rekey(&A) == MKA_ERR_REKEY_BUSY,
+            "a rekey while one is undelivered is refused");
+        wm_Participant_Run(&A, (uint32_t)(13 + i) * MKA_HELLO_TIME_MS, NULL);
+        if (A.old.valid && (A.latest.an == A.old.an)) {
+            collided = 1;
+        }
+    }
+    CHECK(collided == 0,
+        "the Latest key never takes the Old key's Association Number");
+
+    /* Once the wire recovers and the key is delivered, rekeying works again. */
+    A.cfg.send = send_a;
+    wm_Participant_Run(&A, 20U * MKA_HELLO_TIME_MS, NULL);
+    CHECK(!A.sak_program_pending, "the deferred key reached the wire");
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "and rekeying is allowed again");
+}
+
 static void test_peer_reset_new_mi(void)
 {
     Wire a2b, b2a;
@@ -4224,6 +5227,51 @@ static void test_mn_recency_window(void)
     }
     newest = A.actor_mn - 1U;
     CHECK(newest > MKA_MN_RECENT_WINDOW, "actor MN advanced past the window");
+
+    /* Before more than one MKPDU has gone out, only that one number counts:
+     * the window must not run below the first Message Number into values that
+     * were never emitted (0 and, by wraparound, 0xFFFFFFFF). */
+    {
+        Wire tx2;
+        Secy s2;
+        MkaParticipant B2;
+        MkaParticipantConfig cb2;
+        uint8_t g[512];
+        size_t gn;
+
+        memset(&tx2, 0, sizeof tx2);
+        memset(&s2, 0, sizeof s2);
+        cfg_part(&cb2, &s2, &tx2, send_b, 0x0C, 30);
+        CHECK(wm_Participant_Init(&B2, &cb2) == MKA_OK, "init B2");
+        gn = sizeof g;
+        CHECK(wm_Participant_BuildMkpdu(&B2, g, sizeof g, &gn) == MKA_OK,
+            "B2 emits exactly one MKPDU");
+        CHECK(B2.actor_mn == 2U, "so its next MN is 2");
+
+        gn = craft_echo(g, sizeof g, &B2, 1U, true, 1U);
+        CHECK(wm_Participant_Receive(&B2, g, gn, 10U) == MKA_OK, "MN 1 taken");
+        CHECK(wm_Participant_LivePeerCount(&B2) == 1U, "the one emitted MN is "
+                                                       "recent");
+
+        CHECK(wm_Participant_Init(&B2, &cb2) == MKA_OK, "re-init B2");
+        gn = sizeof g;
+        CHECK(wm_Participant_BuildMkpdu(&B2, g, sizeof g, &gn) == MKA_OK,
+            "one MKPDU again");
+        gn = craft_echo(g, sizeof g, &B2, 0U, false, 1U);
+        CHECK(wm_Participant_Receive(&B2, g, gn, 11U) == MKA_OK, "MN 0 taken");
+        CHECK(wm_Participant_LivePeerCount(&B2) == 0U,
+            "MN 0 was never emitted, so it proves nothing");
+
+        CHECK(wm_Participant_Init(&B2, &cb2) == MKA_OK, "re-init B2 again");
+        gn = sizeof g;
+        CHECK(wm_Participant_BuildMkpdu(&B2, g, sizeof g, &gn) == MKA_OK,
+            "one MKPDU again");
+        gn = craft_echo(g, sizeof g, &B2, 0xFFFFFFFFU, false, 1U);
+        CHECK(wm_Participant_Receive(&B2, g, gn, 12U) == MKA_OK, "wrapped MN "
+                                                                 "taken");
+        CHECK(wm_Participant_LivePeerCount(&B2) == 0U,
+            "nor does the value below it by wraparound");
+    }
 
     /* The newest emitted MN, in the Live list: accepted and live. */
     n = craft_echo(f, sizeof f, &A, newest, true, 1U);
@@ -4482,6 +5530,34 @@ static void test_pae_status(void)
                                                  "reported");
     CHECK_EQ_MEM(st.peer_sci, cb.sci, MKA_SCI_LEN, "live peer SCI reported");
 
+    /* A make-before-break rekey must not read as a drop out of RUNNING: the
+     * in-force key is demoted to Old and keeps transmitting while the new one
+     * waits for the peers to report receiving on it, so protection is unbroken
+     * even though latest.tx is false. */
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "rekey");
+    CHECK(!A.latest.tx && A.old.valid && A.old.tx,
+        "the new key is gated, the demoted one is carrying traffic");
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK(st.state == MKA_PAE_RUNNING, "still running across the handover");
+
+    /* An ICV failure is an authentication failure only while nothing has ever
+     * authenticated: this association has worked, so a corrupted frame is not
+     * one. */
+    A.counters.icv_failures++;
+    A.peer_count = 0U;
+    A.peers[0].valid = false;
+    A.peers[0].live = false;
+    A.latest.tx = false;
+    A.old.tx = false;
+    CHECK(A.counters.mkpdu_in != 0U, "MKPDUs have verified on this CA");
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK(st.state == MKA_PAE_WAITING_FOR_PEER,
+        "a bad frame on a working CA is not an authentication failure");
+    A.counters.mkpdu_in = 0U;
+    CHECK(wm_Participant_GetPaeStatus(&A, &st) == MKA_OK, "status read");
+    CHECK(st.state == MKA_PAE_AUTH_FAIL_UNKNOWN_PEER,
+        "but with nothing ever verified it is");
+
     /* MACsec not desired on this participant at all. */
     ca.macsec_desired = 0;
     CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "re-init A without MACsec");
@@ -4541,12 +5617,47 @@ static void test_kay_quiesce_others(void)
     CHECK(kay.parts[1].quiesced, "the unmatched CA was quiesced");
     CHECK(!kay.parts[0].quiesced, "the winner keeps transmitting");
 
+    /* A rekey does not release the losers: the in-force key is demoted to Old
+     * and keeps transmitting while the new one waits for the peers to report
+     * receiving on it, so MACsec never actually goes down. */
+    CHECK(wm_Participant_Rekey(&kay.parts[0]) == MKA_OK, "the winner rekeys");
+    CHECK(!kay.parts[0].latest.tx, "the new key is not transmitting yet");
+    CHECK(kay.parts[0].old.valid && kay.parts[0].old.tx,
+        "but the demoted key still is");
+    wm_Kay_Run(&kay, 12U * MKA_HELLO_TIME_MS);
+    CHECK(kay.parts[1].quiesced, "the loser stays silent across the handover");
+
+    /* Let the handover complete. */
+    for (t = 12U; t < 24U; t++) {
+        uint32_t now = t * MKA_HELLO_TIME_MS;
+        wm_Kay_Run(&kay, now);
+        wm_Participant_Run(&B, now, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, now);
+        while (wire_pop(&b2a, f, &n))
+            wm_Kay_Receive(&kay, f, n, now);
+    }
+    CHECK(kay.parts[0].latest.tx, "the new key took over");
+    CHECK(kay.parts[1].quiesced, "and the loser is still quiesced");
+
+    /* An Old key that has handed its transmit SA over counts no more than one
+     * that never had it: with both keys gated there is no winner. */
+    kay.parts[0].latest.tx = false;
+    kay.parts[0].old.valid = true;
+    kay.parts[0].old.tx = false;
+    wm_Kay_Run(&kay, 24U * MKA_HELLO_TIME_MS);
+    CHECK(!kay.parts[1].quiesced, "no winner while both keys are gated");
+    kay.parts[0].latest.tx = true;
+    kay.parts[0].old.valid = false;
+    wm_Kay_Run(&kay, 25U * MKA_HELLO_TIME_MS);
+    CHECK(kay.parts[1].quiesced, "and the hold returns when transmit resumes");
+
     /* The quiesced CA must now be silent across a full interval. */
     while (wire_pop(&a2b, f, &n)) {
         /* drain */
     }
     idle = 1;
-    for (t = 12U; t < 16U; t++) {
+    for (t = 26U; t < 30U; t++) {
         uint32_t now = t * MKA_HELLO_TIME_MS;
         uint32_t before = kay.parts[1].actor_mn;
         wm_Kay_Run(&kay, now);
@@ -4559,16 +5670,50 @@ static void test_kay_quiesce_others(void)
     }
     CHECK(idle == 1, "the quiesced CA emitted nothing");
 
-    /* Drop the session: every CA resumes the search. */
+    /* Drop the session outright: every CA resumes the search. */
     kay.parts[0].latest.valid = false;
     kay.parts[0].latest.tx = false;
-    wm_Kay_Run(&kay, 16U * MKA_HELLO_TIME_MS);
+    kay.parts[0].old.valid = false;
+    kay.parts[0].old.tx = false;
+    wm_Kay_Run(&kay, 30U * MKA_HELLO_TIME_MS);
     CHECK(!kay.parts[1].quiesced, "the loser resumes when the session drops");
 
     /* Turning the policy off releases anything still held. */
     kay.parts[1].quiesced = true;
     CHECK(wm_Kay_SetQuiesceOthers(&kay, false) == MKA_OK, "quiesce disabled");
     CHECK(!kay.parts[1].quiesced, "disabling the policy releases the loser");
+
+    /* Adding a CA while a winner exists: it arrives un-quiesced and is only
+     * held from the next wm_Kay_Run, so it can emit one MKPDU first. */
+    CHECK(wm_Kay_SetQuiesceOthers(&kay, true) == MKA_OK, "quiesce re-enabled");
+    kay.parts[0].latest.valid = true;
+    kay.parts[0].latest.tx = true;
+    wm_Kay_Run(&kay, 31U * MKA_HELLO_TIME_MS);
+    CHECK(kay.parts[1].quiesced, "the existing loser is held again");
+    {
+        MkaParticipantConfig ca3;
+        Secy sa3;
+
+        memset(&sa3, 0, sizeof sa3);
+        cfg_part(&ca3, &sa3, &a2b, send_a, 0x0A, 10);
+        memcpy(ca3.cak.ckn, "third-ckn", 9);
+        ca3.cak.ckn_len = 9;
+        CHECK(wm_Kay_AddParticipant(&kay, &ca3, NULL) == MKA_OK, "add CA 3");
+        CHECK(!kay.parts[2].quiesced, "a new CA starts un-quiesced");
+        wm_Kay_Run(&kay, 32U * MKA_HELLO_TIME_MS);
+        CHECK(kay.parts[2].quiesced, "and is held from the next run");
+    }
+
+    /* Removing the holding CA releases the others - but only once
+     * mka_kay_apply_quiesce is reached, since the compaction copies the
+     * losers' held state down into the vacated slots. */
+    CHECK(wm_Kay_RemoveParticipant(&kay, ca.cak.ckn, ca.cak.ckn_len) == MKA_OK,
+        "the winner is removed");
+    CHECK(kay.parts[0].quiesced,
+        "the compacted entries still carry the stale hold");
+    wm_Kay_Run(&kay, 33U * MKA_HELLO_TIME_MS);
+    CHECK(!kay.parts[0].quiesced && !kay.parts[1].quiesced,
+        "and the next run releases every one of them");
     wm_Kay_Free(&kay);
 }
 
@@ -4631,6 +5776,40 @@ static void test_ks_priority_extremes(void)
     run_pair(&A, &B, &a2b, &b2a, 12, NULL);
     CHECK(wm_Participant_IsKeyServer(&B), "priority 0 always serves");
     CHECK(!wm_Participant_IsKeyServer(&A), "the higher priority yields");
+
+    /* A pinned PEER-role participant applies the same rule: a peer that
+     * advertises the Key Server role while claiming priority 255 has declared
+     * itself ineligible to issue a SAK, so it is not adopted - even though that
+     * leaves this end with no Key Server at all. */
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 20);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, MKA_PRIORITY_NEVER_KS);
+    ca.role = MKA_ROLE_PEER;
+    cb.role = MKA_ROLE_KEY_SERVER;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U, "the pinned peer is live");
+    CHECK(!A.elected, "but a 255-priority Key Server is not adopted");
+    CHECK(!wm_Participant_HasSak(&A), "so the pinned peer stays without a SAK");
+
+    /* The same pairing with an ordinary priority does elect. */
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 20);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 10);
+    ca.role = MKA_ROLE_PEER;
+    cb.role = MKA_ROLE_KEY_SERVER;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(A.elected, "an eligible pinned Key Server is adopted");
+    CHECK(wm_Participant_HasSak(&A), "and the SAK arrives");
 }
 #endif /* WOLFMKA_AUTOMOTIVE_PROFILE */
 
@@ -4738,6 +5917,35 @@ static void test_rekey_on_lost_sak_use(void)
     wm_Participant_Run(&A, t + 5U, NULL);
     CHECK(A.latest.kn == kn_before, "a peer using the key prompts no rekey");
 
+    /* A member must not latch the lost-SAK signal at all: only the Key Server
+     * can compare a peer's report against the key it issued, and a member
+     * evaluating it would latch on every rekey - the Key Server announces the
+     * new Key Number before the member has installed it. Latent today, since
+     * only a Key Server consumes the flag, but it would fire the moment a
+     * member was elected. */
+    {
+        Wire c2s, s2c;
+        Secy sk, sm;
+        MkaParticipant K, M;
+        MkaParticipantConfig ck, cm;
+
+        memset(&c2s, 0, sizeof c2s);
+        memset(&s2c, 0, sizeof s2c);
+        memset(&sk, 0, sizeof sk);
+        memset(&sm, 0, sizeof sm);
+        cfg_part(&ck, &sk, &c2s, send_a, 0x0A, 10);
+        cfg_part(&cm, &sm, &s2c, send_b, 0x0B, 20);
+        CHECK(wm_Participant_Init(&K, &ck) == MKA_OK, "init KS");
+        CHECK(wm_Participant_Init(&M, &cm) == MKA_OK, "init member");
+        run_pair(&K, &M, &c2s, &s2c, 12, NULL);
+        CHECK(wm_Participant_IsKeyServer(&K) && !wm_Participant_IsKeyServer(&M),
+            "roles as expected");
+        CHECK(wm_Participant_Rekey(&K) == MKA_OK, "the Key Server rekeys");
+        run_pair(&K, &M, &c2s, &s2c, 12, NULL);
+        CHECK(M.latest.kn == K.latest.kn, "the member followed the rekey");
+        CHECK(!M.sak_lost, "and never latched a lost SAK of its own");
+    }
+
     /* Transmitting on the key but not yet receiving on it still counts as
      * using it, so it prompts no rekey either. */
     kn_before = A.latest.kn;
@@ -4762,6 +5970,165 @@ static void test_rekey_on_lost_sak_use(void)
     while (wire_pop(&b2a, f, &n))
         wm_Participant_Receive(&A, f, n, 0U);
     CHECK(!A.sak_lost, "a peer that never held a key raises no loss");
+}
+
+/* A member that still holds a key always sends the MACsec SAK Use parameter
+ * set, so its absence says the peer has stopped using one. The Key Server
+ * notices that through mka_note_sak_use, but a plain member does not run that
+ * check - so without an explicit clear its peer table would go on claiming the
+ * peer is receiving and transmitting under a key it has dropped, and that claim
+ * is what releases the transmit gate. */
+static void test_member_clears_stale_sak_use(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    uint32_t t = 100U;
+
+    printf("a member forgets a peer's SAK Use when it stops being sent:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(!wm_Participant_IsKeyServer(&B), "B is the member, not the server");
+    CHECK(wm_Participant_HasSak(&B), "and holds the SAK");
+    CHECK(B.peers[0].valid && B.peers[0].live, "A is live in B's table");
+
+    /* A reports it is receiving on the key in force. */
+    n = craft_sak_use(f, sizeof f, &B, &A, 3, B.peers[0].mn + 1U);
+    CHECK(wm_Participant_Receive(&B, f, n, t) == MKA_OK, "SAK Use accepted");
+    CHECK(B.peers[0].sak_rx, "the member records the peer as receiving");
+    CHECK(B.peers[0].latest_kn == B.latest.kn, "on the key in force");
+
+    /* The next MKPDU from A carries no MACsec SAK Use set at all. */
+    n = craft_sak_use(f, sizeof f, &B, &A, 0, B.peers[0].mn + 1U);
+    CHECK(wm_Participant_Receive(&B, f, n, t + 1U) == MKA_OK,
+        "an MKPDU without SAK Use is still accepted");
+    CHECK(!B.peers[0].sak_rx, "the receiving claim is dropped");
+    CHECK(!B.peers[0].sak_tx, "and so is the transmitting claim");
+    CHECK(B.peers[0].latest_kn == 0U, "and the Key Number it named");
+}
+
+#ifndef WOLFMKA_NO_AUTO_REKEY
+/* wm_Participant_Rekey has no now_ms argument, so it cannot stamp the automatic
+ * rekey interval itself. If nothing else restarted that interval, the automatic
+ * rekey would keep measuring from whenever the *previous* key was issued and
+ * fire again the moment the manual handover retired - turning one requested
+ * rekey into two. */
+static void test_manual_rekey_restarts_the_auto_interval(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    uint32_t kn_manual;
+    int tick;
+
+    printf("a manual rekey restarts the automatic rekey interval:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is the Key Server");
+
+    /* An interval long enough that it has not yet elapsed for the first key,
+     * but short enough that it will have by the end of the settle below. */
+    A.cfg.sak_rekey_time_ms = 30000U;
+
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "the integrator rekeys by hand");
+    kn_manual = A.latest.kn;
+
+    /* Settle the handover, keeping the peer live (steps < the 6 s Life Time).
+     * The time-based rekey only fires once the Old key has retired, so the run
+     * has to get that far or the assertion below proves nothing. */
+    for (tick = 12; tick < 22; tick++) {
+        uint32_t t = (uint32_t)tick * MKA_HELLO_TIME_MS;
+        wm_Participant_Run(&A, t, NULL);
+        wm_Participant_Run(&B, t, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, t);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t);
+    }
+    CHECK(!A.old.valid, "the manual handover has retired the Old key");
+    CHECK(A.peers[0].live, "and the peer is still live");
+    CHECK((uint32_t)21 * MKA_HELLO_TIME_MS > 30000U,
+        "the clock has passed the interval measured from the previous key");
+    CHECK(A.latest.kn == kn_manual,
+        "but the interval runs from the manual rekey, so no second one fires");
+}
+#endif /* WOLFMKA_NO_AUTO_REKEY */
+
+/* Nothing on the wire stops a peer list from naming the same Member Identifier
+ * twice. The Message Number that comes back from that search is what decides
+ * whether the MKPDU is a stale replay, so the rule has to be first-match: a
+ * stale copy appended after a current one would otherwise discard a frame that
+ * carried a perfectly good liveness proof. */
+static void test_duplicate_mi_in_peer_list_takes_the_first(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    MkaPdu in;
+    uint8_t f[512];
+    size_t n = sizeof f;
+    uint32_t recent;
+
+    printf("a repeated Member Identifier in a peer list: first wins:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(A.peers[0].live, "B is live in A's table");
+
+    recent = echo_mn(&A);
+    CHECK(recent > MKA_MN_RECENT_WINDOW,
+        "A has emitted enough MKPDUs for 1 to be stale");
+
+    /* B's Live Peer List names A twice: first with a Message Number A really
+     * did emit, then with 1, which is far outside the recency window. */
+    memset(&in, 0, sizeof in);
+    in.basic.priority = B.cfg.priority;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, A.cfg.cak.ckn, A.cfg.cak.ckn_len);
+    in.basic.ckn_len = A.cfg.cak.ckn_len;
+    memcpy(in.basic.sci, B.cfg.sci, MKA_SCI_LEN);
+    memcpy(in.basic.mi, B.actor_mi, MKA_MI_LEN);
+    in.basic.mn = A.peers[0].mn + 1U;
+    in.live_peers.present = 1;
+    in.live_peers.count = 2;
+    memcpy(in.live_peers.peers[0].mi, A.actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[0].mn = recent;
+    memcpy(in.live_peers.peers[1].mi, A.actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[1].mn = 1U; /* stale */
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode the doubled peer list");
+    CHECK(wm_Participant_Receive(&A, f, n, 30000U) == MKA_OK,
+        "the MKPDU is accepted, not discarded as a stale echo");
+    CHECK(A.peers[0].live, "and B stays live on the first, current entry");
 }
 
 /* --- ordering probe for distribute-before-install (AutoMKA-03010) --------- */
@@ -4921,6 +6288,57 @@ static void test_profile_rekey_is_single(void)
     CHECK(B.latest.kn == A.latest.kn, "the member followed to the same key");
     CHECK(A.latest.tx && B.latest.tx, "MACsec up again after the rekey");
     CHECK(!A.old.valid && !B.old.valid, "the old key retired on both ends");
+    /* The rekey MKPDU carries the Key Server's new SAK Use and the Distributed
+     * SAK together, and the member reads the SAK Use before installing the key.
+     * If that reads as a key loss, the member latches sak_lost for good and
+     * gratuitously rekeys the moment it is ever elected Key Server. */
+    CHECK(!B.sak_lost, "the member did not read the handover as a key loss");
+}
+
+/* p->latest.sak is a fixed-size buffer and only sak_len octets are written, so
+ * a 256-bit key replaced by a 128-bit one would leave its upper half behind -
+ * and that half outlives the Old copy, which is force-zeroed on retirement
+ * (skoll L: shrinking SAK length leaves a tail of the previous key). */
+static void test_shrinking_sak_leaves_no_tail(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    size_t i;
+    int nonzero = 0;
+
+    printf("A shorter SAK does not inherit the previous key's tail:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    ca.sak_len = 32U;
+    ca.cipher_suite = MKA_CIPHER_GCM_AES_256;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    A.is_key_server = 1;
+    A.elected = 1;
+
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "a 256-bit SAK");
+    CHECK(A.latest.sak_len == 32U, "32 octets installed");
+    for (i = 16U; i < 32U; i++) {
+        if (A.latest.sak[i] != 0U) {
+            nonzero = 1;
+        }
+    }
+    CHECK(nonzero == 1, "its upper half is key material");
+
+    /* Same participant, now negotiating a 128-bit suite. */
+    A.cfg.sak_len = 16U;
+    A.cfg.cipher_suite = MKA_CIPHER_GCM_AES_128;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "a 128-bit SAK");
+    CHECK(A.latest.sak_len == 16U, "16 octets installed");
+    nonzero = 0;
+    for (i = 16U; i < sizeof A.latest.sak; i++) {
+        if (A.latest.sak[i] != 0U) {
+            nonzero = 1;
+        }
+    }
+    CHECK(nonzero == 0, "and nothing of the 256-bit key remains above it");
 }
 
 /* A send that fails must not leave the key programmed but unannounced: the
@@ -5006,6 +6424,741 @@ static void test_deferred_install_send_failure(void)
     CHECK(sa.tx_installed, "the SecY was programmed immediately");
 }
 
+/* Forward secrecy must survive the departure of the *last* live peer: the Key
+ * Server has to rotate away from the key that member still holds, or a member
+ * joining later is handed it (skoll F: last-peer rekey). */
+static void test_rekey_on_last_peer_departure(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    uint32_t t;
+    uint32_t kn_before;
+    uint8_t sak_before[16];
+
+    printf("rekey when the last live peer departs:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is Key Server");
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U, "B is A's only live peer");
+    kn_before = A.latest.kn;
+    memcpy(sak_before, A.latest.sak, 16);
+
+    /* B goes silent; A runs on alone until B is expired. */
+    for (t = 12U; t < 20U; t++) {
+        wm_Participant_Run(&A, t * MKA_HELLO_TIME_MS, NULL);
+        while (wire_pop(&a2b, f, &n)) {
+            /* nobody is listening */
+        }
+    }
+    CHECK(wm_Participant_LivePeerCount(&A) == 0U, "B expired");
+    CHECK(A.latest.kn != kn_before,
+        "the Key Server rekeyed away from the departed member's SAK");
+    CHECK(memcmp(A.latest.sak, sak_before, 16) != 0, "and the key differs");
+}
+
+/* A peer that has never proven liveness must not be able to steer our data
+ * plane through the MACsec SAK Use it claims (skoll F: pre-liveness SAK Use).
+ */
+static void test_sak_use_requires_liveness(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    MkaPdu in;
+    uint8_t f[512];
+    size_t n = sizeof f;
+    int i;
+
+    printf("SAK Use from a non-live peer is ignored:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    ca.delay_protect = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+
+    /* Give A a SAK of its own so there is a replay window to poison. */
+    A.is_key_server = 1;
+    A.elected = 1;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "A holds a SAK");
+    for (i = 0; i < 3; i++) {
+        size_t drop;
+        wm_Participant_Run(&A, (uint32_t)i, NULL);
+        while (wire_pop(&tx, f, &drop)) {
+            /* discard */
+        }
+    }
+    s.set_lowest_pn_calls = 0;
+
+    /* A frame that verifies (same CAK) but never echoes A's MI, claiming to be
+     * receiving on A's key with the highest possible packet number. */
+    memset(&in, 0, sizeof in);
+    in.basic.priority = 200;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, A.cfg.cak.ckn, A.cfg.cak.ckn_len);
+    in.basic.ckn_len = A.cfg.cak.ckn_len;
+    memset(in.basic.sci, 0x5A, MKA_SCI_LEN);
+    memset(in.basic.mi, 0xE7, MKA_MI_LEN);
+    in.basic.mn = 1;
+    in.sak_use.present = 1;
+    MKA_SAK_USE_SET_LATEST_RX(&in.sak_use);
+    in.sak_use.latest_kn = A.latest.kn;
+    in.sak_use.latest_lpn = 0xFFFFFFFFU;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode non-live claimant");
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "frame accepted");
+
+    CHECK(wm_Participant_LivePeerCount(&A) == 0U, "the claimant is not live");
+    CHECK(s.set_lowest_pn_calls == 0, "a non-live peer moved no replay window");
+    CHECK(!A.peers[0].sak_use_seen, "and is not recorded as using the key");
+    CHECK(!A.sak_lost, "so it cannot force a rekey either");
+}
+
+#ifndef WOLFMKA_NO_DELAY_PROTECT
+/* Delay protection must bound the Secure Association the peer names, not
+ * whichever one is Latest here: mid make-before-break a peer still reports the
+ * Old key (skoll F: LPN applied to the wrong SA). */
+static void test_delay_protect_targets_reported_key(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    MkaPdu in;
+    uint8_t f[512];
+    size_t n;
+    uint8_t old_an;
+    uint32_t old_kn;
+
+    printf("delay protection bounds the key the peer names:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    ca.delay_protect = 1;
+    cb.delay_protect = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is Key Server");
+
+    /* A rekeys; B has not installed the new key yet. */
+    old_kn = A.latest.kn;
+    old_an = A.latest.an;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "A rekeys");
+    CHECK(A.old.valid && (A.old.kn == old_kn), "the previous key is Old");
+    CHECK(A.latest.an != old_an, "the new key uses a different AN");
+
+    /* B reports the key it still holds - the Old one. */
+    memset(&in, 0, sizeof in);
+    in.basic.priority = 20;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, A.cfg.cak.ckn, A.cfg.cak.ckn_len);
+    in.basic.ckn_len = A.cfg.cak.ckn_len;
+    memcpy(in.basic.sci, cb.sci, MKA_SCI_LEN);
+    memcpy(in.basic.mi, B.actor_mi, MKA_MI_LEN);
+    in.basic.mn = B.actor_mn + 1U;
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memcpy(in.live_peers.peers[0].mi, A.actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[0].mn = echo_mn(&A);
+    in.sak_use.present = 1;
+    MKA_SAK_USE_SET_LATEST_RX(&in.sak_use);
+    in.sak_use.latest_kn = old_kn;
+    in.sak_use.latest_lpn = 0xC0000005U;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode B still on the old key");
+    sa.set_lowest_pn_calls = 0;
+    CHECK(wm_Participant_Receive(&A, f, n, 500U) == MKA_OK, "accepted");
+
+    CHECK(sa.set_lowest_pn_calls == 1, "a replay bound was applied");
+    CHECK(sa.last_lpn_an == old_an,
+        "the bound landed on the Old key's SA, not the new one");
+    CHECK(sa.last_lowest_pn == 0xC0000005ULL, "with the reported PN");
+
+    /* A Key Number we do not hold bounds nothing at all. */
+    in.basic.mn++;
+    in.live_peers.peers[0].mn = echo_mn(&A);
+    in.sak_use.latest_kn = old_kn + 1000U;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode unknown key number");
+    sa.set_lowest_pn_calls = 0;
+    CHECK(wm_Participant_Receive(&A, f, n, 600U) == MKA_OK, "accepted");
+    CHECK(sa.set_lowest_pn_calls == 0, "an unknown Key Number bounds nothing");
+}
+#endif /* WOLFMKA_NO_DELAY_PROTECT */
+
+/* A transmit the callback rejected has delivered nothing, so the update it
+ * carried must survive for the retry (skoll F: newInfo cleared on failed
+ * send). */
+static void test_failed_send_keeps_new_info(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    uint8_t f[512];
+    size_t n;
+    uint32_t t;
+
+    printf("a failed send does not discard the update:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    ca.immediate_response = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    /* Break the wire, then give A something new to report. */
+    for (t = 0U; t < 2U; t++) {
+        wm_Participant_Run(&A, t * MKA_HELLO_TIME_MS, NULL);
+        wm_Participant_Run(&B, t * MKA_HELLO_TIME_MS, NULL);
+        while (wire_pop(&a2b, f, &n))
+            wm_Participant_Receive(&B, f, n, t * MKA_HELLO_TIME_MS);
+        while (wire_pop(&b2a, f, &n))
+            wm_Participant_Receive(&A, f, n, t * MKA_HELLO_TIME_MS);
+    }
+    A.cfg.send = send_fail;
+    A.new_info = true;
+    wm_Participant_Run(&A, 2U * MKA_HELLO_TIME_MS, NULL);
+    CHECK(A.new_info, "the update survives a rejected frame");
+
+    /* With the wire restored it goes out and is then cleared. */
+    A.cfg.send = send_a;
+    wm_Participant_Run(&A, 3U * MKA_HELLO_TIME_MS, NULL);
+    CHECK(!A.new_info, "and is cleared once a frame reaches the wire");
+}
+
+/* A peer that stops proving liveness leaves the Live Peer List. That is a
+ * membership change: the Key Server must rotate away from the key the peer
+ * still holds, or its eventual expiry - by which time it is no longer live -
+ * raises nothing and a later joiner is handed that key (skoll F: silent
+ * live -> not-live downgrade). */
+static void test_liveness_downgrade_rekeys(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+    MkaPdu in;
+    uint8_t f[512];
+    size_t n;
+    uint32_t kn_before;
+    uint32_t t;
+    EvRec ev;
+
+    printf("liveness downgrade counts as a departure:\n");
+    memset(&ev, 0, sizeof ev);
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+    CHECK(wm_Participant_IsKeyServer(&A), "A is Key Server");
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U, "B is live at A");
+    kn_before = A.latest.kn;
+
+    /* B keeps talking but stops listing A: the A->B direction has failed, so B
+     * can no longer prove two-way connectivity. */
+    memset(&in, 0, sizeof in);
+    in.basic.priority = 20;
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, A.cfg.cak.ckn, A.cfg.cak.ckn_len);
+    in.basic.ckn_len = A.cfg.cak.ckn_len;
+    memcpy(in.basic.sci, cb.sci, MKA_SCI_LEN);
+    memcpy(in.basic.mi, B.actor_mi, MKA_MI_LEN);
+    in.basic.mn = B.actor_mn + 1U;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode a frame that no longer echoes A");
+    CHECK(wm_Participant_Receive(&A, f, n, 500U) == MKA_OK, "accepted");
+
+    CHECK(wm_Participant_LivePeerCount(&A) == 0U, "B is no longer live");
+    CHECK(wm_Participant_PeerCount(&A) == 1U, "but is still a known peer");
+    wm_Participant_Run(&A, 501U, NULL);
+    CHECK(A.latest.kn != kn_before,
+        "the Key Server rotated away from the key B still holds");
+
+    /* And when it finally expires, peer_lost must report that it HAD been
+     * live, which is what the header documents - reporting the instantaneous
+     * flag would call a departed member a stranger. */
+    A.cfg.events.peer_lost = ev_lost;
+    A.cfg.events.ctx = &ev;
+    for (t = 502U; t < 502U + (2U * MKA_LIFE_TIME_MS); t += MKA_HELLO_TIME_MS) {
+        size_t drop;
+        wm_Participant_Run(&A, t, NULL);
+        while (wire_pop(&a2b, f, &drop)) {
+            /* nobody is listening */
+        }
+    }
+    CHECK(wm_Participant_PeerCount(&A) == 0U, "B eventually expired");
+    CHECK(ev.lost == 1, "peer_lost fired once");
+    CHECK(ev.lost_livecount == 1, "and reported that the peer had been live");
+}
+
+/* A pinned Key Server role must not override "I do not want MACsec": the
+ * dynamic election already refuses such a participant, and running MKA with
+ * MACsec disabled depends on nothing programming the data plane (skoll M:
+ * fixed role bypasses macsec_desired). */
+static void test_fixed_ks_respects_macsec_desired(void)
+{
+    Wire a2b, b2a;
+    Secy sa, sb;
+    MkaParticipant A, B;
+    MkaParticipantConfig ca, cb;
+
+    printf("a pinned Key Server still honours macsec_desired:\n");
+    memset(&a2b, 0, sizeof a2b);
+    memset(&b2a, 0, sizeof b2a);
+    memset(&sa, 0, sizeof sa);
+    memset(&sb, 0, sizeof sb);
+    cfg_part(&ca, &sa, &a2b, send_a, 0x0A, 10);
+    cfg_part(&cb, &sb, &b2a, send_b, 0x0B, 20);
+    ca.role = MKA_ROLE_KEY_SERVER;
+    ca.macsec_desired = 0;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+    run_pair(&A, &B, &a2b, &b2a, 12, NULL);
+
+    CHECK(!wm_Participant_IsKeyServer(&A), "the pinned role does not apply");
+    CHECK(!wm_Participant_HasSak(&A), "so no SAK is generated");
+    CHECK(sa.tx_installed == 0 && sa.rx_installed == 0,
+        "and the data plane is never programmed");
+    CHECK(wm_Participant_PeerCount(&A) == 1U, "while MKA itself keeps running");
+}
+
+/* The cipher suite a Key Server distributes is carried through to the SecY, so
+ * it has to be one we implement and has to agree with the key length actually
+ * sent (skoll M: unvalidated distributed cipher suite). */
+static void test_dist_sak_cipher_suite_validated(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant B;
+    MkaParticipantConfig cb;
+    MkaPdu in;
+    uint8_t sak[16], wrapped[40], f[512];
+    size_t wlen = sizeof wrapped;
+    size_t n;
+    uint8_t ks_sci[8] = {0, 0, 0, 0, 0, 0x0A, 0, 1};
+
+    printf("distributed cipher suite is validated:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&cb, &s, &tx, send_b, 0x0B, 20);
+    cb.key_server_capable = 0;
+    CHECK(wm_Participant_Init(&B, &cb) == MKA_OK, "init B");
+
+    memset(sak, 0x55, sizeof sak);
+    CHECK(wm_Crypto_WrapSak(B.keys.kek, B.keys.kek_len, sak, 16, wrapped,
+              &wlen) == MKA_OK,
+        "wrap a 128-bit SAK");
+
+    /* A frame from B's elected Key Server naming a 256-bit suite for a 128-bit
+     * key: the pair is impossible and must be rejected, not programmed. */
+    memset(&in, 0, sizeof in);
+    in.basic.macsec_desired = 1;
+    in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+    memcpy(in.basic.ckn, B.cfg.cak.ckn, B.cfg.cak.ckn_len);
+    in.basic.ckn_len = B.cfg.cak.ckn_len;
+    memcpy(in.basic.sci, ks_sci, 8);
+    memset(in.basic.mi, 0x77, MKA_MI_LEN);
+    in.basic.mn = 1;
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memcpy(in.live_peers.peers[0].mi, B.actor_mi, MKA_MI_LEN);
+    in.live_peers.peers[0].mn = echo_mn(&B);
+    in.dist_sak.present = 1;
+    in.dist_sak.kn = 1;
+    in.dist_sak.distributed_an = 0;
+    in.dist_sak.cipher_suite = MKA_CIPHER_GCM_AES_256;
+    memcpy(in.dist_sak.wrapped_sak, wrapped, wlen);
+    in.dist_sak.wrapped_len = wlen;
+    n = sizeof f;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, B.keys.ick, B.keys.ick_len, f, sizeof f,
+              &n) == MKA_OK,
+        "encode mismatched suite/key length");
+    CHECK(wm_Participant_Receive(&B, f, n, 0) == MKA_ERR_PARSE,
+        "a suite that contradicts the key length is rejected");
+    CHECK(!wm_Participant_HasSak(&B), "and nothing is installed");
+    CHECK(s.tx_installed == 0, "the SecY was never programmed");
+}
+
+/* With distribute_before_install a SAK is adopted before it is programmed. If a
+ * second rekey lands while the first is still waiting on the wire, the pending
+ * key never reached the SecY - so it must be replaced outright, not demoted to
+ * Old, where its phantom SAs would later be "deleted" (skoll M: unprogrammed
+ * Latest demoted to Old). */
+static void test_pending_sak_not_demoted(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    uint32_t first_kn;
+
+    printf("an unprogrammed SAK is replaced, not demoted:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    ca.distribute_before_install = 1;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    A.is_key_server = 1;
+    A.elected = 1;
+
+    /* Adopt one, with the wire broken so it stays unprogrammed. */
+    A.cfg.send = send_fail;
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "first SAK adopted");
+    CHECK(A.sak_program_pending, "and left pending");
+    first_kn = A.latest.kn;
+    wm_Participant_Run(&A, 1U, NULL);
+    CHECK(A.sak_program_pending, "still pending after the failed send");
+    CHECK(s.tx_installed == 0, "the SecY never saw it");
+
+    /* A second rekey while the first is still pending. wm_Participant_Rekey
+     * refuses that now - an undelivered key is a rekey in progress - so this
+     * has to arrive the way it actually can: the Key Server's own rekey, driven
+     * by a membership change it must answer. */
+    CHECK(wm_Participant_Rekey(&A) == MKA_ERR_REKEY_BUSY,
+        "the public rekey refuses to stack on an undelivered key");
+    {
+        uint8_t pf[512];
+        size_t pn;
+        uint8_t p_sci[8] = {0, 0, 0, 0, 0, 0x0C, 0, 1};
+
+        pn = craft_live_member(pf, sizeof pf, &A, p_sci, 0x77);
+        CHECK(wm_Participant_Receive(&A, pf, pn, 2U) == MKA_OK,
+            "a peer becomes live");
+        A.sak_lost = 1; /* that peer reports it has lost the key */
+        wm_Participant_Run(&A, 3U, NULL);
+    }
+    CHECK(A.latest.kn != first_kn, "the new key is in force");
+    CHECK(!A.old.valid, "the unprogrammed key was replaced, not kept as Old");
+
+    /* With the wire restored the surviving key reaches the data plane, and no
+     * delete is issued for a key that was never installed. */
+    A.cfg.send = send_a;
+    /* The failed attempt stamped the cadence, so the retry comes at the next
+     * interval; this participant has no immediate_response to short-cut it. */
+    wm_Participant_Run(&A, MKA_HELLO_TIME_MS + 10U, NULL);
+    CHECK(!A.sak_program_pending, "programmed once it was announced");
+    CHECK(s.tx_installed == 1, "exactly one install");
+    CHECK(s.del_calls == 0, "and no phantom deletion");
+}
+
+/* A member names the Key Server's MI in its MACsec SAK Use. With more than one
+ * live peer - or with the peer-reset handling leaving two entries for one SCI -
+ * the scan must pick the live peer whose SCI is the elected Key Server's, not
+ * merely the last entry that matched (skoll L: stale duplicate-SCI MI). */
+static void test_sak_use_names_the_key_server(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant P;
+    MkaParticipantConfig cp;
+    MkaPdu out;
+    uint8_t f[512];
+    size_t n = sizeof f;
+    uint8_t other_sci[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0xB0, 0, 1};
+    uint8_t ks_sci[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0xA0, 0, 1};
+
+    printf("SAK Use names the elected Key Server:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&cp, &s, &tx, send_a, 0x0C, 200);
+    CHECK(wm_Participant_Init(&P, &cp) == MKA_OK, "init P");
+
+    /* White box: a member holding a SAK, with a live peer that is not the Key
+     * Server sitting ahead of the one that is. */
+    P.peers[0].valid = 1;
+    P.peers[0].live = 1;
+    memcpy(P.peers[0].sci, other_sci, MKA_SCI_LEN);
+    memset(P.peers[0].mi, 0x11, MKA_MI_LEN);
+    P.peers[1].valid = 1;
+    P.peers[1].live = 1;
+    memcpy(P.peers[1].sci, ks_sci, MKA_SCI_LEN);
+    memset(P.peers[1].mi, 0x22, MKA_MI_LEN);
+    P.peer_count = 2U;
+    P.elected = 1;
+    P.is_key_server = 0;
+    memcpy(P.ks_sci, ks_sci, MKA_SCI_LEN);
+    P.latest.valid = 1;
+    P.latest.kn = 7U;
+    P.latest.an = 0U;
+    P.latest.sak_len = 16U;
+    P.sak_cipher_suite = MKA_CIPHER_GCM_AES_128;
+
+    CHECK(wm_Participant_BuildMkpdu(&P, f, sizeof f, &n) == MKA_OK, "build");
+    memset(&out, 0, sizeof out);
+    CHECK(wm_Pdu_Decode(g_cmac, f, n, P.keys.ick, P.keys.ick_len, &out) ==
+              MKA_OK,
+        "decode");
+    CHECK(out.sak_use.present, "the SAK Use set is emitted");
+    CHECK_EQ_MEM(out.sak_use.latest_ks_mi, P.peers[1].mi, MKA_MI_LEN,
+        "the Key Server's MI is reported, not the other peer's");
+
+    /* And when the elected Key Server is not among the live peers - it has just
+     * gone quiet, say - the scan walks every slot, skipping the ones that hold
+     * nothing, and reports no MI rather than some other peer's. */
+    P.peers[0].valid = 0;
+    P.peers[0].live = 0;
+    memcpy(P.peers[1].sci, other_sci, MKA_SCI_LEN);
+    P.peer_count = 1U;
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&P, f, sizeof f, &n) == MKA_OK,
+        "build with no live Key Server");
+    memset(&out, 0, sizeof out);
+    CHECK(wm_Pdu_Decode(g_cmac, f, n, P.keys.ick, P.keys.ick_len, &out) ==
+              MKA_OK,
+        "decode");
+    {
+        static const uint8_t zero_mi[MKA_MI_LEN] = {0};
+        CHECK_EQ_MEM(out.sak_use.latest_ks_mi, zero_mi, MKA_MI_LEN,
+            "no peer's MI is passed off as the Key Server's");
+    }
+}
+
+/* Peer-reset recovery gives one device two entries - the stale incarnation and
+ * the new one - but no more: without a cap a CA member could take the whole
+ * peer table on its own just by cycling Member Identifiers, crowding out every
+ * other member (skoll L: peer table exhausted by cycling MIs). */
+static void test_peer_entries_capped_per_sci(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    uint8_t f[512];
+    size_t n;
+    MkaStatus rc = MKA_OK;
+    unsigned mi_fill;
+
+    printf("entries per SCI are capped:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+
+    /* One SCI, a fresh MI each time. */
+    for (mi_fill = 0x30U; mi_fill < 0x38U; mi_fill++) {
+        MkaPdu in;
+        static const uint8_t one_sci[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0x77, 0, 1};
+
+        memset(&in, 0, sizeof in);
+        in.basic.priority = 200;
+        in.basic.macsec_desired = 1;
+        in.basic.algo_agility = MKA_ALGO_AGILITY_DEFAULT;
+        memcpy(in.basic.ckn, A.cfg.cak.ckn, A.cfg.cak.ckn_len);
+        in.basic.ckn_len = A.cfg.cak.ckn_len;
+        memcpy(in.basic.sci, one_sci, MKA_SCI_LEN);
+        memset(in.basic.mi, (uint8_t)mi_fill, MKA_MI_LEN);
+        in.basic.mn = 1;
+        n = sizeof f;
+        CHECK(wm_Pdu_Encode(g_cmac, &in, A.keys.ick, A.keys.ick_len, f,
+                  sizeof f, &n) == MKA_OK,
+            "encode a new incarnation");
+        rc = wm_Participant_Receive(&A, f, n, 100U + mi_fill);
+    }
+
+    /* The cap bounds how much of the table one device holds at once, not how
+     * often it may re-introduce itself. None of these incarnations ever proved
+     * liveness, so each new one reclaims the oldest of its own dead entries
+     * rather than being refused - a device is never locked out by its own
+     * history, and the table is no more crowded for it. */
+    CHECK(rc == MKA_OK, "churning its own dead entries is admitted");
+    CHECK(wm_Participant_PeerCount(&A) == (size_t)MKA_MAX_PEERS_PER_SCI,
+        "one device holds no more than its allowance");
+    CHECK(wm_Participant_PeerCount(&A) < (size_t)MKA_MAX_PEERS,
+        "so the rest of the table stays available to other members");
+}
+
+/* The lockout the eviction exists to prevent: a device that resets twice inside
+ * the Life Time. Its first incarnation is still in the table, its second was
+ * admitted but never proved liveness before the second reset, and nothing else
+ * frees either - mka_retire_stale_mi runs only when an entry for that SCI
+ * becomes live, which is exactly what has not happened. */
+static void test_double_reset_is_not_locked_out(void)
+{
+    static const uint8_t d_sci[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0x88, 0, 1};
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    uint8_t f[512];
+    size_t n;
+
+    printf("a device that resets twice inside the Life Time still gets in:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    wm_Participant_Run(&A, 0U, NULL);
+
+    /* First incarnation, proving liveness. */
+    n = craft_live_member(f, sizeof f, &A, d_sci, 0xD1);
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "MI1 accepted");
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U, "and is live");
+
+    /* It resets: a new MI, which never gets far enough to prove liveness. */
+    n = craft_potential_member(f, sizeof f, &A, d_sci, 0xD2);
+    CHECK(wm_Participant_Receive(&A, f, n, 200U) == MKA_OK, "MI2 accepted");
+    CHECK(wm_Participant_PeerCount(&A) == 2U, "both incarnations are held");
+
+    /* An unrelated device, also never live, so the reclaim has to discriminate
+     * by SCI rather than take the first dead entry it finds. */
+    {
+        static const uint8_t other_sci[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0x89, 0,
+            1};
+        n = craft_potential_member(f, sizeof f, &A, other_sci, 0xDA);
+        CHECK(wm_Participant_Receive(&A, f, n, 250U) == MKA_OK,
+            "an unrelated device is admitted");
+        CHECK(wm_Participant_PeerCount(&A) == 3U, "three entries now");
+    }
+
+    /* It resets again, well inside the 6 s Life Time, so neither earlier entry
+     * has aged out. Before the eviction this was MKA_ERR_FULL and the device
+     * stayed out for the rest of the Life Time. */
+    n = craft_potential_member(f, sizeof f, &A, d_sci, 0xD3);
+    CHECK(wm_Participant_Receive(&A, f, n, 300U) == MKA_OK,
+        "the third incarnation is admitted, not refused");
+    CHECK(wm_Participant_PeerCount(&A) == (size_t)MKA_MAX_PEERS_PER_SCI + 1U,
+        "still within the per-device allowance, plus the unrelated device");
+    CHECK(wm_Participant_LivePeerCount(&A) == 1U,
+        "and the incarnation that did prove liveness was not the one dropped");
+}
+
+/* The refusal still stands when there is nothing safe to reclaim. Admission
+ * happens before the newcomer has proved anything, so an entry that once went
+ * live must not be displaceable - otherwise a member asserting another member's
+ * SCI could evict it. Two live members re-asserting one SCI is the reachable
+ * way to fill an SCI's allowance entirely with entries that have that
+ * standing. */
+static void test_no_eviction_displaces_a_proven_peer(void)
+{
+    static const uint8_t sci_x[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0x91, 0, 1};
+    static const uint8_t sci_y[MKA_SCI_LEN] = {0, 0, 0, 0, 0, 0x92, 0, 1};
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    uint8_t f[512];
+    size_t n;
+
+    printf("an entry that proved liveness is never evicted:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    wm_Participant_Run(&A, 0U, NULL);
+
+    n = craft_live_member(f, sizeof f, &A, sci_x, 0xE1);
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "MI1 on SCI X");
+    n = craft_live_member(f, sizeof f, &A, sci_y, 0xE2);
+    CHECK(wm_Participant_Receive(&A, f, n, 100U) == MKA_OK, "MI2 on SCI Y");
+    CHECK(wm_Participant_LivePeerCount(&A) == 2U, "both proved liveness");
+
+    /* MI2 now claims SCI X. It is already live, so the stale-MI retirement -
+     * which only runs on the transition into liveness - does not fire, and both
+     * entries end up on SCI X having each proved liveness. */
+    n = craft_live_member_mn(f, sizeof f, &A, sci_x, 0xE2, 2U);
+    CHECK(wm_Participant_Receive(&A, f, n, 200U) == MKA_OK,
+        "MI2 re-asserts SCI X");
+    CHECK(wm_Participant_PeerCount(&A) == 2U, "still two entries");
+
+    /* A third Member Identifier on SCI X now has nothing it may reclaim. */
+    n = craft_potential_member(f, sizeof f, &A, sci_x, 0xE3);
+    CHECK(wm_Participant_Receive(&A, f, n, 300U) == MKA_ERR_FULL,
+        "so the newcomer is refused rather than displacing either");
+    CHECK(wm_Participant_LivePeerCount(&A) == 2U, "both survive");
+}
+
+/* The Lowest Acceptable PN is what a peer uses to advance its replay window, so
+ * each installed key must carry its own real number - not a hard-coded 1, which
+ * would tell the peer to accept everything (skoll L: LPN hard-coded for the Old
+ * key and in NO_DELAY_PROTECT builds). */
+static void test_sak_use_lpn_per_key(void)
+{
+    Wire tx;
+    Secy s;
+    MkaParticipant A;
+    MkaParticipantConfig ca;
+    MkaPdu out;
+    uint8_t f[512];
+    size_t n = sizeof f;
+
+    printf("SAK Use carries a real LPN for each key:\n");
+    memset(&tx, 0, sizeof tx);
+    memset(&s, 0, sizeof s);
+    cfg_part(&ca, &s, &tx, send_a, 0x0A, 10);
+    /* Per-AN packet numbers, so Latest and Old must differ. */
+    ca.secy.get_next_pn = secy_get_pn_byan;
+    CHECK(wm_Participant_Init(&A, &ca) == MKA_OK, "init A");
+    A.is_key_server = 1;
+    A.elected = 1;
+
+    /* Two keys installed: a Latest and an Old, on different ANs. */
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "first SAK");
+    CHECK(wm_Participant_Rekey(&A) == MKA_OK, "rekey, so an Old key exists");
+    CHECK(A.old.valid, "the Old key is installed");
+    CHECK(A.latest.an != A.old.an, "on a different Association Number");
+
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&A, f, sizeof f, &n) == MKA_OK, "build");
+    memset(&out, 0, sizeof out);
+    CHECK(wm_Pdu_Decode(g_cmac, f, n, A.keys.ick, A.keys.ick_len, &out) ==
+              MKA_OK,
+        "decode");
+    CHECK(out.sak_use.present, "SAK Use emitted");
+    CHECK(out.sak_use.latest_lpn != 1U,
+        "the Latest key's LPN comes from the SecY");
+    CHECK(out.sak_use.old_lpn != 1U, "and so does the Old key's");
+    CHECK(out.sak_use.latest_lpn != out.sak_use.old_lpn,
+        "each key reports its own packet number");
+
+    /* If the SecY cannot answer, both keys fall back to 1 rather than to a
+     * stale or uninitialised number. */
+    A.cfg.secy.get_next_pn = secy_get_pn_fail;
+    n = sizeof f;
+    CHECK(wm_Participant_BuildMkpdu(&A, f, sizeof f, &n) == MKA_OK,
+        "build with a failing PN query");
+    memset(&out, 0, sizeof out);
+    CHECK(wm_Pdu_Decode(g_cmac, f, n, A.keys.ick, A.keys.ick_len, &out) ==
+              MKA_OK,
+        "decode");
+    CHECK(out.sak_use.latest_lpn == 1U, "the Latest key falls back to 1");
+    CHECK(out.sak_use.old_lpn == 1U, "and so does the Old key");
+}
+
 void run_kay_tests(void)
 {
     printf("\n== kay ==\n");
@@ -5033,11 +7186,18 @@ void run_kay_tests(void)
     test_kay_negative();
     test_kay_ckn_mismatch();
     test_peer_table_full();
+    test_peer_entries_capped_per_sci();
+    test_double_reset_is_not_locked_out();
+    test_no_eviction_displaces_a_proven_peer();
+    test_sak_use_lpn_per_key();
     test_kay_plain_dist_sak();
     test_kay_dist_sak_bad_len();
     test_dist_sak_only_from_key_server();
     test_kay_dist_sak_bad_offset();
 #ifndef WOLFMKA_NO_XPN
+    test_an_wraps_across_four_rekeys();
+    test_pn_hook_read_once_per_key();
+    test_xpn_ssci_stale_after_departure();
     test_xpn_ssci_membership_change();
     #ifndef WOLFMKA_NO_DELAY_PROTECT
     test_xpn_delay_protect_lpn64();
@@ -5045,6 +7205,8 @@ void run_kay_tests(void)
 #endif
     test_kay_introspection();
     test_kay_events();
+    test_key_server_lost_event();
+    test_status_peer_sci_is_first_match();
     test_kay_event_ks_change();
     test_kay_cb_failures();
     test_kay_drop_no_sak();
@@ -5078,15 +7240,36 @@ void run_kay_tests(void)
     test_automotive_defaults();
     test_immediate_response();
     test_automotive_fast_startup();
+    test_key_server_restart_reuses_kn();
+    test_incapable_ks_does_not_deadlock();
+    test_rx_claim_waits_for_async_install();
+    test_an_allocation_skips_old_key();
     test_peer_reset_new_mi();
     test_mn_recency_window();
     test_macsec_statistics();
     test_pae_status();
     test_kay_quiesce_others();
     test_rekey_on_lost_sak_use();
+    test_member_clears_stale_sak_use();
+#ifndef WOLFMKA_NO_AUTO_REKEY
+    test_manual_rekey_restarts_the_auto_interval();
+#endif
+    test_duplicate_mi_in_peer_list_takes_the_first();
+    test_rekey_on_last_peer_departure();
+    test_sak_use_requires_liveness();
+#ifndef WOLFMKA_NO_DELAY_PROTECT
+    test_delay_protect_targets_reported_key();
+#endif
+    test_failed_send_keeps_new_info();
+    test_liveness_downgrade_rekeys();
+    test_fixed_ks_respects_macsec_desired();
+    test_dist_sak_cipher_suite_validated();
+    test_pending_sak_not_demoted();
+    test_sak_use_names_the_key_server();
     test_distribute_before_install();
     test_deferred_install_send_failure();
     test_profile_rekey_is_single();
+    test_shrinking_sak_leaves_no_tail();
 #ifdef WOLFMKA_AUTOMOTIVE_PROFILE
     test_ks_priority_extremes();
 #endif
@@ -5105,6 +7288,10 @@ void run_kay_tests(void)
 #endif
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
     test_cipher_negotiation();
+    test_cipher_announcement_is_sticky();
+    test_empty_announce_keeps_constraint();
+    test_late_join_capability_mismatch();
+    test_late_join_offset_only_reduction();
     test_capability_negotiation();
     test_negotiation_edge_cases();
     test_negotiation_select_extremes();

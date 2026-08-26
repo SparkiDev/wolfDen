@@ -63,6 +63,10 @@ int main(void)
     static const uint8_t m32[4] = {0xFF, 0xFF, 0xFF, 0xFF};
     static const uint8_t v48[6] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
     static const uint8_t m48[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    static const uint8_t v64[8] = {0x00, 0x80, 0xC2, 0x00, 0x01, 0x00, 0x00,
+        0x01};
+    static const uint8_t m64[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF};
 
 #ifdef WOLFMKA_BIG_ENDIAN
     printf("byte order: BIG-endian (native-memcpy write path)\n");
@@ -91,10 +95,18 @@ int main(void)
     w_be48(b, (uint64_t)0xFFFFFFFFFFFFULL);
     check(eq(b, m48, 6), "w_be48(0xFFFFFFFFFFFF)");
 
+    /* 64-bit writer. The vector is the GCM-AES-128 cipher-suite reference
+     * number, which is what this pair actually carries on the wire. */
+    w_be64(b, (uint64_t)0x0080C20001000001ULL);
+    check(eq(b, v64, 8), "w_be64(GCM-AES-128)");
+    w_be64(b, (uint64_t)0xFFFFFFFFFFFFFFFFULL);
+    check(eq(b, m64, 8), "w_be64(0xFFFFFFFFFFFFFFFF)");
+
     /* Readers and round-trips. */
     check(rd_be16(v16) == 0x1234U, "rd_be16");
     check(rd_be32(v32) == 0x12345678U, "rd_be32");
     check(rd_be48(v48) == (uint64_t)0x123456789ABCULL, "rd_be48");
+    check(rd_be64(v64) == (uint64_t)0x0080C20001000001ULL, "rd_be64");
 
     w_be16(b, (uint16_t)0xBEEFU);
     check(rd_be16(b) == 0xBEEFU, "w_be16/rd_be16 round-trip");
@@ -103,6 +115,9 @@ int main(void)
     w_be48(b, (uint64_t)0xCAFEF00DBA5EULL);
     check(rd_be48(b) == (uint64_t)0xCAFEF00DBA5EULL,
         "w_be48/rd_be48 round-trip");
+    w_be64(b, (uint64_t)0x0080C20001000004ULL);
+    check(rd_be64(b) == (uint64_t)0x0080C20001000004ULL,
+        "w_be64/rd_be64 round-trip");
 
     printf("%s\n", (g_fail == 0) ? "endian: PASS" : "endian: FAIL");
     return (g_fail == 0) ? 0 : 1;

@@ -610,6 +610,21 @@ static void test_pdu_decode_negative(void)
     CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
         "decode frame with non-cipher-suites TLV");
     CHECK(!out.announce.present, "non-cipher-suites announcement TLV skipped");
+
+    /* Announcement: a cipher-suites TLV too short to hold even one entry
+     * carries no constraint, so it must not be reported as present. Marking it
+     * present would make the KaY clear whatever the peer previously announced
+     * and treat the empty set as "accepts any cipher suite". */
+    out_len = sizeof buf;
+    wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len);
+    buf[48] = 0xE0;
+    buf[49] = 0x04; /* type 112, length 4 - short of the 10-octet entry */
+    memset(&buf[50], 0, 10U);
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "decode frame with a short cipher-suites TLV");
+    CHECK(!out.announce.present,
+        "a TLV too short for one entry announces nothing");
 #endif /* WOLFMKA_NO_ANNOUNCEMENTS */
 }
 
@@ -665,6 +680,8 @@ static void test_pdu_malformed(void)
         "decode null ick");
     CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, NULL) == MKA_ERR_BAD_ARG,
         "decode null pdu");
+    CHECK(wm_Pdu_Decode(NULL, buf, out_len, ick, 16, &out) == MKA_ERR_BAD_ARG,
+        "decode null cmac");
     CHECK(wm_Pdu_PeekBasic(NULL, out_len, &basic) == MKA_ERR_BAD_ARG,
         "peek null in");
     CHECK(wm_Pdu_PeekBasic(buf, out_len, NULL) == MKA_ERR_BAD_ARG,
@@ -706,6 +723,107 @@ static void test_pdu_more_negative(void)
     CHECK(out.sak_use.present, "no-key SAK Use present");
     CHECK(!MKA_SAK_USE_IS_LATEST_TX(&out.sak_use),
         "no-key SAK Use clears latest tx");
+
+    /* The converse shape, which no wolfMKA encoder produces: a SAK Use set
+     * whose key-in-use flags are set but whose body is absent. The Key Server
+     * MI, Key Number and Lowest Acceptable PN that would identify the key were
+     * never on the wire, so the flags cannot be honoured - decode has to agree
+     * with encode that "no body" means "no key in use". Built by encoding a
+     * 40-octet body and then cutting it out, so the frame is well formed and
+     * authenticated: this is a semantic case, not a bounds case. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.sak_use.present = 1;
+    in.sak_use.key_flags = MKA_SAK_USE_LATEST_TX;
+    in.sak_use.latest_kn = 7U;
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode SAK Use with a key in use");
+    /* The Basic Parameter Set is 40 octets, so the SAK Use header follows the
+     * 4-octet EAPOL header at offset 44 and its body at 48. */
+    CHECK(buf[44] == (uint8_t)MKA_PS_SAK_USE, "SAK Use set located");
+    CHECK(((size_t)(buf[46] & 0x0FU) << 8U) + buf[47] == 40U,
+        "and carries the 40-octet body");
+    CHECK((buf[45] & MKA_SAK_USE_KEY_MASK) == MKA_SAK_USE_LATEST_TX,
+        "with Latest Tx asserted");
+    buf[46] = (uint8_t)(buf[46] & 0xF0U); /* body length 40 -> 0 */
+    buf[47] = 0U;
+    memmove(&buf[48], &buf[88], out_len - 88U); /* drop the body */
+    out_len -= 40U;
+    {
+        size_t body = out_len - EAPOL_HDR_LEN;
+        buf[2] = (uint8_t)(body >> 8U);
+        buf[3] = (uint8_t)(body & 0xFFU);
+    }
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "a body-less SAK Use with flags set still decodes");
+    CHECK(out.sak_use.present, "the set is present");
+    CHECK(out.sak_use.key_flags == 0U,
+        "but no key is reported in use, matching the absent body");
+    CHECK(!MKA_SAK_USE_IS_LATEST_TX(&out.sak_use), "so Latest Tx is not set");
+    CHECK((out.sak_use.latest_an == 0U) && (out.sak_use.old_an == 0U),
+        "and neither is an Association Number the set never named");
+
+    /* At most one parameter set of each type per MKPDU (11.11). Every decoder
+     * here assigns rather than merges, so a second set of a type would
+     * overwrite the first - letting an authenticated member hide a Live Peer
+     * List proving our liveness behind a later, unrelated one. Splice a copy of
+     * the Live Peer List in and reseal, so the frame is well formed and passes
+     * the ICV: this has to be rejected on the duplicate alone. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memset(in.live_peers.peers[0].mi, 0x51, 12);
+    in.live_peers.peers[0].mn = 3U;
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode a one-peer Live Peer List");
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "which decodes on its own");
+    /* The Basic Parameter Set is 40 octets, so the peer list sits at offset 44
+     * and spans a 4-octet header plus one 16-octet entry. */
+    CHECK(buf[44] == (uint8_t)MKA_PS_LIVE_PEER_LIST, "peer list located");
+    ins = 44U + 20U;
+    memmove(&buf[ins + 20U], &buf[ins], out_len - ins);
+    memmove(&buf[ins], &buf[44], 20U); /* the duplicate */
+    out_len += 20U;
+    {
+        size_t body = out_len - EAPOL_HDR_LEN;
+        buf[2] = (uint8_t)(body >> 8U);
+        buf[3] = (uint8_t)(body & 0xFFU);
+    }
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_ERR_PARSE,
+        "a duplicated parameter set is rejected");
+
+    /* A parameter set this decoder does not know is skipped without touching
+     * the MkaPdu, so repeating one clobbers nothing and stays acceptable - the
+     * forward-compatibility rule the duplicate check must not break. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode a bare frame");
+    ins = 44U; /* immediately before the ICV Indicator */
+    memmove(&buf[ins + 8U], &buf[ins], out_len - ins);
+    memset(&buf[ins], 0, 8U);
+    buf[ins] = 20U;      /* an unknown parameter-set type, body length 0 */
+    buf[ins + 4U] = 20U; /* and a second copy of it */
+    out_len += 8U;
+    {
+        size_t body = out_len - EAPOL_HDR_LEN;
+        buf[2] = (uint8_t)(body >> 8U);
+        buf[3] = (uint8_t)(body & 0xFFU);
+    }
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "two unknown parameter sets of the same type are skipped, not "
+        "rejected");
 
     /* Output buffer one short word smaller than needed: everything fits up to
      * the ICV, whose append then overflows -> MKA_ERR_BUFFER. */
@@ -865,9 +983,68 @@ static void test_pdu_invalid_params(void)
     CHECK(wm_Pdu_Encode(g_cmac, NULL, ick, 16, buf, sizeof buf, &n) ==
               MKA_ERR_BAD_ARG,
         "encode pdu NULL");
+    /* Rejected before anything is written, rather than after the whole frame
+     * has been laid into the caller's buffer. */
+    memset(buf, 0xE7, sizeof buf);
+    CHECK(wm_Pdu_Encode(NULL, &in, ick, 16, buf, sizeof buf, &n) ==
+              MKA_ERR_BAD_ARG,
+        "encode cmac NULL");
+    CHECK(buf[0] == 0xE7U, "and the output buffer is untouched");
     CHECK(wm_Pdu_Encode(g_cmac, &in, NULL, 16, buf, sizeof buf, &n) ==
               MKA_ERR_BAD_ARG,
         "encode ick NULL");
+
+    /* Encode sizes the frame once and then writes without per-field bounds
+     * checks, so a length larger than the array behind it would be reported in
+     * the size - passing the capacity check - and then over-read the caller's
+     * MkaPdu. Every length field is checked up front instead. */
+    {
+        MkaPdu bad;
+        size_t m;
+
+#define CHECK_LEN_REJECTED(field, value, msg)                                  \
+    do {                                                                       \
+        memset(&bad, 0, sizeof bad);                                           \
+        fill_basic(&bad.basic);                                                \
+        (field) = (value);                                                     \
+        CHECK(wm_Pdu_EncodedSize(&bad) == 0U, msg " sized as zero");           \
+        m = sizeof buf;                                                        \
+        CHECK(wm_Pdu_Encode(g_cmac, &bad, ick, 16, buf, sizeof buf, &m) ==     \
+                  MKA_ERR_BAD_ARG,                                             \
+            msg);                                                              \
+    } while (0)
+
+        /* The in-range baseline, so the checks below are the only difference.
+         */
+        memset(&bad, 0, sizeof bad);
+        fill_basic(&bad.basic);
+        CHECK(wm_Pdu_EncodedSize(&bad) != 0U, "an in-range PDU still sizes");
+
+        CHECK_LEN_REJECTED(bad.basic.ckn_len, sizeof bad.basic.ckn + 1U,
+            "an over-long CKN is rejected");
+        CHECK_LEN_REJECTED(bad.live_peers.count, (size_t)MKA_MAX_PEERS + 1U,
+            "an over-long Live Peer List is rejected");
+        CHECK_LEN_REJECTED(bad.potential_peers.count,
+            (size_t)MKA_MAX_PEERS + 1U,
+            "an over-long Potential Peer List is rejected");
+        CHECK_LEN_REJECTED(bad.dist_sak.wrapped_len,
+            sizeof bad.dist_sak.wrapped_sak + 1U,
+            "an over-long wrapped SAK is rejected");
+#ifdef WOLFMKA_DISTRIBUTED_CAK
+        CHECK_LEN_REJECTED(bad.dist_cak.body_len, sizeof bad.dist_cak.body + 1U,
+            "an over-long Distributed CAK body is rejected");
+#endif
+#ifdef WOLFMKA_KMD
+        CHECK_LEN_REJECTED(bad.kmd.kmd_len, sizeof bad.kmd.kmd + 1U,
+            "an over-long KMD is rejected");
+#endif
+#ifndef WOLFMKA_NO_ANNOUNCEMENTS
+        CHECK_LEN_REJECTED(bad.announce.count,
+            (size_t)MKA_MAX_CIPHER_SUITES + 1U,
+            "an over-long announcement is rejected");
+#endif
+#undef CHECK_LEN_REJECTED
+    }
     CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, NULL, sizeof buf, &n) ==
               MKA_ERR_BAD_ARG,
         "encode out NULL");
@@ -1188,7 +1365,178 @@ static void test_announce_suite_cap(void)
     CHECK(out.announce.count == (size_t)MKA_MAX_CIPHER_SUITES,
         "cipher-suite list clamped to MKA_MAX_CIPHER_SUITES");
 }
+
+/* The other end of the same field: a cipher-suites TLV too short to hold even
+ * one entry, and two of them in one announcement. Both parse cleanly and are
+ * about what the result *means*, so the bounds tests do not reach them and
+ * neither does structural coverage. */
+static void test_announce_semantic_negative(void)
+{
+    uint8_t ick[16], buf[256];
+    size_t out_len;
+    MkaPdu in, out;
+    uint16_t ebody;
+    size_t i;
+
+    printf("announcement semantic edge cases:\n");
+    memset(ick, 0x38, sizeof ick);
+
+    /* A one-suite announcement to cut down. Layout: EAPOL hdr 0..3, basic
+     * 4..43, announcement set 44..59 (4 header + 2 TLV header + 10 entry, then
+     * padding), ICV indicator at 60, ICV at 64. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.announce.present = 1;
+    in.announce.count = 1;
+    in.announce.suites[0].cipher_suite = MKA_CIPHER_GCM_AES_256;
+    in.announce.suites[0].capability = MKA_CAP_INTEGRITY_CONF;
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode a one-suite announcement");
+    CHECK(out_len == 80U, "one-suite frame layout as expected");
+    CHECK(buf[44] == (uint8_t)MKA_PS_ANNOUNCEMENT, "announcement located");
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "which decodes on its own");
+    CHECK(out.announce.present && (out.announce.count == 1U),
+        "carrying its one suite");
+
+    /* Case 1: the TLV declares a zero-length value. A cipher-suites TLV with no
+     * entries states no constraint, and marking the announcement present would
+     * be read by the KaY as "this peer accepts anything" - erasing whatever the
+     * peer last announced. It must decode to absent, not to an empty set. */
+    {
+        uint8_t f[256];
+        size_t n;
+
+        memcpy(f, buf, out_len);
+        n = out_len;
+        f[48] = 0xE0;
+        f[49] = 0x00; /* TLV type 112, value length 0 */
+        f[46] = 0x00;
+        f[47] = MKA_ANN_TLV_HDR_LEN;      /* set body: the TLV header alone */
+        memmove(&f[52], &f[60], n - 60U); /* drop the entry, keep 4-alignment */
+        f[50] = 0x00;
+        f[51] = 0x00;
+        n -= 8U;
+        ebody = (uint16_t)(n - EAPOL_HDR_LEN);
+        f[2] = (uint8_t)(ebody >> 8);
+        f[3] = (uint8_t)ebody;
+        reseal(f, n, ick);
+        CHECK(wm_Pdu_Decode(g_cmac, f, n, ick, 16, &out) == MKA_OK,
+            "an empty cipher-suites TLV still parses");
+        CHECK(!out.announce.present,
+            "but announces nothing, rather than an empty (unconstrained) set");
+        CHECK(out.announce.count == 0U, "and carries no suites");
+    }
+
+    /* Case 2: two cipher-suites TLVs in one announcement. The walk assigns
+     * rather than merges, so the second would replace the first - a constraint
+     * stated and then buried under a permissive copy, one nesting level below
+     * the duplicate parameter set. Rejected on the same grounds. */
+    {
+        uint8_t f[256];
+        size_t n;
+
+        memcpy(f, buf, out_len);
+        n = out_len;
+        memmove(&f[72], &f[60], n - 60U); /* room for a second 12-octet TLV */
+        memcpy(&f[60], &f[48], 12U);      /* the duplicate */
+        for (i = 0U; i < 8U; i++) {
+            f[62U + 2U + i] = 0x00U; /* a different, permissive suite */
+        }
+        f[46] = 0x00;
+        f[47] = (uint8_t)(2U * (MKA_ANN_TLV_HDR_LEN + MKA_CS_TLV_ENTRY_LEN));
+        n += 12U;
+        ebody = (uint16_t)(n - EAPOL_HDR_LEN);
+        f[2] = (uint8_t)(ebody >> 8);
+        f[3] = (uint8_t)ebody;
+        reseal(f, n, ick);
+        CHECK(wm_Pdu_Decode(g_cmac, f, n, ick, 16, &out) == MKA_ERR_PARSE,
+            "a second cipher-suites TLV is rejected");
+    }
+}
 #endif /* WOLFMKA_NO_ANNOUNCEMENTS */
+
+/* Two more shapes that parse but mean something the bounds tests do not check:
+ * an XPN set longer than this revision defines, and a peer list that is present
+ * but empty. Both are about the decoded meaning, not about staying in bounds.
+ */
+static void test_decode_forward_compatible_shapes(void)
+{
+    uint8_t ick[16], buf[256];
+    size_t out_len;
+    MkaPdu in, out;
+    uint16_t ebody;
+
+    printf("forward-compatible decoder shapes:\n");
+    memset(ick, 0x39, sizeof ick);
+
+#ifndef WOLFMKA_NO_XPN
+    /* A future revision may extend the XPN parameter set. Trailing octets past
+     * the fields this one knows must be ignored rather than rejected, or a
+     * newer peer becomes undecodable; the fields that are defined must still
+     * decode. Neither direction was pinned. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.xpn.present = 1;
+    in.xpn.latest_lpn_msb = 0xAABBCCDDU;
+    in.xpn.old_lpn_msb = 0x11223344U;
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode an XPN set");
+    /* Layout: EAPOL hdr 0..3, basic 4..43, XPN set 44..55 (4 header + 8 body),
+     * ICV indicator at 56. Widen the body to 12 with four trailing octets. */
+    CHECK(buf[44] == (uint8_t)MKA_PS_XPN, "XPN set located");
+    CHECK(buf[47] == (uint8_t)MKA_XPN_BODY_LEN, "with the defined body length");
+    memmove(&buf[60], &buf[56], out_len - 56U);
+    buf[56] = 0xDE;
+    buf[57] = 0xAD;
+    buf[58] = 0xBE;
+    buf[59] = 0xEF;
+    buf[47] = (uint8_t)(MKA_XPN_BODY_LEN + 4U);
+    out_len += 4U;
+    ebody = (uint16_t)(out_len - EAPOL_HDR_LEN);
+    buf[2] = (uint8_t)(ebody >> 8);
+    buf[3] = (uint8_t)ebody;
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "an over-long XPN set is accepted, not rejected");
+    CHECK(out.xpn.present, "and marked present");
+    CHECK(out.xpn.latest_lpn_msb == 0xAABBCCDDU, "the Latest MSBs decode");
+    CHECK(out.xpn.old_lpn_msb == 0x11223344U, "and so do the Old ones");
+#endif /* WOLFMKA_NO_XPN */
+
+    /* A Live Peer List that is present but names nobody. This is a real
+     * statement - "I currently see no live peer" - not a malformed set, so it
+     * has to decode as present with a count of zero rather than be rejected or
+     * silently read as absent. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.live_peers.present = 1;
+    in.live_peers.count = 1;
+    memset(in.live_peers.peers[0].mi, 0x77, MKA_MI_LEN);
+    out_len = sizeof buf;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, 16, buf, sizeof buf, &out_len) ==
+              MKA_OK,
+        "encode a one-peer Live Peer List");
+    /* Peer list at 44: 4-octet header plus one 16-octet entry. Cut the entry
+     * out, leaving a header declaring a zero-length body. */
+    CHECK(buf[44] == (uint8_t)MKA_PS_LIVE_PEER_LIST, "peer list located");
+    buf[46] = 0x00;
+    buf[47] = 0x00;
+    memmove(&buf[48], &buf[64], out_len - 64U);
+    out_len -= 16U;
+    ebody = (uint16_t)(out_len - EAPOL_HDR_LEN);
+    buf[2] = (uint8_t)(ebody >> 8);
+    buf[3] = (uint8_t)ebody;
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, 16, &out) == MKA_OK,
+        "an empty Live Peer List parses");
+    CHECK(out.live_peers.present, "and is present - the peer said something");
+    CHECK(out.live_peers.count == 0U, "namely that it sees no live peer");
+}
 
 #ifdef WOLFMKA_DISTRIBUTED_CAK
 /* Distributed CAK (parameter set type 5): the opaque body (wrapped CAK || CKN)
@@ -1316,6 +1664,194 @@ static void test_kmd(void)
 }
 #endif /* WOLFMKA_KMD */
 
+/* The ICV is the last 16 octets of the MKPDU *body*. Measuring the frame
+ * instead admits declared body lengths of 12..15, for which the authenticated
+ * region shrinks to nothing and the "received ICV" starts inside the EAPOL
+ * header (skoll M: ICV-length guard off by EAPOL_HDR_LEN). */
+static void test_pdu_short_body_rejected(void)
+{
+    uint8_t ick[16];
+    uint8_t frm[32];
+    MkaPdu out;
+    MkaBasicParamSet basic;
+    size_t body;
+
+    printf("body too short to hold an ICV is rejected:\n");
+    memset(ick, 0x66, sizeof ick);
+
+    for (body = 12U; body < MKA_DEFAULT_ICV_LEN; body++) {
+        memset(frm, 0xA5, sizeof frm);
+        frm[0] = (uint8_t)EAPOL_VERSION_2010;
+        frm[1] = (uint8_t)EAPOL_TYPE_MKA;
+        frm[2] = 0U;
+        frm[3] = (uint8_t)body;
+        CHECK(wm_Pdu_Decode(g_cmac, frm, EAPOL_HDR_LEN + body, ick, sizeof ick,
+                  &out) == MKA_ERR_PARSE,
+            "short body rejected on decode");
+        CHECK(wm_Pdu_PeekBasic(frm, EAPOL_HDR_LEN + body, &basic) ==
+                  MKA_ERR_PARSE,
+            "short body rejected on peek");
+    }
+
+    /* Bodies long enough to hold the ICV but leaving less than a parameter-set
+     * header for the mandatory Basic set. The peek reaches this without
+     * verifying an ICV, so the case holds however the ICV is computed. */
+    for (body = MKA_DEFAULT_ICV_LEN;
+        body < (MKA_DEFAULT_ICV_LEN + MKA_PARAM_HDR_LEN); body++) {
+        memset(frm, 0xA5, sizeof frm);
+        frm[0] = (uint8_t)EAPOL_VERSION_2010;
+        frm[1] = (uint8_t)EAPOL_TYPE_MKA;
+        frm[2] = 0U;
+        frm[3] = (uint8_t)body;
+        CHECK(wm_Pdu_PeekBasic(frm, EAPOL_HDR_LEN + body, &basic) ==
+                  MKA_ERR_PARSE,
+            "no room for a Basic set is rejected on peek");
+    }
+}
+
+/* A parameter set must not be allowed to reach into the trailing ICV: those
+ * octets are not payload, and a set declared long enough to swallow them would
+ * be handed to a parameter-set decoder as if they were (skoll M: walk bounded
+ * against the whole body). */
+static void test_pdu_set_cannot_eat_icv(void)
+{
+    uint8_t ick[16], buf[256];
+    size_t out_len = sizeof(buf);
+    MkaPdu in, out;
+
+    printf("a parameter set cannot consume the ICV:\n");
+    memset(ick, 0x66, sizeof ick);
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, sizeof(ick), buf, sizeof(buf),
+              &out_len) == MKA_OK,
+        "encode a Basic-only frame");
+    /* EAPOL(4) + Basic(40) + ICV Indicator(4) + ICV(16); the body is 60, so the
+     * ICV starts at body offset 44. */
+    CHECK(out_len == 64U, "frame is the expected length");
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) == MKA_OK,
+        "it decodes before tampering");
+
+    /* Replace the ICV Indicator with a set declaring a 16-octet body: that is
+     * exactly the ICV region. */
+    buf[44] = 6U; /* an unknown/optional type */
+    buf[45] = 0U;
+    buf[46] = 0U;
+    buf[47] = (uint8_t)MKA_DEFAULT_ICV_LEN;
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) ==
+              MKA_ERR_PARSE,
+        "a set overlapping the ICV is rejected");
+
+    /* A body that is nothing but the ICV leaves no room for the mandatory
+     * Basic set at all.
+     *
+     * Not meaningful with WOLFMKA_ICV_L2_ADDR: there the ICV also covers an L2
+     * prefix taken from the sender SCI at frame offset 8, which for a body this
+     * short lies inside the ICV itself - sealing the frame rewrites the very
+     * octets the prefix is derived from, so the check would fail on the seal
+     * rather than on the missing Basic set. */
+#ifndef WOLFMKA_ICV_L2_ADDR
+    {
+        uint8_t tiny[EAPOL_HDR_LEN + MKA_DEFAULT_ICV_LEN];
+        memset(tiny, 0, sizeof tiny);
+        tiny[0] = (uint8_t)EAPOL_VERSION_2010;
+        tiny[1] = (uint8_t)EAPOL_TYPE_MKA;
+        tiny[2] = 0U;
+        tiny[3] = (uint8_t)MKA_DEFAULT_ICV_LEN;
+        test_seal_icv(g_cmac, ick, sizeof ick, tiny, EAPOL_HDR_LEN);
+        CHECK(wm_Pdu_Decode(g_cmac, tiny, sizeof tiny, ick, sizeof ick, &out) ==
+                  MKA_ERR_PARSE,
+            "a body holding only the ICV has no Basic set");
+    }
+#endif
+
+    /* The ICV Indicator ends the walk, so a bogus one would hide every set
+     * after it. It must sit immediately before the ICV and declare the ICV's
+     * length. */
+    out_len = sizeof(buf);
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.sak_use.present = 1;
+    MKA_SAK_USE_SET_LATEST_RX(&in.sak_use);
+    in.sak_use.latest_kn = 1U;
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, sizeof(ick), buf, sizeof(buf),
+              &out_len) == MKA_OK,
+        "encode with an optional set present");
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) == MKA_OK,
+        "it decodes before tampering");
+    /* Turn the SAK Use set at body offset 40 into an ICV Indicator: it is now
+     * an indicator in the wrong place. */
+    buf[EAPOL_HDR_LEN + 40U] = (uint8_t)MKA_PS_ICV_INDICATOR;
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) ==
+              MKA_ERR_PARSE,
+        "an ICV Indicator before the ICV region is rejected");
+
+    /* And a well-formed one - type 255, declared length 16 - spliced in ahead
+     * of the real one, so only its position gives it away. Everything the
+     * splice pushes past it, the real indicator included, would go unread. */
+    out_len = sizeof(buf);
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, sizeof(ick), buf, sizeof(buf),
+              &out_len) == MKA_OK,
+        "re-encode");
+    {
+        const size_t tail = MKA_PARAM_HDR_LEN + MKA_DEFAULT_ICV_LEN;
+        size_t new_len = out_len + tail;
+
+        CHECK(new_len <= sizeof buf, "room to splice");
+        memmove(&buf[out_len], &buf[out_len - tail], tail);
+        buf[out_len - tail] = (uint8_t)MKA_PS_ICV_INDICATOR;
+        buf[out_len - tail + 1U] = 0U;
+        buf[out_len - tail + 2U] = 0U;
+        buf[out_len - tail + 3U] = (uint8_t)MKA_DEFAULT_ICV_LEN;
+        memset(&buf[out_len - tail + MKA_PARAM_HDR_LEN], 0xA5,
+            MKA_DEFAULT_ICV_LEN);
+        buf[2] = (uint8_t)((new_len - EAPOL_HDR_LEN) >> 8);
+        buf[3] = (uint8_t)(new_len - EAPOL_HDR_LEN);
+        reseal(buf, new_len, ick);
+        CHECK(wm_Pdu_Decode(g_cmac, buf, new_len, ick, sizeof ick, &out) ==
+                  MKA_ERR_PARSE,
+            "an early ICV Indicator is rejected on position alone");
+    }
+
+    /* And one in the right place but declaring the wrong length. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    in.sak_use.present = 1;
+    MKA_SAK_USE_SET_LATEST_RX(&in.sak_use);
+    in.sak_use.latest_kn = 1U;
+    out_len = sizeof(buf);
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, sizeof(ick), buf, sizeof(buf),
+              &out_len) == MKA_OK,
+        "re-encode");
+    buf[out_len - MKA_DEFAULT_ICV_LEN - 1U] = 8U; /* declared body 8, not 16 */
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) ==
+              MKA_ERR_PARSE,
+        "an ICV Indicator with the wrong length is rejected");
+
+    /* The mandatory Basic set is bounded the same way: a declared length that
+     * reaches into the ICV would otherwise be read as CKN octets. Back to a
+     * basic-only frame, so the widened set really does reach the ICV. */
+    memset(&in, 0, sizeof in);
+    fill_basic(&in.basic);
+    out_len = sizeof(buf);
+    CHECK(wm_Pdu_Encode(g_cmac, &in, ick, sizeof(ick), buf, sizeof(buf),
+              &out_len) == MKA_OK,
+        "re-encode");
+    /* Basic set header is body[0..3]; widen its declared body from 34 to 50,
+     * which pushes the set to 56 octets against a 44-octet pre-ICV region. */
+    buf[EAPOL_HDR_LEN + 2U] &= 0xF0U;
+    buf[EAPOL_HDR_LEN + 3U] = 50U;
+    reseal(buf, out_len, ick);
+    CHECK(wm_Pdu_Decode(g_cmac, buf, out_len, ick, sizeof ick, &out) ==
+              MKA_ERR_PARSE,
+        "a Basic set overlapping the ICV is rejected");
+}
+
 void run_pdu_tests(void)
 {
     printf("\n== pdu ==\n");
@@ -1337,11 +1873,15 @@ void run_pdu_tests(void)
     test_pdu_branch_combos();
 #ifndef WOLFMKA_NO_ANNOUNCEMENTS
     test_announce_suite_cap();
+    test_announce_semantic_negative();
 #endif
+    test_decode_forward_compatible_shapes();
 #ifdef WOLFMKA_DISTRIBUTED_CAK
     test_dist_cak();
 #endif
 #ifdef WOLFMKA_KMD
     test_kmd();
 #endif
+    test_pdu_short_body_rejected();
+    test_pdu_set_cannot_eat_icv();
 }

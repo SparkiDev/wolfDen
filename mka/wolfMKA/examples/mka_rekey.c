@@ -159,6 +159,7 @@ int main(void)
     MkaParticipantConfig ca, cb;
     MkaParticipant* ks;
     MkaCmacCtx* cmac;
+    MkaRandom* rng;
     int tick;
     int rc;
 
@@ -173,6 +174,13 @@ int main(void)
         printf("cmac init failed\n");
         return 1;
     }
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        fprintf(stderr, "could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     memset(&ca, 0, sizeof(ca));
     memset(ca.cak.cak, 0xCA, 16);
@@ -180,6 +188,7 @@ int main(void)
     memcpy(ca.cak.ckn, "rekey-connectivity-association", 30);
     ca.cak.ckn_len = 30;
     ca.cmac = cmac;
+    ca.rng = rng;
     cb = ca;
 
     {
@@ -213,6 +222,7 @@ int main(void)
     if (wm_Participant_Init(&A, &ca) != MKA_OK ||
         wm_Participant_Init(&B, &cb) != MKA_OK) {
         printf("init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -226,6 +236,7 @@ int main(void)
         printf("Result     : FAILURE - initial SAK not established\n");
         wm_Participant_Free(&A);
         wm_Participant_Free(&B);
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -239,6 +250,7 @@ int main(void)
         printf("Result     : FAILURE - rekey request rejected\n");
         wm_Participant_Free(&A);
         wm_Participant_Free(&B);
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -262,6 +274,7 @@ int main(void)
     }
     wm_Participant_Free(&A);
     wm_Participant_Free(&B);
+    wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
     return rc;
 }

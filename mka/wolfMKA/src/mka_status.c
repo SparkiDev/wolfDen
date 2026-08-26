@@ -43,6 +43,7 @@ const char* wm_Status_String(MkaStatus status)
         case MKA_ERR_NOT_KS: s = "MKA_ERR_NOT_KS"; break;
         case MKA_ERR_INTERNAL: s = "MKA_ERR_INTERNAL"; break;
         case MKA_ERR_REPLAY: s = "MKA_ERR_REPLAY"; break;
+        case MKA_ERR_REKEY_BUSY: s = "MKA_ERR_REKEY_BUSY"; break;
         default: s = "MKA_ERR_UNKNOWN"; break;
     }
     return s;

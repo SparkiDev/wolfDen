@@ -31,7 +31,9 @@
  *
  * Time is supplied by the caller as a monotonic millisecond clock so the engine
  * has no platform dependencies. Outbound MKPDUs go through a send callback;
- * inbound frames are fed in via wm_Participant_Receive().
+ * inbound frames are fed in via wm_Participant_Receive(). The two crypto
+ * workspaces (MkaParticipantConfig::cmac and ::rng) are caller-owned and
+ * required - see mka_crypto.h.
  */
 
 #ifndef WOLFMKA_KAY_H
@@ -81,6 +83,13 @@ WOLFMKA_CIPHER_NEGOTIATION."
     /* used when delay protection is on */
     #define MKA_BOUNDED_HELLO_TIME_MS 500u
 #endif
+/* Packet-number thresholds at which the Key Server rekeys rather than let the
+ * transmit PN run out (IEEE Std 802.1X-2020, 9.8). The two must stay a factor
+ * of 2^32 apart: the 32-bit form is three quarters of a 32-bit PN space, and
+ * the XPN form is the same fraction of the 64-bit one. */
+#define MKA_PN_EXHAUSTION_THRESHOLD  0xC0000000U
+#define MKA_XPN_EXHAUSTION_THRESHOLD MKA_U64(0xC0000000U, 0x00000000U)
+
 /* Key Server priority values the OPEN Alliance profile makes absolute
  * (AutoMKA-03007): 0 always serves, 255 never does. 0 needs no special handling
  * - it is the lowest value, so the ordinary "lowest priority wins" comparison
@@ -91,6 +100,22 @@ WOLFMKA_CIPHER_NEGOTIATION."
 #define MKA_PRIORITY_ALWAYS_KS 0U
 #define MKA_PRIORITY_NEVER_KS  255U
 
+#ifndef MKA_MAX_PEERS_PER_SCI
+    /* How many peer-table entries one SCI may hold at once. Peer-reset recovery
+     * needs two - the stale incarnation and the new one, which coexist until
+     * the new Member Identifier proves liveness (OPEN Alliance AutoMKA-03006,
+     * AutoMKA-03016) - and nothing legitimate needs more. Without a cap a CA
+     * member could exhaust the whole table on its own by cycling Member
+     * Identifiers, since each new one claims a fresh entry. */
+    #define MKA_MAX_PEERS_PER_SCI 2U
+#endif
+
+#if MKA_MAX_PEERS_PER_SCI < 1U
+    #error                                                                     \
+        "MKA_MAX_PEERS_PER_SCI must be at least 1: a zero cap admits no peer \
+at all, so no CA could ever form."
+#endif
+
 #ifndef MKA_MN_RECENT_WINDOW
     /* How many of the most recently emitted Message Numbers count as
      * "acceptably recent" when a peer echoes one back to prove liveness
@@ -100,6 +125,12 @@ WOLFMKA_CIPHER_NEGOTIATION."
      * the newest emitted MN and is the strictest useful setting. */
     #define MKA_MN_RECENT_WINDOW 3U
 #endif
+
+#if MKA_MN_RECENT_WINDOW < 1U
+    #error                                                                     \
+        "MKA_MN_RECENT_WINDOW must be at least 1: a zero window accepts no \
+echoed Message Number, so no peer could ever become live."
+#endif
 #ifndef MKA_AUTOMOTIVE_RETRY_BASE_MS
     /* First step of the startup ramp wm_Participant_AutomotiveDefaults()
      * installs; it doubles from here to MKA_HELLO_TIME_MS (OPEN Alliance
@@ -107,73 +138,99 @@ WOLFMKA_CIPHER_NEGOTIATION."
     #define MKA_AUTOMOTIVE_RETRY_BASE_MS 10u
 #endif
 
-/* Scratch buffer size for an outgoing MKPDU. Override at build time if needed
- * (e.g. to fit a larger MKA_MAX_PEERS); wm_Pdu_Encode returns
- * MKA_ERR_BUFFER if the frame to encode exceeds this. */
+/* Scratch buffer size for an outgoing MKPDU.
+ *
+ * Derived from MKA_MAX_PEERS rather than fixed, because the two must agree: a
+ * membership that cannot be encoded is not a degraded transmission but no
+ * transmission at all - wm_Pdu_Encode returns MKA_ERR_BUFFER, the participant
+ * stops emitting MKPDUs, and the CA dies. The budget is both peer lists at
+ * MKA_MAX_PEERS entries of 16 octets (MI + MN) plus a fixed allowance for the
+ * Basic set, MACsec SAK Use, Distributed SAK, XPN and Announcement sets, the
+ * ICV Indicator and the ICV.
+ *
+ * Lower MKA_MAX_PEERS to shrink this: a point-to-point link needs two, which
+ * the OPEN Alliance automotive profile assumes. An explicit override is checked
+ * below rather than trusted. */
 #ifndef MKA_MKPDU_MAX_LEN
-    #define MKA_MKPDU_MAX_LEN 516U
+    #define MKA_MKPDU_MAX_LEN (256U + (2U * (4U + (MKA_MAX_PEERS * 16U))))
+#endif
+
+#if MKA_MKPDU_MAX_LEN < (128U + (2U * (4U + (MKA_MAX_PEERS * 16U))))
+    #error                                                                     \
+        "MKA_MKPDU_MAX_LEN cannot hold MKA_MAX_PEERS peers: a full membership \
+would fail to encode and the participant would stop transmitting. Raise it or \
+lower MKA_MAX_PEERS."
 #endif
 
 /* Transmit callback: hand a complete EAPOL-MKA frame to the network.
  * Returns 0 on success. */
 typedef int (*MkaSendFn)(void* ctx, const uint8_t* frame, size_t len);
 
-/* One known peer in the Connectivity Association. Fields are ordered by
+/** One known peer in the Connectivity Association. Fields are ordered by
  * descending alignment to minimise padding. */
 typedef struct {
-    /* last Message Number seen */
+    /** last Message Number seen */
     uint32_t mn;
+    /** time this member was last heard from, in the caller's milliseconds */
     uint32_t last_seen_ms;
-    /* KN this peer reports installed */
+    /** KN this peer reports installed */
     uint32_t latest_kn;
-    /* peer's reported lowest accept PN */
+    /** peer's reported lowest accept PN */
     uint32_t latest_lpn;
-    /* XPN: MSBs of that PN (11.11.6) */
+    /** XPN: MSBs of that PN (11.11.6) */
     uint32_t latest_lpn_msb;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
-    /* cipher suites this peer last announced (Announcement set); adv_count 0
+    /** cipher suites this peer last announced (Announcement set); adv_count 0
      * means the peer sent no Announcement, so it constrains no suite. */
     uint64_t adv_suites[MKA_MAX_CIPHER_SUITES];
     uint8_t adv_count;
 #endif
+    /** the peer's Member Identifier */
     uint8_t mi[MKA_MI_LEN];
+    /** the peer's Secure Channel Identifier (MAC || port) */
     uint8_t sci[MKA_SCI_LEN];
-    /* advertised Key Server priority */
+    /** advertised Key Server priority */
     uint8_t priority;
+    /** the MACsec Capability the peer advertised */
     uint8_t macsec_capability;
+    /** this table slot is in use */
     bool valid;
-    /* in our Live Peer List vs Potential */
+    /** in our Live Peer List vs Potential */
     bool live;
-    /* advertised Key Server flag */
+    /** advertised Key Server flag */
     bool key_server;
+    /** the peer advertised MACsec Desired */
     bool macsec_desired;
-    /* mn holds an accepted value yet */
+    /** mn holds an accepted value yet */
     bool mn_seen;
-    /* peer is receiving on its latest key */
+    /** peer is receiving on its latest key */
     bool sak_rx;
-    /* peer is transmitting on it */
+    /** peer is transmitting on it */
     bool sak_tx;
-    /* this peer has reported using the SAK now in force; if it later stops,
+    /** this peer has reported using the SAK now in force; if it later stops,
      * the key is gone at its end and the Key Server rekeys */
     bool sak_use_seen;
+    /** this peer has been live at some point, even if it is not now: what the
+     * peer_lost event reports as was_live */
+    bool ever_live;
 #ifdef WOLFMKA_SUSPENSION
-    /* MKA Suspension Time this peer last advertised (s) */
+    /** MKA Suspension Time this peer last advertised (s) */
     uint8_t suspend_for;
 #endif
 } MkaPeer;
 
-/*
+/**
  * Key Server role selection. MKA_ROLE_AUTO runs the dynamic election of IEEE
  * Std 802.1X-2010 (9.5). The fixed roles bypass election and pin the outcome,
  * as required by AUTOSAR CP (CP_SWS_Mka_00011): the Key Server is configured,
  * not negotiated.
  */
 typedef enum {
-    /* dynamic election (default) */
+    /** dynamic election (default) */
     MKA_ROLE_AUTO = 0,
-    /* fixed Key Server */
+    /** fixed Key Server */
     MKA_ROLE_KEY_SERVER = 1,
-    /* fixed non-Key-Server */
+    /** fixed non-Key-Server */
     MKA_ROLE_PEER = 2
 } MkaRole;
 
@@ -198,6 +255,14 @@ typedef struct MkaEventOps {
     /** The elected Key Server changed; is_self is true when it is us. */
     void (*key_server_elected)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
         bool is_self);
+    /** The Connectivity Association no longer has an elected Key Server - the
+     *  last live peer left, or the peer a fixed-PEER participant was following
+     *  stopped advertising the role. Raised on the transition only, and paired
+     *  with key_server_elected: an integrator gating a controlled port or a
+     *  status indicator on the election needs to see it lost as well as made,
+     *  and no further callback arrives until a Key Server is elected again.
+     *  @c sci is the Key Server that was in force. */
+    void (*key_server_lost)(void* ctx, const uint8_t sci[MKA_SCI_LEN]);
     /** A SAK became the participant's Latest key (initial key or rekey).
      * Raised when the key is adopted, which is not necessarily when the SecY
      * has it: under distribute_before_install the data plane is programmed
@@ -221,14 +286,14 @@ typedef struct MkaEventOps {
     void* ctx;
 } MkaEventOps;
 
-/* Fields are ordered by descending alignment to minimise padding. */
+/** Fields are ordered by descending alignment to minimise padding. */
 typedef struct {
-    /* CAK / CKN for this CA */
+    /** CAK / CKN for this CA */
     MkaCakPair cak;
-    /* 0 => GCM-AES-128; or MKA_CIPHER_* */
+    /** 0 => GCM-AES-128; or MKA_CIPHER_* */
     uint64_t cipher_suite;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
-    /* Optional Key Server cipher-suite preference list, most preferred first
+    /** Optional Key Server cipher-suite preference list, most preferred first
      * (caller-owned, up to MKA_MAX_CIPHER_SUITES entries). When
      * cipher_pref_count is non-zero, the Key Server selects the first suite
      * every live peer accepts (a peer accepts a suite it announced, or any
@@ -236,53 +301,64 @@ typedef struct {
      * When 0, cipher_suite / sak_len are used unchanged. */
     const uint64_t* cipher_prefs;
 #endif
-    /* data-plane hooks (any may be NULL) */
+    /** data-plane hooks (any may be NULL) */
     MkaSecyOps secy;
-    /* async event hooks (any may be NULL) */
+    /** async event hooks (any may be NULL) */
     MkaEventOps events;
-    /* transmit callback */
+    /** transmit callback */
     MkaSendFn send;
+    /** opaque context handed back to @c send */
     void* send_ctx;
-    /* RNG from wm_Crypto_RandomInit; NULL seeds one per use */
+    /** RNG workspace from wm_Crypto_RandomInit; required (non-NULL), as
+     *  @c cmac is. wolfSSL's WC_RNG never lives on wolfMKA's stack or heap, so
+     *  a missing one is rejected at wm_Participant_Init rather than silently
+     *  replaced by a per-call RNG. */
     MkaRandom* rng;
-    /* CMAC workspace from wm_Crypto_CmacInit; keeps the wolfSSL Cmac off the
+    /** CMAC workspace from wm_Crypto_CmacInit; keeps the wolfSSL Cmac off the
      * stack and out of any allocation. Required (non-NULL): the participant
      * uses it for ICV and key derivation, and wolfMKA never falls back to a
      * stack or heap context. */
     MkaCmacCtx* cmac;
 
-    /* AUTO (elect) or a fixed role */
+    /** AUTO (elect) or a fixed role */
     MkaRole role;
-    /* Key Server auto-rekey period; 0 off */
+    /** Key Server auto-rekey period; 0 off */
     uint32_t sak_rekey_time_ms;
 #ifndef WOLFMKA_NO_RETRY
-    /* MKA retry base delay; 0 disables */
+    /** MKA retry base delay; 0 disables */
     uint32_t retry_base_ms;
-    /* retry back-off ceiling */
+    /** retry back-off ceiling */
     uint32_t retry_cyclic_ms;
 #endif
 
-    /* our SCI (MAC || port) */
+    /** our SCI (MAC || port) */
     uint8_t sci[MKA_SCI_LEN];
-    /* our Key Server priority */
+    /** our Key Server priority */
     uint8_t priority;
-    /* MkaMacsecCapability */
+    /** MkaMacsecCapability */
     uint8_t macsec_capability;
-    /* SAK size to generate (16 or 32) */
+    /** SAK size to generate (16 or 32) */
     uint8_t sak_len;
-    /* MkaConfidentialityOffset advertised in the Distributed SAK (Key Server)
+    /** MkaConfidentialityOffset advertised in the Distributed SAK (Key Server)
      */
     uint8_t confidentiality_offset;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
-    /* number of entries in cipher_prefs (0 disables negotiation) */
+    /** number of entries in cipher_prefs (0 disables negotiation) */
     uint8_t cipher_pref_count;
 #endif
+    /** this participant wants MACsec; false runs MKA with the data plane
+     * untouched */
     bool macsec_desired;
-    /* may we become Key Server? */
+    /** may we become Key Server? False means *cannot*, not "would rather not":
+     *  the participant excludes itself from the election, and advertises the
+     *  never-Key-Server priority (255) instead of @c priority so peers do not
+     *  elect it either. Setting an attractive @c priority alongside this has no
+     *  effect on the wire - if you want to be a reluctant but possible Key
+     *  Server, leave this true and raise @c priority instead. */
     bool key_server_capable;
-    /* enable MACsec delay protection */
+    /** enable MACsec delay protection */
     bool delay_protect;
-    /* Transmit on the next wm_Participant_Run() when this participant has new
+    /** Transmit on the next wm_Participant_Run() when this participant has new
      * information to report, instead of waiting out the Hello Time - the
      * newInfo behaviour of IEEE Std 802.1X-2010, 9.4 (OPEN Alliance
      * AutoMKA-03003). New information is any of:
@@ -295,7 +371,7 @@ typedef struct {
      * automotive profile turns it on (see wm_Participant_AutomotiveDefaults).
      */
     bool immediate_response;
-    /* Put a newly adopted SAK on the wire before programming it into the SecY,
+    /** Put a newly adopted SAK on the wire before programming it into the SecY,
      * so both ends start installing at the same moment instead of one after the
      * other (OPEN Alliance AutoMKA-03010). Worth setting when the SecY is slow
      * to program - an external PHY behind a narrow management interface - and
@@ -312,64 +388,75 @@ typedef struct {
      */
     bool distribute_before_install;
 #ifndef WOLFMKA_NO_ANNOUNCEMENTS
-    /* emit Announcement set (type 7) */
+    /** emit Announcement set (type 7) */
     bool announce_cipher_suites;
 #endif
 #ifdef WOLFMKA_KMD
-    /* Key Management Domain to advertise (KS) */
+    /** Key Management Domain to advertise (KS) */
     uint8_t kmd[MKA_MAX_KMD_LEN];
-    /* 0 => do not advertise a KMD */
+    /** 0 => do not advertise a KMD */
     size_t kmd_len;
 #endif
 } MkaParticipantConfig;
 
-/* One installed Secure Association Key. During a rekey both a Latest and an Old
- * key are installed at once (make-before-break, IEEE Std 802.1X-2010, 9.x). */
+/** One installed Secure Association Key. During a rekey both a Latest and an
+ * Old key are installed at once (make-before-break, IEEE Std 802.1X-2010, 9.x).
+ */
 typedef struct {
+    /** SAK length in octets (16 or 32) */
     size_t sak_len;
-    /* Key Number */
+    /** Key Number */
     uint32_t kn;
+    /** Member Identifier of the Key Server that issued this key. Together with
+     *  @c kn this is the Key Identifier, KI = (Key Server MI || KN), which is
+     *  what IEEE Std 802.1X-2010 identifies a SAK by. The Key Number alone is
+     *  unique only per Key-Server incarnation - a Key Server that restarts
+     *  begins again at 1 - so a key must never be recognised by @c kn on its
+     *  own. */
+    uint8_t ks_mi[MKA_MI_LEN];
+    /** the Secure Association Key itself */
     uint8_t sak[MKA_MAX_CAK_LEN];
-    /* Association Number */
+    /** Association Number */
     uint8_t an;
+    /** this key slot holds a key */
     bool valid;
-    /* transmitting on this key */
+    /** transmitting on this key */
     bool tx;
 } MkaSak;
 
-/* Read-only snapshot of a tracked peer, returned by wm_Participant_GetPeer.
+/** Read-only snapshot of a tracked peer, returned by wm_Participant_GetPeer.
  */
 typedef struct {
-    /* peer Member Identifier */
+    /** peer Member Identifier */
     uint8_t mi[MKA_MI_LEN];
-    /* peer Secure Channel Identifier */
+    /** peer Secure Channel Identifier */
     uint8_t sci[MKA_SCI_LEN];
-    /* last Message Number seen from the peer */
+    /** last Message Number seen from the peer */
     uint32_t mn;
-    /* advertised Key Server priority */
+    /** advertised Key Server priority */
     uint8_t priority;
-    /* in our Live Peer List (proven bidirectional) */
+    /** in our Live Peer List (proven bidirectional) */
     bool live;
-    /* advertises the Key Server flag */
+    /** advertises the Key Server flag */
     bool key_server;
-    /* advertises MACsec Desired */
+    /** advertises MACsec Desired */
     bool macsec_desired;
 } MkaPeerInfo;
 
-/* Read-only snapshot of the in-force SAK, returned by wm_Participant_GetSak.
+/** Read-only snapshot of the in-force SAK, returned by wm_Participant_GetSak.
  */
 typedef struct {
-    /* a Latest SAK is installed */
+    /** a Latest SAK is installed */
     bool valid;
-    /* Latest Key Number */
+    /** Latest Key Number */
     uint32_t kn;
-    /* Latest Association Number */
+    /** Latest Association Number */
     uint8_t an;
-    /* SAK length in octets */
+    /** SAK length in octets */
     size_t sak_len;
-    /* transmitting on the Latest key */
+    /** transmitting on the Latest key */
     bool tx;
-    /* cipher suite in force (MKA_CIPHER_*) */
+    /** cipher suite in force (MKA_CIPHER_*) */
     uint64_t cipher_suite;
 } MkaSakInfo;
 
@@ -381,133 +468,159 @@ typedef struct {
  * accessors expose individually.
  */
 typedef enum {
-    /* MACsec and/or MKA is not in use on this participant */
+    /** MACsec and/or MKA is not in use on this participant */
     MKA_PAE_UNDEFINED = 0,
-    /* Waiting for the underlying link. Never reported by wolfMKA, which has no
+    /** Waiting for the underlying link. Never reported by wolfMKA, which has no
      * view of link state; an integrator that gates on link up reports it. */
     MKA_PAE_WAITING_FOR_LINK_UP = 1,
-    /* No peer has been heard from yet */
+    /** No peer has been heard from yet */
     MKA_PAE_WAITING_FOR_PEER = 2,
-    /* A peer is known; discovery, election or key agreement is under way */
+    /** A peer is known; discovery, election or key agreement is under way */
     MKA_PAE_IN_PROGRESS = 3,
-    /* A SAK is agreed and MACsec is transmitting */
+    /** A SAK is agreed and MACsec is transmitting. Stays set across a
+     * make-before-break rekey, where the demoted Old key carries the traffic
+     * while the new one waits for the peers to report receiving on it */
     MKA_PAE_RUNNING = 4,
-    /* MKPDUs are arriving but failing ICV verification: the peer holds a
-     * different CAK, so no peer can be established */
+    /** MKPDUs are arriving and none has ever authenticated: the peer holds a
+     * different CAK, so no peer can be established. Reported only while no
+     * MKPDU has ever verified - one bad frame on a working association is not
+     * an authentication failure */
     MKA_PAE_AUTH_FAIL_UNKNOWN_PEER = 5
 } MkaPaeState;
 
-/* Participant status, returned by wm_Participant_GetPaeStatus. */
+/** Participant status, returned by wm_Participant_GetPaeStatus. */
 typedef struct {
-    /* the CAK Name this participant runs */
+    /** the CAK Name this participant runs */
     uint8_t ckn[MKA_MAX_CKN_LEN];
+    /** CKN length in octets */
     size_t ckn_len;
-    /* cipher suite in force; 0 unless the state is MKA_PAE_RUNNING */
+    /** cipher suite in force; 0 unless the state is MKA_PAE_RUNNING */
     uint64_t cipher_suite;
-    /* the peer's SCI, or all zero when there is no peer */
+    /** the peer's SCI, or all zero when there is no peer */
     uint8_t peer_sci[MKA_SCI_LEN];
+    /** where this participant has got to (see MkaPaeState) */
     MkaPaeState state;
 } MkaPaeStatus;
 
-/* MKA protocol counters, returned by wm_Participant_GetCounters. */
+/** MKA protocol counters, returned by wm_Participant_GetCounters. */
 typedef struct {
-    /* MKPDUs received that passed ICV verification */
+    /** MKPDUs received that passed ICV verification */
     uint32_t mkpdu_in;
-    /* MKPDUs built for transmission */
+    /** MKPDUs built for transmission */
     uint32_t mkpdu_out;
-    /* received MKPDUs that failed ICV verification */
+    /** received MKPDUs that failed ICV verification */
     uint32_t icv_failures;
-    /* SAKs adopted as the Latest key (initial key + rekeys) */
+    /** SAKs adopted as the Latest key (initial key + rekeys) */
     uint32_t sak_installs;
 } MkaCounters;
 
-/* Fields are ordered by descending alignment to minimise padding. The SAK
+/** Fields are ordered by descending alignment to minimise padding. The SAK
  * state (latest/old) is the in-use key and, during a rekey, the key being
  * retired. */
 typedef struct {
+    /** the configuration this participant was initialised with */
     MkaParticipantConfig cfg;
-    /* derived KEK / ICK */
+    /** derived KEK / ICK */
     MkaDerivedKeys keys;
+    /** the key currently being brought into use */
     MkaSak latest;
+    /** the key it replaced, still carrying traffic until it retires */
     MkaSak old;
-    /* cipher suite in force for the SAK */
+    /** cipher suite in force for the SAK */
     uint64_t sak_cipher_suite;
-    /* MKA protocol counters */
+    /** MKA protocol counters */
     MkaCounters counters;
+    /** how many of @c peers are in use */
     size_t peer_count;
-    /* confidentiality offset in force for the SAK */
+    /** confidentiality offset in force for the SAK */
     uint8_t sak_conf_offset;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
-    /* the SAK is used integrity-only: a member of the CA cannot do
+    /** the SAK is used integrity-only: a member of the CA cannot do
      * confidentiality (its MACsec Capability is below INTEGRITY_CONF). */
     bool sak_integrity_only;
+    /** a member joined whose MACsec Capability is below what the SAK in force
+     * was negotiated for, so the Key Server must distribute a new one. The
+     * confidentiality offset travels inside the Distributed SAK parameter set,
+     * so it cannot be changed for a key already issued. */
+    bool cap_reduced;
 #endif
 
+    /** the peer table: every member heard from on this CA */
     MkaPeer peers[MKA_MAX_PEERS];
-    /* our Message Number */
+    /** our Message Number */
     uint32_t actor_mn;
-    /* when we last sent an MKPDU */
+    /** when we last sent an MKPDU */
     uint32_t last_tx_ms;
-    /* when the Latest SAK was generated */
+    /** when the Latest SAK was generated */
     uint32_t last_rekey_ms;
+#ifndef WOLFMKA_NO_AUTO_REKEY
+    /** a manual rekey is waiting to have its time recorded; see
+     *  wm_Participant_Rekey */
+    bool rekey_time_pending;
+#endif
 #ifndef WOLFMKA_NO_RETRY
-    /* current MKA retry back-off interval */
+    /** current MKA retry back-off interval */
     uint32_t retry_delay_ms;
 #endif
 
-    /* our Member Identifier */
+    /** our Member Identifier */
     uint8_t actor_mi[MKA_MI_LEN];
-    /* elected Key Server's SCI */
+    /** elected Key Server's SCI */
     uint8_t ks_sci[MKA_SCI_LEN];
-    /* held silent because another CA on this KaY has MACsec up
+    /** held silent because another CA on this KaY has MACsec up
      * (wm_Kay_SetQuiesceOthers); set by wm_Kay_Run, never by the participant */
     bool quiesced;
-    /* a peer that was using the SAK has stopped reporting it, so the Key
+    /** a peer that was using the SAK has stopped reporting it, so the Key
      * Server rekeys to bring it back (see mka_note_sak_use) */
     bool sak_lost;
-    /* the Latest key is adopted but not yet programmed into the SecY: it goes
+    /** a live peer stopped proving liveness since the last run: a membership
+     * change the Key Server must answer with a rekey, exactly as it does for a
+     * peer that expired */
+    bool live_lost;
+    /** the Latest key is adopted but not yet programmed into the SecY: it goes
      * out on the wire first (cfg.distribute_before_install) */
     bool sak_program_pending;
-    /* something worth announcing has happened since the last MKPDU (a peer
+    /** something worth announcing has happened since the last MKPDU (a peer
      * list changed, a SAK was installed, or the transmit gate released). With
      * cfg.immediate_response the next wm_Participant_Run() transmits rather
      * than waiting for the interval; cleared by that transmit. */
     bool new_info;
-    /* election has produced a result */
+    /** election has produced a result */
     bool elected;
-    /* are we the elected Key Server? */
+    /** are we the elected Key Server? */
     bool is_key_server;
+    /** wm_Participant_Run has been called at least once */
     bool started;
-    /* count of SecY ops awaiting async completion */
+    /** count of SecY ops awaiting async completion */
     unsigned secy_pending;
 #ifdef WOLFMKA_DISTRIBUTED_CAK
-    /* group CAK staged for distribution */
+    /** group CAK staged for distribution */
     uint8_t dist_cak[MKA_MAX_CAK_LEN];
-    /* its CAK Name */
+    /** its CAK Name */
     uint8_t dist_ckn[MKA_MAX_CKN_LEN];
-    /* 0 => nothing staged to distribute */
+    /** 0 => nothing staged to distribute */
     size_t dist_cak_len;
     size_t dist_ckn_len;
 #endif
 #ifdef WOLFMKA_KMD
-    /* last Key Management Domain received */
+    /** last Key Management Domain received */
     uint8_t rx_kmd[MKA_MAX_KMD_LEN];
-    /* 0 => none received */
+    /** 0 => none received */
     size_t rx_kmd_len;
 #endif
 #ifdef WOLFMKA_SUSPENSION
-    /* MKA suspended (announce, then go quiet) */
+    /** MKA suspended (announce, then go quiet) */
     bool suspended;
-    /* a suspension announcement is still pending */
+    /** a suspension announcement is still pending */
     bool suspend_announce;
-    /* MKA Suspension Time we advertise (s) */
+    /** MKA Suspension Time we advertise (s) */
     uint8_t suspend_for;
 #endif
 
 #if defined(WOLFMKA_SMALL_STACK) && defined(WOLFMKA_NO_MALLOC)
-    /* Off-stack scratch storage for the small-stack, no-malloc build: the large
-     * MKPDU working set lives in the participant object instead of on the stack
-     * or the heap. */
+    /** Off-stack scratch storage for the small-stack, no-malloc build: the
+     * large MKPDU working set lives in the participant object instead of on the
+     * stack or the heap. */
     MkaPdu ws_pdu;
     uint8_t ws_frame[MKA_MKPDU_MAX_LEN];
 #endif
@@ -518,11 +631,20 @@ typedef struct {
  *
  * Derives KEK/ICK from the CAK, generates a random actor MI, and sets MN to 1.
  *
+ * The whole configuration is validated before anything is derived, so a
+ * rejected one leaves @p p zeroed and inert rather than half-initialised.
+ *
  * @param[out] p    The participant to initialise.
  * @param[in]  cfg  The configuration (CAK/CKN, SCI, priority, SecY hooks, ...).
  * @return MKA_OK on success;
- *         MKA_ERR_BAD_ARG if p or cfg is NULL, cfg->sak_len is not 16 or 32, or
- *         cfg->cipher_suite is unsupported or inconsistent with sak_len;
+ *         MKA_ERR_BAD_ARG if p or cfg is NULL, or the configuration is
+ *         rejected: @c cmac or @c rng missing (both workspaces are required in
+ *         every build), @c sak_len not 16 or 32, @c cipher_suite unsupported or
+ *         inconsistent with @c sak_len, @c confidentiality_offset above
+ *         MKA_CONF_OFFSET_50, @c macsec_capability above
+ *         MKA_CAP_INTEGRITY_CONF_OFFSET, and - where the feature is built -
+ *         @c cipher_pref_count without @c cipher_prefs or above
+ *         MKA_MAX_CIPHER_SUITES, or @c kmd_len above MKA_MAX_KMD_LEN;
  *         MKA_ERR_CRYPTO if key derivation or MI generation fails.
  */
 MkaStatus wm_Participant_Init(MkaParticipant* p,
@@ -703,10 +825,20 @@ MkaStatus wm_Participant_SecyComplete(MkaParticipant* p);
  * distribute_before_install reverses that; either way it returns as soon as the
  * key is generated, and the handover completes over the following runs.
  *
+ * A successful call also restarts the automatic rekey interval
+ * (MkaParticipantConfig::sak_rekey_time_ms), so a manual rekey is not followed
+ * by an automatic one as soon as the handover retires. Because this function
+ * takes no time argument, the interval is restarted from the next
+ * wm_Participant_Run rather than from the moment of the call.
+ *
  * @param[in,out] p  The participant.
  * @return MKA_OK on success;
  *         MKA_ERR_BAD_ARG if p is NULL;
  *         MKA_ERR_NOT_KS if the participant is not the Key Server;
+ *         MKA_ERR_REKEY_BUSY if the previous SAK has been adopted but has not
+ *         reached the wire yet - a second key cannot help until the first is
+ *         delivered, and stacking them lets the Association Numbers of the
+ *         Latest and Old keys collide;
  *         MKA_ERR_CRYPTO if SAK generation fails.
  */
 MkaStatus wm_Participant_Rekey(MkaParticipant* p);
@@ -886,9 +1018,11 @@ MkaStatus wm_Participant_GetCounters(const MkaParticipant* p, MkaCounters* out);
  * (IEEE Std 802.1X-2010, 9.6 / 12.5).
  */
 typedef struct {
+    /** the participants this KaY runs, one per Connectivity Association */
     MkaParticipant parts[MKA_MAX_PARTICIPANTS];
+    /** how many of @c parts are in use */
     size_t count;
-    /* once one CA has MACsec up, hold the others silent (see
+    /** once one CA has MACsec up, hold the others silent (see
      * wm_Kay_SetQuiesceOthers) */
     bool quiesce_others;
 } MkaKay;
@@ -919,7 +1053,9 @@ void wm_Kay_Free(MkaKay* kay);
  *                     kay.
  * @param[out]    out  Optional; receives a pointer to the created participant.
  * @return MKA_OK on success;
- *         MKA_ERR_BAD_ARG if kay or cfg is NULL;
+ *         MKA_ERR_BAD_ARG if kay or cfg is NULL, or the configuration is
+ *         rejected - the slot is left unused; see wm_Participant_Init for what
+ *         it validates;
  *         MKA_ERR_FULL if the participant table is full;
  *         MKA_ERR_STATE if a participant with the same CKN already exists;
  *         MKA_ERR_CRYPTO if participant initialisation fails.

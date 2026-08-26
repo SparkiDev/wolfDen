@@ -90,6 +90,7 @@ int main(void)
     MkaParticipant p;
     MkaParticipantConfig cfg;
     MkaCmacCtx* cmacw;
+    MkaRandom* rngw;
     uint8_t out[256];
     size_t n = sizeof(out);
     int before;
@@ -108,6 +109,8 @@ int main(void)
 
     cmacw = wm_Crypto_CmacInit();
     CK(cmacw != NULL, "cmac init");
+    rngw = wm_Crypto_RandomInit();
+    CK(rngw != NULL, "rng init");
     before = g_allocs;
     CK(wm_Crypto_DeriveKeys(cmacw, &cak, &dk) == MKA_OK, "derive_keys");
     CK(g_allocs == before, "pooled CMAC workspace makes no allocation");
@@ -128,6 +131,7 @@ int main(void)
     cfg.sak_len = 16;
     cfg.send = dummy_send;
     cfg.cmac = cmacw;
+    cfg.rng = rngw;
     CK(wm_Participant_Init(&p, &cfg) == MKA_OK, "init");
     before = g_allocs;
     CK(wm_Participant_BuildMkpdu(&p, out, sizeof out, &n) == MKA_OK,
@@ -152,6 +156,7 @@ int main(void)
     /* Run a couple of ticks (transmit path allocates + frees the frame). */
     wm_Participant_Run(&p, 0, NULL);
     wm_Participant_Run(&p, MKA_HELLO_TIME_MS, NULL);
+    wm_Crypto_RandomFree(rngw);
     wm_Crypto_CmacFree(cmacw);
 
     printf("  allocations=%d frees=%d peak=%zu bytes\n", g_allocs, g_frees,

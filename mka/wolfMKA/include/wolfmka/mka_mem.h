@@ -118,9 +118,9 @@ extern "C" {
 /* Dynamic memory "type" tags (analogous to wolfSSL's DYNAMIC_TYPE_*). A custom
  * WOLFMKA_MALLOC can use these to route allocations. */
 enum {
-    /* scratch buffers (KDF input, MKPDU frame) */
+    /** scratch buffers (KDF input, MKPDU frame) */
     MKA_DYN_TMP_BUFFER = 1,
-    /* a decoded/encoded MkaPdu */
+    /** a decoded/encoded MkaPdu */
     MKA_DYN_PDU = 2
 };
 

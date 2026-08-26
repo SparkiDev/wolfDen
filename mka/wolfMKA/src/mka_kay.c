@@ -67,6 +67,15 @@ static void mka_ev_key_server(const MkaParticipant* p,
     }
 }
 
+/** Notify that the CA no longer has an elected Key Server. */
+static void mka_ev_key_server_lost(const MkaParticipant* p,
+    const uint8_t sci[MKA_SCI_LEN])
+{
+    if (p->cfg.events.key_server_lost != NULL) {
+        p->cfg.events.key_server_lost(p->cfg.events.ctx, sci);
+    }
+}
+
 /** Notify that a SAK was installed as the Latest key. */
 static void mka_ev_sak_installed(const MkaParticipant* p, uint32_t kn,
     uint8_t an, uint64_t cipher_suite)
@@ -130,6 +139,37 @@ static MkaPeer* mka_find_peer(MkaParticipant* p, const uint8_t mi[MKA_MI_LEN])
 }
 
 /**
+ * Count the peer-table entries already held by one SCI.
+ *
+ * A device is identified on the wire by its SCI; its Member Identifier changes
+ * whenever it restarts. Counting per SCI is therefore what bounds how much of
+ * the table one device can occupy.
+ *
+ * The SCI is self-asserted, so this bounds a device that varies only its MI -
+ * which is what a restart, a misconfiguration or a stuck peer actually does. A
+ * CAK-holding member intent on filling the table can vary its SCI too and get a
+ * fresh allowance each time; inside a CA that is a trust question, not a
+ * parsing one (see mka_retire_stale_mi). MKA_MAX_PEERS remains the hard bound.
+ * @param[in] p    the participant owning the peer table.
+ * @param[in] sci  the SCI to count (MKA_SCI_LEN octets).
+ * @return the number of valid entries carrying that SCI.
+ */
+static size_t mka_sci_entry_count(const MkaParticipant* p,
+    const uint8_t sci[MKA_SCI_LEN])
+{
+    size_t n = 0U;
+    size_t i;
+
+    for (i = 0U; i < MKA_MAX_PEERS; i++) {
+        const MkaPeer* pe = &p->peers[i];
+        if (pe->valid && (WOLFMKA_MEMCMP(pe->sci, sci, MKA_SCI_LEN) == 0)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/**
  * Allocate and initialise a new peer slot for a Member Identifier.
  * @param[in,out] p   the participant whose peer table receives the new entry.
  * @param[in]     mi  the new peer's Member Identifier (MKA_MI_LEN octets).
@@ -190,7 +230,7 @@ static void mka_drop_peer(MkaParticipant* p, MkaPeer* pe)
             mka_secy_track(p, s->delete_sa(s->ctx, pe->sci, p->old.an));
         }
     }
-    mka_ev_peer_lost(p, pe->mi, pe->live);
+    mka_ev_peer_lost(p, pe->mi, pe->ever_live);
     /* newInfo: a peer left the Potential or Live Peer List. */
     p->new_info = true;
     (void)WOLFMKA_MEMSET(pe, 0, sizeof(*pe));
@@ -326,11 +366,18 @@ static bool mka_status_peer_sci(const MkaParticipant* p,
     size_t i;
     const MkaPeer* best = NULL;
 
-    /* A live peer is the association's actual counterpart, so it wins. */
+    /* A live peer is the association's actual counterpart, so it wins. Both
+     * loops stop at the first hit: the header describes peer_sci for the
+     * point-to-point case, where there is only one, and in a group CA the
+     * choice should at least be the same rule twice - scanning on here and
+     * breaking below meant the highest-indexed live peer won but the
+     * lowest-indexed merely-valid one did, so the reported SCI could change
+     * when an unrelated peer was dropped and its slot reused. */
     for (i = 0U; i < MKA_MAX_PEERS; i++) {
         const MkaPeer* pe = &p->peers[i];
         if (pe->valid && pe->live) {
             best = pe;
+            break;
         }
     }
     /* Otherwise report whoever has been heard from, so a session still coming
@@ -371,16 +418,26 @@ MkaStatus wm_Participant_GetPaeStatus(const MkaParticipant* p,
     out->ckn_len = p->cfg.cak.ckn_len;
     (void)mka_status_peer_sci(p, out->peer_sci);
 
-    if (p->latest.valid && p->latest.tx) {
+    /* The Old key counts as running: a make-before-break rekey demotes the
+     * in-force key (which keeps its transmit SA) and leaves latest.tx false
+     * until the peers report receiving on the new one. Protection is unbroken
+     * throughout, so testing latest.tx alone would drop the reported state back
+     * to IN_PROGRESS on every rekey. */
+    if ((p->latest.valid && p->latest.tx) || (p->old.valid && p->old.tx)) {
         out->state = MKA_PAE_RUNNING;
         out->cipher_suite = p->sak_cipher_suite;
     }
     else if (p->peer_count != 0U) {
         out->state = MKA_PAE_IN_PROGRESS;
     }
-    else if (p->counters.icv_failures != 0U) {
-        /* Frames are arriving but none authenticate: the far end is configured
-         * with a different CAK, which is a distinct condition from silence. */
+    else if ((p->counters.icv_failures != 0U) && (p->counters.mkpdu_in == 0U)) {
+        /* Frames are arriving and *none* has ever authenticated: the far end is
+         * configured with a different CAK, which is a distinct condition from
+         * silence. Requiring mkpdu_in == 0 keeps it to that case - a single
+         * corrupted frame on an association that has worked is not an
+         * authentication failure, and icv_failures never decreases, so without
+         * this the state would be reported for the rest of the participant's
+         * life every time the peer table happened to be empty. */
         out->state = MKA_PAE_AUTH_FAIL_UNKNOWN_PEER;
     }
     else {
@@ -475,10 +532,18 @@ static bool mka_list_echo(const MkaPeerList* list, const uint8_t mi[MKA_MI_LEN],
     bool found = false;
     size_t i;
 
+    /* Stop at the first hit, as mka_set_latest_ks_mi does: a peer list is not
+     * required to hold distinct Member Identifiers, and letting a later
+     * duplicate overwrite an earlier one would make the last entry win. That
+     * matters because the number this returns is what mka_stale_live_echo
+     * tests for recency - a stale copy appended after a current one would
+     * discard the whole MKPDU. The early exit also usually ends the search at
+     * the first element rather than always scanning the list. */
     for (i = 0U; i < list->count; i++) {
         if (WOLFMKA_MEMCMP(list->peers[i].mi, mi, MKA_MI_LEN) == 0) {
             *mn = list->peers[i].mn;
             found = true;
+            break;
         }
     }
     return found;
@@ -513,8 +578,16 @@ static bool mka_mn_recent(const MkaParticipant* p, uint32_t mn)
          * value already emitted is actor_mn - 1 and the window covers that and
          * the MKA_MN_RECENT_WINDOW - 1 values below it. The subtraction is
          * unsigned, so it stays correct across the 32-bit rollover. */
+        uint32_t window = (uint32_t)MKA_MN_RECENT_WINDOW;
+        /* Only as many numbers as have actually been emitted can be recent.
+         * Message Numbers start at 1, so actor_mn - 1 is the count; without
+         * this clamp the first two MKPDUs would also accept 0 and 0xFFFFFFFF,
+         * which were never sent. */
+        if (window > (p->actor_mn - 1U)) {
+            window = p->actor_mn - 1U;
+        }
         age = (p->actor_mn - 1U) - mn;
-        recent = (age < (uint32_t)MKA_MN_RECENT_WINDOW);
+        recent = (age < window);
     }
     return recent;
 }
@@ -640,6 +713,16 @@ static uint8_t mka_negotiate_offset(const MkaParticipant* p)
  */
 static bool mka_cfg_valid(const MkaParticipantConfig* cfg)
 {
+    /* Both crypto workspaces are caller-allocated and mandatory. wolfSSL's
+     * ~1 KB Cmac context and its WC_RNG are never placed on wolfMKA's stack or
+     * heap, so there is nothing to substitute when one is missing - and a
+     * silent substitution is exactly what a WOLFMKA_SMALL_STACK /
+     * WOLFMKA_NO_MALLOC build cannot afford. Rejected here rather than at first
+     * use, so a misconfiguration fails at init instead of at the first rekey.
+     */
+    if ((cfg->cmac == NULL) || (cfg->rng == NULL)) {
+        return false;
+    }
     if (!mka_aes_key_len_valid(cfg->sak_len)) {
         return false;
     }
@@ -654,6 +737,16 @@ static bool mka_cfg_valid(const MkaParticipantConfig* cfg)
     }
 #endif
     if (cfg->confidentiality_offset > (uint8_t)MKA_CONF_OFFSET_50) {
+        return false;
+    }
+    /* The MACsec Capability is a two-bit wire field (11.11.1), so a larger
+     * value would be advertised as whatever its low two bits happen to be -
+     * a configuration of 4 would tell every peer this participant implements
+     * no MACsec at all, while the local capability comparison went on reading
+     * 4 and concluding the CA can do everything. Failing at init keeps this
+     * with the other out-of-range configuration values (FMEA FM-24) rather
+     * than letting it become a silent asymmetry. */
+    if (cfg->macsec_capability > (uint8_t)MKA_CAP_INTEGRITY_CONF_OFFSET) {
         return false;
     }
 #ifdef WOLFMKA_KMD
@@ -696,6 +789,17 @@ MkaStatus wm_Participant_Init(MkaParticipant* p,
     if (rc == MKA_OK) {
         /* Message Numbers start at 1 (9.4.2) */
         p->actor_mn = 1U;
+    }
+    else {
+        /* Make good on the promise above. The configuration copy already holds
+         * the caller's plaintext CAK, and a failure after DeriveKeys leaves the
+         * derived KEK and ICK next to it, so returning here without a wipe
+         * would strand key material in the object - and in a caller-provided
+         * MkaKay slot that wm_Kay_Free() never walks, because
+         * wm_Kay_AddParticipant does not count a participant that failed to
+         * initialise. No SecY state exists yet, so zeroing is the whole
+         * teardown. */
+        wm_Crypto_ForceZero(p, sizeof(*p));
     }
     return rc;
 }
@@ -817,6 +921,14 @@ static void mka_elect_dynamic(MkaParticipant* p)
 /**
  * Elect the Key Server for a fixed PEER-role participant: we never serve, so
  * adopt the SCI of a live peer that advertises the Key Server role.
+ *
+ * The automotive profile's priority-255 rule applies here as it does to the
+ * dynamic election: 255 is an absolute "never Key Server" (AutoMKA-03007), so a
+ * peer advertising both that priority and the Key Server role is contradicting
+ * itself and is not adopted. Refusing can leave a pinned peer with no Key
+ * Server at all, which is the fail-closed outcome - it distributes no SAK and
+ * brings no MACsec up - and is preferable to accepting a SAK from a device that
+ * has declared itself ineligible to issue one.
  * @param[in,out] p  the participant whose election state is updated.
  */
 static void mka_elect_fixed_peer(MkaParticipant* p)
@@ -827,7 +939,13 @@ static void mka_elect_fixed_peer(MkaParticipant* p)
     p->elected = false;
     for (i = 0U; i < MKA_MAX_PEERS; i++) {
         const MkaPeer* pe = &p->peers[i];
-        if (pe->valid && pe->live && pe->key_server) {
+        bool peer_ok = pe->valid && pe->live && pe->key_server;
+#ifdef WOLFMKA_AUTOMOTIVE_PROFILE
+        if (pe->priority == (uint8_t)MKA_PRIORITY_NEVER_KS) {
+            peer_ok = false;
+        }
+#endif
+        if (peer_ok) {
             (void)WOLFMKA_MEMCPY(p->ks_sci, pe->sci, MKA_SCI_LEN);
             p->elected = true;
             break;
@@ -867,11 +985,21 @@ static void mka_run_election(MkaParticipant* p)
     (void)WOLFMKA_MEMCPY(old_sci, p->ks_sci, MKA_SCI_LEN);
 
     if (p->cfg.role == MKA_ROLE_KEY_SERVER) {
-        /* Fixed-role configuration (AUTOSAR CP_SWS_Mka_00011): the role is
-         * pinned, so the dynamic election is bypassed entirely. */
-        p->elected = true;
-        p->is_key_server = true;
-        (void)WOLFMKA_MEMCPY(p->ks_sci, p->cfg.sci, MKA_SCI_LEN);
+        if (p->cfg.macsec_desired) {
+            /* Fixed-role configuration (AUTOSAR CP_SWS_Mka_00011): the role is
+             * pinned, so the dynamic election is bypassed entirely. */
+            p->elected = true;
+            p->is_key_server = true;
+            (void)WOLFMKA_MEMCPY(p->ks_sci, p->cfg.sci, MKA_SCI_LEN);
+        }
+        else {
+            /* A participant that does not want MACsec must not serve keys for
+             * it, pinned role or not - the dynamic election already refuses,
+             * and running MKA with MACsec disabled depends on it (OPEN Alliance
+             * AutoMKA-12002). */
+            p->elected = false;
+            p->is_key_server = false;
+        }
     }
     else if (p->cfg.role == MKA_ROLE_PEER) {
         mka_elect_fixed_peer(p);
@@ -882,6 +1010,16 @@ static void mka_run_election(MkaParticipant* p)
 
     if (mka_election_changed(p, was_elected, was_self, old_sci)) {
         mka_ev_key_server(p, p->ks_sci, p->is_key_server);
+    }
+    /* The other edge. mka_election_changed only reports an election that was
+     * made, so losing one - the last live peer expiring, or a fixed-PEER
+     * participant's Key Server ceasing to advertise the role - used to fire
+     * nothing at all, and an integrator gating a controlled port on the
+     * election never saw it go away. Reported with the SCI that was in force,
+     * because p->ks_sci keeps its stale value across the gap and only
+     * p->elected distinguishes it. */
+    if (was_elected && (!p->elected)) {
+        mka_ev_key_server_lost(p, old_sci);
     }
 }
 
@@ -982,6 +1120,18 @@ static void mka_install_rx_key(MkaParticipant* p, const MkaPeer* pe,
 
 /**
  * Create a peer's receive SC and install its Latest (and Old) SAs.
+ *
+ * The cipher suite, confidentiality offset and XPN SSCI are per-Secure-Channel
+ * in the SecY interface (see MkaSecyOps::set_cipher_suite), not per-Secure-
+ * Association, so the channel carries the Latest key's parameters and the Old
+ * key's SA shares them. A rekey that also changes the suite or offset therefore
+ * cannot validate the Old key's in-flight frames - a deliberate limit of the
+ * abstraction rather than an oversight, and the same trade-off
+ * mka_reapply_xpn_ssci documents for SSCI ranks. Supporting it would mean
+ * storing the suite and offset in MkaSak and configuring per key, which no
+ * SecY this interface targets can express. In practice the suite is fixed for
+ * the life of a CA unless WOLFMKA_CIPHER_NEGOTIATION re-derives it from a
+ * changed membership.
  * @param[in] p   the participant (provides the current keys and SecY hooks).
  * @param[in] pe  the peer to install receive SAs for.
  */
@@ -1040,26 +1190,45 @@ static void mka_program_sak(MkaParticipant* p);
  * @param[in]     sak_len  Length of the SAK in octets.
  * @param[in]     an       Association Number.
  * @param[in]     kn       Key Number.
+ * @param[in]     ks_mi    Member Identifier of the Key Server issuing the key -
+ *                         our own when we are it. Stored with the key so it can
+ *                         later be recognised by its full Key Identifier.
  */
 static void mka_install_sak(MkaParticipant* p, const uint8_t* sak,
-    size_t sak_len, uint8_t an, uint32_t kn)
+    size_t sak_len, uint8_t an, uint32_t kn, const uint8_t* ks_mi)
 {
     /* Demote the current Latest to Old; force-retire any unfinished Old. A new
      * SAK always carries a fresh Key Number, so a valid Latest is always a
      * different key here. */
     if (p->latest.valid) {
-        if (p->old.valid) {
-            mka_delete_sak_sas(p, &p->old);
+        if (p->sak_program_pending) {
+            /* This key was adopted but never programmed - its distribution had
+             * not reached the wire yet - so there are no SecY SAs to keep for
+             * in-flight traffic and none to delete later. Replace it outright
+             * rather than demoting a phantom to Old. */
+            wm_Crypto_ForceZero(&p->latest, sizeof(p->latest));
         }
-        /* its SecY SAs stay installed */
-        p->old = p->latest;
+        else {
+            if (p->old.valid) {
+                mka_delete_sak_sas(p, &p->old);
+            }
+            /* its SecY SAs stay installed */
+            p->old = p->latest;
+        }
     }
 
     p->latest.valid = true;
+    /* The buffer is a fixed MKA_MAX_CAK_LEN and only sak_len octets are
+     * written, so a shorter key than the one it replaces would leave the tail
+     * of the old one behind - and once the Old copy is retired and wiped, that
+     * tail is the only surviving piece of a dead SAK. Clear the whole buffer.
+     */
+    wm_Crypto_ForceZero(p->latest.sak, sizeof p->latest.sak);
     (void)WOLFMKA_MEMCPY(p->latest.sak, sak, sak_len);
     p->latest.sak_len = sak_len;
     p->latest.an = an;
     p->latest.kn = kn;
+    (void)WOLFMKA_MEMCPY(p->latest.ks_mi, ks_mi, MKA_MI_LEN);
     /* newInfo: the MACsec SAK Use set now names a different key, which the CA
      * needs before the transmit gate on either end can release. */
     p->new_info = true;
@@ -1331,7 +1500,7 @@ static MkaStatus mka_ks_generate_sak(MkaParticipant* p)
         an = p->latest.valid
                  ? (uint8_t)(((uint32_t)p->latest.an + 1U) & MKA_AN_MASK)
                  : 0U;
-        mka_install_sak(p, sak, sak_len, an, kn);
+        mka_install_sak(p, sak, sak_len, an, kn, p->actor_mi);
     }
     wm_Crypto_ForceZero(sak,
         /* generated key copied into latest */
@@ -1352,29 +1521,48 @@ static MkaStatus mka_ks_generate_sak(MkaParticipant* p)
  * Secure Channels and program the SAs it was configured not to have. Declining
  * the key here keeps every downstream SecY call from happening, since they all
  * hang off an installed Latest key.
- * @param[in] p  participant.
- * @param[in] d  the received Distributed SAK parameter set.
+ *
+ * "Already installed" means the same Key Identifier, KI = (Key Server MI || Key
+ * Number), not the same Key Number. Key Numbers are unique only per Key-Server
+ * incarnation: a Key Server that restarts comes back with a fresh MI, no stored
+ * key, and therefore begins again at KN 1 - carrying key bytes nobody else has.
+ * Comparing KN alone made the member skip that install and keep the dead key,
+ * while the restarted Key Server transmitted on the new one at the same AN.
+ * Both ends reported MACsec running over a silent black-hole, with no
+ * self-recovery, and it was guaranteed rather than racy wherever the member
+ * cannot self-promote (a pinned MKA_ROLE_PEER, or key_server_capable = false -
+ * the AUTOSAR and automotive configuration).
+ * @param[in] p      participant.
+ * @param[in] d      the received Distributed SAK parameter set.
+ * @param[in] ks_mi  Member Identifier of the sender, which the caller has
+ *                   already established is the elected Key Server.
  * @return true to skip installation, false to proceed.
  */
-static bool mka_dist_sak_skip(const MkaParticipant* p, const MkaDistSak* d)
+static bool mka_dist_sak_skip(const MkaParticipant* p, const MkaDistSak* d,
+    const uint8_t* ks_mi)
 {
-    return (d->wrapped_len == 0U) || (!p->cfg.macsec_desired) ||
-           (p->latest.valid && (d->kn == p->latest.kn));
+    bool already_held =
+        p->latest.valid && (d->kn == p->latest.kn) &&
+        (WOLFMKA_MEMCMP(p->latest.ks_mi, ks_mi, MKA_MI_LEN) == 0);
+
+    return (d->wrapped_len == 0U) || (!p->cfg.macsec_desired) || already_held;
 }
 
 /**
  * Non-Key-Server: unwrap and install a distributed SAK as Latest.
- * @param[in,out] p  participant.
- * @param[in]     d  the received Distributed SAK parameter set.
+ * @param[in,out] p      participant.
+ * @param[in]     d      the received Distributed SAK parameter set.
+ * @param[in]     ks_mi  Member Identifier of the Key Server that issued it.
  * @return MKA_OK, or MKA_ERR_CRYPTO if unwrapping fails.
  */
-static MkaStatus mka_install_from_dist(MkaParticipant* p, const MkaDistSak* d)
+static MkaStatus mka_install_from_dist(MkaParticipant* p, const MkaDistSak* d,
+    const uint8_t* ks_mi)
 {
     uint8_t sak[MKA_MAX_CAK_LEN];
     size_t sak_len = sizeof(sak);
     MkaStatus rc;
 
-    if (mka_dist_sak_skip(p, d)) {
+    if (mka_dist_sak_skip(p, d, ks_mi)) {
         return MKA_OK;
     }
 
@@ -1390,12 +1578,21 @@ static MkaStatus mka_install_from_dist(MkaParticipant* p, const MkaDistSak* d)
         }
     }
     if (rc == MKA_OK) {
+        /* The Key Server's choice still has to be one we implement, and to
+         * agree with the key length it actually sent: the suite is carried
+         * straight through to the SecY, so an unchecked value would program the
+         * data plane with something the CA never negotiated. */
+        if (!mka_cipher_suite_valid(d->cipher_suite, (uint8_t)sak_len)) {
+            rc = MKA_ERR_PARSE;
+        }
+    }
+    if (rc == MKA_OK) {
         /* Adopt the cipher suite and confidentiality offset chosen by the Key
          * Server (cipher suite 0 => 128). */
         p->sak_cipher_suite =
             (d->cipher_suite == 0U) ? MKA_CIPHER_GCM_AES_128 : d->cipher_suite;
         p->sak_conf_offset = d->confidentiality_offset;
-        mka_install_sak(p, sak, sak_len, d->distributed_an, d->kn);
+        mka_install_sak(p, sak, sak_len, d->distributed_an, d->kn, ks_mi);
     }
     /* unwrapped key copied into latest */
     wm_Crypto_ForceZero(sak, sizeof sak);
@@ -1449,7 +1646,10 @@ static void mka_process_dist_cak(const MkaParticipant* p, const MkaDistCak* d)
  * A peer mid-handover legitimately still names the Old key - it has not
  * installed the new one yet - so that Key Number counts as ours too. Treating
  * it as unknown would make every make-before-break rekey look like a key loss
- * and trigger another rekey, and so on.
+ * and trigger another rekey, and so on. The mirror case - a peer naming our key
+ * as its *Old* one because it has moved on and we have not - needs no handling
+ * here: only the Key Server evaluates this at all (see mka_refresh_peer), and
+ * only the Key Server issues Key Numbers, so a peer can never be ahead of it.
  * @param[in] p    the participant holding the key in force.
  * @param[in] pdu  the decoded MKPDU.
  * @return true if the peer reports a key we issued as in use.
@@ -1509,6 +1709,32 @@ static void mka_note_sak_use(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu)
 }
 
 /**
+ * Forget what a peer last reported about its use of a key.
+ *
+ * A member that still holds a key always includes the MACsec SAK Use parameter
+ * set, so its absence is a statement: the peer is no longer using one. Without
+ * this the last report would stand indefinitely - the Key Server notices the
+ * loss through mka_note_sak_use, but a plain member does not run that check,
+ * so its peer table would keep claiming the peer is receiving and transmitting
+ * under a key it has dropped. That claim feeds the transmit gate
+ * (mka_peers_rx_on) and the Old-key retirement rule (mka_retire_old), both of
+ * which would then release on evidence that has expired.
+ *
+ * The delay-protection side of mka_apply_sak_use is deliberately not undone:
+ * the lowest acceptable packet number is a monotonically advancing bound in the
+ * SecY, and winding it back is neither possible nor desirable.
+ * @param[in,out] pe  The peer whose SAK Use claim is being cleared.
+ */
+static void mka_clear_sak_use(MkaPeer* pe)
+{
+    pe->sak_rx = false;
+    pe->sak_tx = false;
+    pe->latest_kn = 0U;
+    pe->latest_lpn = 0U;
+    pe->latest_lpn_msb = 0U;
+}
+
+/**
  * Record a peer's MACsec SAK Use state and apply delay protection.
  *
  * When delay protection is enabled, advances the peer's receive replay window
@@ -1542,16 +1768,84 @@ static void mka_apply_sak_use(MkaParticipant* p, MkaPeer* pe,
 #ifndef WOLFMKA_NO_DELAY_PROTECT
     /* Delay protection: reject unduly delayed frames by advancing the receive
      * lowest acceptable PN to what the transmitter reports (9.4.1). */
-    if (p->cfg.delay_protect && p->latest.valid && (s->set_lowest_pn != NULL)) {
+    if (p->cfg.delay_protect && (s->set_lowest_pn != NULL)) {
         /* Convey the full 64-bit Lowest Acceptable PN: the low 32 bits from the
          * SAK Use set and the high 32 from the XPN set (zero for non-XPN). */
         uint64_t lpn64 =
             ((uint64_t)pe->latest_lpn_msb << 32U) | (uint64_t)pe->latest_lpn;
-        (void)s->set_lowest_pn(s->ctx, pe->sci, p->latest.an, lpn64);
+        /* Bound the Secure Association the peer is actually reporting on, not
+         * whichever one happens to be Latest here. Mid make-before-break a peer
+         * that has not installed the new key still names the Old one, and
+         * advancing the Latest key's replay window to the Old key's packet
+         * number would discard every frame the peer sends once it does install
+         * it - a blackhole that lasts until the next rekey, or forever if the
+         * rekey was driven by packet-number exhaustion. A Key Number we do not
+         * hold bounds nothing. */
+        if (p->latest.valid && (su->latest_kn == p->latest.kn)) {
+            (void)s->set_lowest_pn(s->ctx, pe->sci, p->latest.an, lpn64);
+        }
+        else if (p->old.valid && (su->latest_kn == p->old.kn)) {
+            (void)s->set_lowest_pn(s->ctx, pe->sci, p->old.an, lpn64);
+        }
+        else {
+            /* not a key of ours */
+        }
     }
 #else
     (void)s;
 #endif
+}
+
+/**
+ * Reclaim one entry for an SCI that has used up its per-device allowance.
+ *
+ * A device that resets twice inside the Life Time would otherwise lock itself
+ * out: its first incarnation still occupies a slot, its second was admitted but
+ * never proved liveness before the second reset, and the third is refused with
+ * MKA_ERR_FULL. Nothing else frees either one - mka_retire_stale_mi runs only
+ * when an entry for that SCI *becomes live*, which is exactly what cannot
+ * happen - so the device stays out until the first entry ages out, up to a full
+ * MKA_LIFE_TIME_MS after the reset it already recovered from.
+ *
+ * Only an entry that has never been live is taken, and the oldest of those. An
+ * entry that once proved liveness is a working association until the Life Time
+ * says otherwise, and admission happens before the newcomer has proved
+ * anything - so a member asserting another member's SCI must not be able to
+ * displace it. Never-live entries carry no such standing: nothing was ever
+ * established with them.
+ *
+ * This does not weaken the cap. A member cycling Member Identifiers still holds
+ * at most MKA_MAX_PEERS_PER_SCI entries; it can now churn its own share, which
+ * is the behaviour the cap was drawn around in the first place.
+ * @param[in,out] p       the participant owning the peer table.
+ * @param[in]     sci     the SCI whose allowance is exhausted.
+ * @param[in]     now_ms  current time, for picking the oldest candidate.
+ * @return true if an entry was freed.
+ */
+static bool mka_evict_stale_sci_entry(MkaParticipant* p,
+    const uint8_t sci[MKA_SCI_LEN], uint32_t now_ms)
+{
+    MkaPeer* victim = NULL;
+    uint32_t oldest = 0U;
+    size_t i;
+
+    for (i = 0U; i < MKA_MAX_PEERS; i++) {
+        MkaPeer* pe = &p->peers[i];
+        if (pe->valid && (!pe->ever_live) &&
+            (WOLFMKA_MEMCMP(pe->sci, sci, MKA_SCI_LEN) == 0)) {
+            /* Unsigned subtraction, so the age is correct across the 32-bit
+             * millisecond rollover. */
+            uint32_t age = now_ms - pe->last_seen_ms;
+            if ((victim == NULL) || (age > oldest)) {
+                oldest = age;
+                victim = pe;
+            }
+        }
+    }
+    if (victim != NULL) {
+        mka_drop_peer(p, victim);
+    }
+    return victim != NULL;
 }
 
 /**
@@ -1566,7 +1860,7 @@ static void mka_apply_sak_use(MkaParticipant* p, MkaPeer* pe,
  *         MKA_ERR_NO_PEER (wrong CKN), MKA_ERR_FULL or MKA_ERR_REPLAY.
  */
 static MkaStatus mka_admit_peer(MkaParticipant* p, const MkaPdu* pdu,
-    MkaPeer** pe_out, bool* added_out)
+    uint32_t now_ms, MkaPeer** pe_out, bool* added_out)
 {
     MkaPeer* pe;
 
@@ -1587,8 +1881,19 @@ static MkaStatus mka_admit_peer(MkaParticipant* p, const MkaPdu* pdu,
 
     pe = mka_find_peer(p, pdu->basic.mi);
     if (pe == NULL) {
+        if (mka_sci_entry_count(p, pdu->basic.sci) >= MKA_MAX_PEERS_PER_SCI) {
+            /* This device already holds its allowance of entries. Reclaim one
+             * that never proved liveness, so a device that reset twice inside
+             * the Life Time is not locked out by its own dead incarnations;
+             * failing that, refuse. Either way the cap holds, bounding a member
+             * that cycles Member Identifiers to its own share of the table
+             * instead of letting it crowd out every other CA member. */
+            if (!mka_evict_stale_sci_entry(p, pdu->basic.sci, now_ms)) {
+                return MKA_ERR_FULL;
+            }
+        }
         pe = mka_add_peer(p, pdu->basic.mi);
-        *added_out = true;
+        *added_out = (pe != NULL);
     }
     if (pe == NULL) {
         return MKA_ERR_FULL;
@@ -1629,12 +1934,17 @@ static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
     pe->macsec_capability = pdu->basic.macsec_capability;
     pe->last_seen_ms = now_ms;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
-    /* Record the cipher suites the peer announced, for Key Server selection. An
-     * MKPDU without an Announcement clears the set (then it constrains no
-     * suite). */
-    pe->adv_count = 0U;
+    /* Record the cipher suites the peer announced, for Key Server selection.
+     * Announcements are optional in every MKPDU (IEEE Std 802.1X-2010, 11.12),
+     * so what a peer once announced stands until it announces something else -
+     * clearing the set on an MKPDU that simply omits it would read as "accepts
+     * anything" and let the next rekey hand that peer a suite it ruled out. A
+     * peer that has never announced starts at adv_count == 0, since
+     * mka_add_peer zeroes the entry. */
     if (pdu->announce.present) {
         size_t k;
+
+        pe->adv_count = 0U;
         /* The decoder clamps the announced suite count to
          * MKA_MAX_CIPHER_SUITES, so the copy into adv_suites[] (sized to that
          * maximum) cannot overflow. */
@@ -1650,10 +1960,6 @@ static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
      * or not carrying an XPN set), so expiry holds it that much longer. */
     pe->suspend_for = pdu->xpn.suspension_time;
 #endif
-    mka_note_sak_use(p, pe, pdu);
-    if (pdu->sak_use.present) {
-        mka_apply_sak_use(p, pe, &pdu->sak_use, &pdu->xpn);
-    }
     if (added) {
         mka_ev_peer_added(p, pe->mi, pe->sci);
     }
@@ -1673,6 +1979,32 @@ static bool mka_refresh_peer(MkaParticipant* p, MkaPeer* pe, const MkaPdu* pdu,
                  mka_mn_recent(p, echo_mn);
     }
     pe->live = echoed;
+    if (pe->live) {
+        pe->ever_live = true;
+    }
+
+    /* Only a peer that has proven two-way liveness may move our state. A CA
+     * member holding the CAK - so its ICV verifies - but never echoing our MI
+     * stays merely Potential and can win no election and distribute no SAK;
+     * without this gate it could still steer the SecY through the SAK Use it
+     * claims, naming another member's SCI to poison that member's replay
+     * window, or oscillate the Key Number to force a rekey on every tick. */
+    if (pe->live) {
+        if (p->is_key_server) {
+            /* Only the Key Server acts on a lost SAK, and only it can compare
+             * a peer's report against the key it issued: a member evaluating
+             * this would latch the flag on every rekey, because the Key Server
+             * announces the new Key Number before the member has installed
+             * it. */
+            mka_note_sak_use(p, pe, pdu);
+        }
+        if (pdu->sak_use.present) {
+            mka_apply_sak_use(p, pe, &pdu->sak_use, &pdu->xpn);
+        }
+        else {
+            mka_clear_sak_use(pe);
+        }
+    }
     return pe->live;
 }
 
@@ -1714,9 +2046,17 @@ static void mka_reapply_xpn_ssci(MkaParticipant* p)
  * Alliance AutoMKA-03006).
  *
  * The old entry is removed only once the new MI has proven liveness, never on
- * first sight of it: an attacker replaying or forging an MKPDU with an unknown
- * MI can therefore never evict a working peer, since a forged frame cannot echo
- * this participant's own MI and Message Number back to it.
+ * first sight of it, so a replayed or truncated exchange cannot evict a working
+ * peer. That is the limit of what this check buys: anything reaching here has
+ * already passed the ICV, so it holds the CAK. In a group CA - one established
+ * by Distributed CAK, where every member shares the key - a member can read
+ * this participant's MI and Message Number off the wire (MKPDUs are
+ * authenticated, not encrypted), echo them to become live, and assert another
+ * member's SCI in its Basic Parameter Set, since the SCI is self-asserted and
+ * copied verbatim. Retirement then drops the victim's entry. The same
+ * self-asserted SCI is the only gate on accepting a Distributed SAK, so a
+ * CAK-holding member is already trusted with far more than this; a group CA is
+ * a trust domain, not a set of mutually isolated peers.
  *
  * Called before the new peer's receive SA is installed, because both entries
  * share an SCI and the SecY keys its SAs by (SCI, AN) - retiring afterwards
@@ -1773,6 +2113,52 @@ static MkaStatus mka_react_to_pdu(MkaParticipant* p, MkaPeer* pe,
          * idempotent reapply. */
         mka_reapply_xpn_ssci(p);
 #endif
+#ifdef WOLFMKA_CIPHER_NEGOTIATION
+        /* A join does not normally rekey - see test_kay_join_no_rekey - but a
+         * member less capable than the CA negotiated for is the exception. The
+         * confidentiality offset and the integrity-only decision travel inside
+         * the Distributed SAK parameter set, so they belong to the key: there
+         * is no message that changes them for a key already issued. Without a
+         * rekey the Key Server would go on protecting with the offset it chose
+         * before, while the joiner programmed its own data plane from its own
+         * capability - the two ends disagreeing about what the CA is doing.
+         *
+         * Only a *reduction* triggers this. A member at least as capable as the
+         * CA changes nothing, which is why the ordinary join stays rekey-free.
+         */
+        if (p->is_key_server && p->latest.valid) {
+            bool now_integ_only =
+                (mka_min_capability(p) <= (uint8_t)MKA_CAP_INTEGRITY_ONLY);
+            if ((now_integ_only != p->sak_integrity_only) ||
+                (mka_negotiate_offset(p) != p->sak_conf_offset)) {
+                p->cap_reduced = true;
+            }
+        }
+#endif
+    }
+    else if ((!now_live) && was_live) {
+        /* The peer stopped proving liveness and drops out of the Live Peer
+         * List. Its receive SAs stay installed until it expires, because the
+         * loss may be one-directional and transient and tearing them down would
+         * break traffic that is still arriving; but the Key Server must treat
+         * the membership change as a departure. Without this the peer's
+         * eventual expiry raises no forward-secrecy rekey - it is no longer
+         * live by then - and the key it still holds would be handed to whoever
+         * joins next. */
+        p->live_lost = true;
+        p->new_info = true;
+#ifndef WOLFMKA_NO_XPN
+        /* A departure shifts the XPN ranks exactly as a join does - an SSCI is
+         * the SCI's rank within the *live* membership - so the channels have to
+         * be reprogrammed here too. On a Key Server this was masked, because a
+         * departure forces a rekey and mka_program_sak reapplies the suite to
+         * every channel; a member never rekeys, so its ranks simply went stale
+         * and it transmitted XPN frames with an SSCI no one else computed. */
+        mka_reapply_xpn_ssci(p);
+#endif
+    }
+    else {
+        /* liveness unchanged */
     }
 
     /* SAK / CAK / KMD distribution is authorised only when it comes from the
@@ -1786,7 +2172,7 @@ static MkaStatus mka_react_to_pdu(MkaParticipant* p, MkaPeer* pe,
         (WOLFMKA_MEMCMP(pe->sci, p->ks_sci, MKA_SCI_LEN) == 0)) {
         /* A distributed SAK from the Key Server: unwrap and install it. */
         if (pdu->dist_sak.present) {
-            rc = mka_install_from_dist(p, &pdu->dist_sak);
+            rc = mka_install_from_dist(p, &pdu->dist_sak, pdu->basic.mi);
         }
 
 #ifdef WOLFMKA_DISTRIBUTED_CAK
@@ -1837,7 +2223,7 @@ static MkaStatus mka_receive_process(MkaParticipant* p, const MkaPdu* pdu,
         return MKA_ERR_REPLAY;
     }
 
-    rc = mka_admit_peer(p, pdu, &pe, &added);
+    rc = mka_admit_peer(p, pdu, now_ms, &pe, &added);
     if ((rc != MKA_OK) || (pe == NULL)) {
         /* rejected, or our own loopback (rc == MKA_OK) */
         return rc;
@@ -1930,7 +2316,8 @@ static void mka_build_peer_lists(const MkaParticipant* p, MkaPdu* pdu)
  * @param[in]  p    the participant providing the PN hook and key state.
  * @param[out] pdu  the MKPDU whose XPN parameter set is filled.
  */
-static void mka_build_xpn(const MkaParticipant* p, MkaPdu* pdu)
+static void mka_build_xpn(const MkaParticipant* p, MkaPdu* pdu,
+    uint64_t latest_pn, uint64_t old_pn)
 {
     if (mka_cipher_is_xpn(p->sak_cipher_suite)) {
         pdu->xpn.present = true;
@@ -1941,19 +2328,18 @@ static void mka_build_xpn(const MkaParticipant* p, MkaPdu* pdu)
             pdu->xpn.suspension_time = p->suspend_for;
         }
     #endif
-        if (p->cfg.secy.get_next_pn != NULL) {
-            uint64_t pn64 = 1U;
-            if (p->cfg.secy.get_next_pn(p->cfg.secy.ctx, p->latest.an, &pn64) ==
-                0) {
-                pdu->sak_use.latest_lpn = (uint32_t)pn64;
-                pdu->xpn.latest_lpn_msb = (uint32_t)(pn64 >> 32U);
-            }
-            if (p->old.valid && (p->cfg.secy.get_next_pn(p->cfg.secy.ctx,
-                                     p->old.an, &pn64) == 0)) {
-                pdu->sak_use.old_lpn = (uint32_t)pn64;
-                pdu->xpn.old_lpn_msb = (uint32_t)(pn64 >> 32U);
-            }
-        }
+        /* The packet numbers were already read by the caller: this only splits
+         * out the upper halves. Re-querying here would call get_next_pn a
+         * second time per key - four times per MKPDU during a handover - and
+         * the SecY hook makes no promise of idempotence. The project's own test
+         * shim advances a counter on every call, and a real backend may read a
+         * clear-on-read register or cost a management-bus transaction. Sharing
+         * one read also removes a split-brain hazard: a second query that
+         * failed used to leave the low half from the first read beside a zero
+         * upper half, so the peer reconstructed a truncated 64-bit LPN rather
+         * than seeing no update. */
+        pdu->xpn.latest_lpn_msb = (uint32_t)(latest_pn >> 32U);
+        pdu->xpn.old_lpn_msb = (uint32_t)(old_pn >> 32U);
     }
 }
 #endif
@@ -1972,11 +2358,18 @@ static void mka_set_latest_ks_mi(const MkaParticipant* p, MkaPdu* pdu)
     }
     else {
         size_t i;
+        /* Peer-reset handling can leave two entries for one SCI - the stale
+         * incarnation and the live one - so match on liveness and stop at the
+         * first hit rather than letting a later stale entry overwrite it. */
         for (i = 0U; i < MKA_MAX_PEERS; i++) {
-            if (p->peers[i].valid && (WOLFMKA_MEMCMP(p->peers[i].sci, p->ks_sci,
-                                          MKA_SCI_LEN) == 0)) {
-                (void)WOLFMKA_MEMCPY(pdu->sak_use.latest_ks_mi, p->peers[i].mi,
-                    MKA_MI_LEN);
+            const MkaPeer* pe = &p->peers[i];
+            /* live implies valid: a dropped peer is zeroed. */
+            if (pe->live) {
+                if (WOLFMKA_MEMCMP(pe->sci, p->ks_sci, MKA_SCI_LEN) == 0) {
+                    (void)WOLFMKA_MEMCPY(pdu->sak_use.latest_ks_mi, pe->mi,
+                        MKA_MI_LEN);
+                    break;
+                }
             }
         }
     }
@@ -1989,7 +2382,8 @@ static void mka_set_latest_ks_mi(const MkaParticipant* p, MkaPdu* pdu)
  */
 static void mka_build_sak_use(const MkaParticipant* p, MkaPdu* pdu)
 {
-    uint32_t lpn = 1U;
+    uint64_t latest_pn = 1U;
+    uint64_t old_pn = 1U;
 
     pdu->sak_use.present = true;
     pdu->sak_use.latest_an = p->latest.an;
@@ -1997,8 +2391,17 @@ static void mka_build_sak_use(const MkaParticipant* p, MkaPdu* pdu)
      * distribute_before_install the MKPDU that carries a new SAK goes out
      * before the data plane is programmed, and a peer takes this flag as leave
      * to start transmitting protected frames - which we could not yet decrypt.
-     * The claim follows one MKPDU later, as soon as programming is done. */
-    if (!p->sak_program_pending) {
+     * The claim follows one MKPDU later, as soon as programming is done.
+     *
+     * secy_pending is checked for the same reason and is not redundant:
+     * mka_program_sak clears sak_program_pending as its first act, *before* it
+     * issues create_rx_sc / install_rx_sa / enable_receive, any of which may
+     * return MKA_SECY_PENDING on an asynchronous data plane. Without this the
+     * two readiness tests disagreed in the unsafe direction -
+     * mka_maybe_enable_tx already refuses to transmit while an operation is
+     * outstanding, so this end would not send on an SA the hardware lacks, but
+     * it told the peer that it could. */
+    if ((!p->sak_program_pending) && (p->secy_pending == 0U)) {
         MKA_SAK_USE_SET_LATEST_RX(&pdu->sak_use);
     }
     if (p->latest.tx) {
@@ -2014,26 +2417,42 @@ static void mka_build_sak_use(const MkaParticipant* p, MkaPdu* pdu)
             MKA_SAK_USE_SET_OLD_TX(&pdu->sak_use);
         }
         pdu->sak_use.old_kn = p->old.kn;
-        pdu->sak_use.old_lpn = 1U;
     }
 
 #ifndef WOLFMKA_NO_DELAY_PROTECT
-    /* Advertise our transmit SA's next PN as the Lowest Acceptable PN and set
-     * the delay-protection flag, so a peer can bound frame delay (9.4.1). */
+    /* Tell the peer we are policing delay, so it knows the numbers below are
+     * meant to be acted on (9.4.1). */
     if (p->cfg.delay_protect) {
         MKA_SAK_USE_SET_DELAY_PROTECT(&pdu->sak_use);
     }
+#endif
+    /* The Lowest Acceptable PN is part of the SAK Use set whatever this end
+     * does about delay: it is the *peer* that uses it to advance its replay
+     * window, and a hard-coded 1 would tell it to accept everything. So the
+     * query is not gated on our own delay_protect, nor compiled out with it,
+     * and the Old key gets its own number instead of sharing the Latest key's
+     * placeholder. */
     if (p->cfg.secy.get_next_pn != NULL) {
         uint64_t pn = 1U;
         if (p->cfg.secy.get_next_pn(p->cfg.secy.ctx, p->latest.an, &pn) == 0) {
-            lpn = (uint32_t)pn;
+            latest_pn = pn;
+        }
+        if (p->old.valid) {
+            pn = 1U;
+            if (p->cfg.secy.get_next_pn(p->cfg.secy.ctx, p->old.an, &pn) == 0) {
+                old_pn = pn;
+            }
         }
     }
-#endif
-    pdu->sak_use.latest_lpn = lpn;
+    /* One read per key, whatever the cipher suite: the low half goes in the SAK
+     * Use set and, under XPN, the upper half in the XPN set. */
+    pdu->sak_use.latest_lpn = (uint32_t)latest_pn;
+    if (p->old.valid) {
+        pdu->sak_use.old_lpn = (uint32_t)old_pn;
+    }
 
 #ifndef WOLFMKA_NO_XPN
-    mka_build_xpn(p, pdu);
+    mka_build_xpn(p, pdu, latest_pn, old_pn);
 #endif
 
     mka_set_latest_ks_mi(p, pdu);
@@ -2049,14 +2468,21 @@ static void mka_build_sak_use(const MkaParticipant* p, MkaPdu* pdu)
  */
 static MkaStatus mka_build_dist_cak(const MkaParticipant* p, MkaPdu* pdu)
 {
-    uint8_t wrapped[MKA_MAX_WRAPPED_SAK];
-    size_t wlen = sizeof(wrapped);
+    /* Wrapped straight into the parameter set rather than through a local: the
+     * body is sized MKA_MAX_WRAPPED_SAK + MKA_MAX_CKN_LEN, so the wrapped CAK
+     * has exactly its own room at the front and the CKN follows it. A scratch
+     * buffer here would put a second copy of the wrapped group CAK on the stack
+     * with no wipe on either path - every sibling in this file zeroizes its key
+     * scratch (mka_ks_generate_sak, mka_install_from_dist,
+     * mka_process_dist_cak), and not having the copy at all is better than
+     * remembering to wipe it. The capacity passed is the wrapped-SAK bound, not
+     * sizeof(body), so a longer wrap cannot eat the room the CKN needs. */
+    size_t wlen = (size_t)MKA_MAX_WRAPPED_SAK;
     MkaStatus rc;
 
     rc = wm_Crypto_WrapSak(p->keys.kek, p->keys.kek_len, p->dist_cak,
-        p->dist_cak_len, wrapped, &wlen);
+        p->dist_cak_len, pdu->dist_cak.body, &wlen);
     if (rc == MKA_OK) {
-        (void)WOLFMKA_MEMCPY(pdu->dist_cak.body, wrapped, wlen);
         (void)WOLFMKA_MEMCPY(&pdu->dist_cak.body[wlen], p->dist_ckn,
             p->dist_ckn_len);
         pdu->dist_cak.body_len = wlen + p->dist_ckn_len;
@@ -2160,7 +2586,18 @@ static MkaStatus mka_build_fill(const MkaParticipant* p, MkaPdu* pdu)
     (void)WOLFMKA_MEMSET(pdu, 0, sizeof(*pdu));
 
     pdu->basic.version = (uint8_t)WOLFMKA_MKA_VERSION;
-    pdu->basic.priority = p->cfg.priority;
+    /* A participant that cannot serve advertises the never-Key-Server priority
+     * rather than its configured one. key_server_capable = false means "I
+     * cannot", and it excludes self from the local election - but the Key
+     * Server Priority field is the only way to say so on the wire, and
+     * advertising an attractive priority while refusing to serve deadlocks the
+     * CA: the peer elects us on that priority, we elect the peer because we
+     * know we cannot, and neither distributes a SAK. Peers rank 255 last (and
+     * exclude it outright under the automotive profile), so this makes the
+     * advertisement match the behaviour. */
+    pdu->basic.priority = p->cfg.key_server_capable
+                              ? p->cfg.priority
+                              : (uint8_t)MKA_PRIORITY_NEVER_KS;
     pdu->basic.key_server = p->is_key_server;
     pdu->basic.macsec_desired = p->cfg.macsec_desired;
     pdu->basic.macsec_capability = p->cfg.macsec_capability;
@@ -2257,19 +2694,39 @@ static bool mka_expire_peers(MkaParticipant* p, uint32_t now_ms)
 
     for (i = 0U; i < MKA_MAX_PEERS; i++) {
         MkaPeer* pe = &p->peers[i];
-        uint32_t deadline = MKA_LIFE_TIME_MS;
+        uint32_t deadline;
+
+        /* Validate before reading the entry, as mka_find_peer,
+         * mka_sci_entry_count, mka_peers_rx_on, mka_retire_old and
+         * mka_build_peer_lists all do. A free slot is zeroed by mka_drop_peer
+         * so the old ordering was well defined, but it did the deadline
+         * arithmetic MKA_MAX_PEERS times per tick whatever the occupancy. */
+        if (!pe->valid) {
+            continue;
+        }
+        deadline = MKA_LIFE_TIME_MS;
 #ifdef WOLFMKA_SUSPENSION
         /* A peer that advertised a suspension time is held that much longer, so
          * its keys survive the planned quiet period (802.1Xbx-2014). */
         deadline += (uint32_t)pe->suspend_for * 1000U;
 #endif
-        if (pe->valid && ((now_ms - pe->last_seen_ms) > deadline)) {
+        if ((now_ms - pe->last_seen_ms) > deadline) {
             if (pe->live) {
                 removed_live = true;
             }
             mka_drop_peer(p, pe);
         }
     }
+#ifndef WOLFMKA_NO_XPN
+    if (removed_live) {
+        /* The live membership shrank, and an SSCI is a rank within it, so the
+         * remaining channels need reprogramming - the mirror of the reapply
+         * mka_refresh_peer does on a join. A peer that simply goes quiet leaves
+         * by this path rather than by the not-live branch, since that one needs
+         * an MKPDU from the peer to run at all. */
+        mka_reapply_xpn_ssci(p);
+    }
+#endif
     return removed_live;
 }
 
@@ -2317,17 +2774,17 @@ static bool mka_pn_exhausted(const MkaParticipant* p)
 {
     const MkaSecyOps* s = &p->cfg.secy;
     uint64_t pn = 0U;
+    uint64_t threshold = (uint64_t)MKA_PN_EXHAUSTION_THRESHOLD;
 
     #ifndef WOLFMKA_NO_XPN
+    /* An XPN cipher suite counts in 64 bits, so the same three-quarters-full
+     * point sits 2^32 higher. */
     if (mka_cipher_is_xpn(p->sak_cipher_suite)) {
-        return (s->get_next_pn != NULL) &&
-               (s->get_next_pn(s->ctx, p->latest.an, &pn) == 0) &&
-               (pn > MKA_U64(0xC0000000U, 0x00000000U));
+        threshold = MKA_XPN_EXHAUSTION_THRESHOLD;
     }
     #endif
     return (s->get_next_pn != NULL) &&
-           (s->get_next_pn(s->ctx, p->latest.an, &pn) == 0) &&
-           (pn > 0xC0000000U);
+           (s->get_next_pn(s->ctx, p->latest.an, &pn) == 0) && (pn > threshold);
 }
 #endif /* WOLFMKA_NO_AUTO_REKEY */
 
@@ -2350,13 +2807,47 @@ static MkaStatus mka_ks_maybe_rekey(MkaParticipant* p, uint32_t now_ms,
     MkaStatus rc = MKA_OK;
 
 #ifndef WOLFMKA_NO_AUTO_REKEY
-    /* Automatic rekey (AUTOSAR CP_SWS_Mka_00013/00014): with a SAK in use
-     * and no handover already running, rekey after the configured time
-     * span or once the transmit PN passes the exhaustion threshold. `!gen`
-     * already implies a SAK is in use (gen = !latest.valid ||
-     * removed_live), so only the no-handover check remains. */
-    if ((!gen) && (!p->old.valid)) {
-        if ((p->cfg.sak_rekey_time_ms != 0U) &&
+    /* wm_Participant_Rekey has no clock of its own, so a manual rekey leaves
+     * its timestamp to be taken here - the first time after it that the
+     * participant is told what time it is. Without this the automatic rekey
+     * would measure its interval from whenever the *previous* key was issued,
+     * and fire again as soon as the manual handover retired; if the manual
+     * rekey came before the first wm_Participant_Run, it would measure from
+     * zero and fire on that very first run. */
+    if (p->rekey_time_pending) {
+        p->rekey_time_pending = false;
+        p->last_rekey_ms = now_ms;
+    }
+#endif
+
+#ifdef WOLFMKA_CIPHER_NEGOTIATION
+    /* A member joined that the SAK in force was not negotiated for. */
+    if (p->cap_reduced) {
+        gen = true;
+    }
+#endif
+
+#ifndef WOLFMKA_NO_AUTO_REKEY
+    /* Automatic rekey (AUTOSAR CP_SWS_Mka_00013/00014). `!gen` already implies
+     * a SAK is in use (gen = !latest.valid || removed_live), so these two are
+     * the remaining triggers.
+     *
+     * The time-based rekey waits for any handover in flight to finish: it is a
+     * hygiene policy, and starting a second handover on top of the first buys
+     * nothing.
+     *
+     * Packet-number exhaustion does not wait. Nothing bounds how long the Old
+     * key stays valid - mka_retire_old needs *every* live peer to report
+     * transmitting on the Latest key, and a peer that never does (one
+     * configured macsec_desired = false, an async SecY whose completion never
+     * arrives, a third-party peer that reports Latest Rx but not Latest Tx)
+     * pins it indefinitely. Gating exhaustion on the handover therefore used to
+     * switch off PN-exhaustion protection entirely, silently and for good,
+     * while this end kept transmitting toward GCM nonce reuse - the outcome
+     * FMEA FM-08 exists to prevent. Disrupting a stalled handover is the far
+     * cheaper failure. */
+    if (!gen) {
+        if ((!p->old.valid) && (p->cfg.sak_rekey_time_ms != 0U) &&
             ((now_ms - p->last_rekey_ms) >= p->cfg.sak_rekey_time_ms)) {
             gen = true;
         }
@@ -2375,6 +2866,10 @@ static MkaStatus mka_ks_maybe_rekey(MkaParticipant* p, uint32_t now_ms,
             /* Whatever prompted this rekey is answered; peers re-report their
              * SAK Use against the new key. */
             p->sak_lost = false;
+#ifdef WOLFMKA_CIPHER_NEGOTIATION
+            /* The new key carries the renegotiated capability. */
+            p->cap_reduced = false;
+#endif
         }
     }
     return rc;
@@ -2413,13 +2908,37 @@ static MkaStatus mka_transmit_step(MkaParticipant* p, uint32_t now_ms,
     if (sent != NULL) {
         *sent = did_send;
     }
+    /* The cadence advances however the attempt went, so a persistently failing
+     * transmit path is rate-limited to one attempt per interval rather than one
+     * per tick. That covers both ways it can fail: a send callback that rejects
+     * the frame (reported through did_send, never through rc), and a build that
+     * does not produce one at all - an AES-Key-Wrap or CMAC fault out of
+     * wolfSSL, or a peer list too large for the frame. Leaving the stamp to the
+     * success path would turn the latter into a full parameter-set fill plus an
+     * AES-CMAC on every tick of the integrator's loop, which on a 1 ms loop is
+     * two thousand times the intended rate. */
+    p->started = true;
+    p->last_tx_ms = now_ms;
     if (rc == MKA_OK) {
-        p->started = true;
-        p->last_tx_ms = now_ms;
-        /* Whatever changed is now on the wire, so the newInfo condition is
-         * satisfied until the next state change sets it again. */
-        p->new_info = false;
-        if (p->sak_program_pending && did_send) {
+        /* A participant with no transmit callback has nothing to deliver, so
+         * it advances as if the frame had gone out; otherwise only a frame the
+         * callback accepted counts. */
+        bool delivered = did_send || (p->cfg.send == NULL);
+
+        if (delivered) {
+            /* Whatever changed is now on the wire, so the newInfo condition is
+             * satisfied until the next state change sets it again. A failed
+             * send must leave it set: clearing it would discard the update
+             * entirely, and with it the reason to retransmit before the next
+             * interval. */
+            p->new_info = false;
+#ifdef WOLFMKA_SUSPENSION
+            /* Same reasoning: the one-shot suspension announcement is spent
+             * only when it reaches the wire. */
+            p->suspend_announce = false;
+#endif
+        }
+        if (p->sak_program_pending && delivered) {
             /* The MKPDU carrying the key has gone out, so the data plane can be
              * programmed now (AutoMKA-03010). Deferring until the send succeeds
              * means a key is never installed that no peer has been told about;
@@ -2468,8 +2987,18 @@ static MkaStatus mka_advance_state(MkaParticipant* p, uint32_t now_ms,
 {
     MkaStatus rc = MKA_OK;
 
-    if (p->is_key_server && (wm_Participant_LivePeerCount(p) > 0U)) {
-        rc = mka_ks_maybe_rekey(p, now_ms, removed_live);
+    /* A peer that stopped proving liveness has left the Live Peer List just as
+     * surely as one that expired, so both feed the same trigger. */
+    bool departed = removed_live || p->live_lost;
+
+    p->live_lost = false;
+    /* The trigger must be honoured even when the departing peer was the last
+     * one: by this point the live count is already zero, so gating the whole
+     * call on it would drop exactly the forward-secrecy rekey it exists for,
+     * and a member joining later would be handed the departed member's SAK. */
+    if (p->is_key_server &&
+        ((wm_Participant_LivePeerCount(p) > 0U) || departed)) {
+        rc = mka_ks_maybe_rekey(p, now_ms, departed);
     }
     mka_maybe_enable_tx(p);
     mka_retire_old(p);
@@ -2561,8 +3090,10 @@ MkaStatus wm_Participant_Run(MkaParticipant* p, uint32_t now_ms, bool* sent)
     /* While suspended, transmit only the one-shot suspension announcement, then
      * go quiet (802.1Xbx-2014). */
     if (p->suspended) {
+        /* Cleared by mka_transmit_step once the frame is actually delivered:
+         * consuming it here would lose the announcement outright if the
+         * transmit callback rejected the frame. */
         do_tx = p->suspend_announce;
-        p->suspend_announce = false;
     }
 #endif
     if (do_tx) {
@@ -2616,13 +3147,40 @@ MkaStatus wm_Participant_DistributeCak(MkaParticipant* p, const uint8_t* cak,
 /* Thin public wrapper that gates mka_ks_generate_sak() on Key-Server status. */
 MkaStatus wm_Participant_Rekey(MkaParticipant* p)
 {
+    MkaStatus rc;
+
     if (p == NULL) {
         return MKA_ERR_BAD_ARG;
     }
     if (!p->is_key_server) {
         return MKA_ERR_NOT_KS;
     }
-    return mka_ks_generate_sak(p);
+    /* One rekey at a time. Without this an integrator polling the transmit
+     * packet number and rekeying on every poll could start a second handover on
+     * top of the first: the pending-replace path discards the un-programmed
+     * Latest key while leaving the Old key in place, so the two stop tracking
+     * each other and the 2-bit Association Number can wrap onto an AN whose
+     * Secure Associations are still installed. Refusing is also the honest
+     * answer - the previous key has not reached the peers yet, so a second one
+     * cannot help.
+     *
+     * Only the un-distributed case is refused. A make-before-break handover
+     * that is merely still running (old.valid, the new key already programmed
+     * and on the wire) is a normal state to rekey out of, and the automatic
+     * packet-number-exhaustion rekey depends on being able to. */
+    if (p->sak_program_pending) {
+        return MKA_ERR_REKEY_BUSY;
+    }
+    rc = mka_ks_generate_sak(p);
+#ifndef WOLFMKA_NO_AUTO_REKEY
+    if (rc == MKA_OK) {
+        /* This call has no now_ms to record, so the automatic rekey interval is
+         * restarted from the next wm_Participant_Run rather than left measuring
+         * from the previous key. */
+        p->rekey_time_pending = true;
+    }
+#endif
+    return rc;
 }
 
 #ifdef WOLFMKA_SUSPENSION
@@ -2703,6 +3261,9 @@ void wm_Kay_Free(MkaKay* kay)
         wm_Participant_Free(&kay->parts[i]);
     }
     kay->count = 0U;
+    /* Leave the object as wm_Kay_Init would, so a freed KaY that is reused
+     * without re-initialising does not carry the old policy. */
+    kay->quiesce_others = false;
 }
 
 /* Linear scan over the configured CAKs comparing the full CKN. */
@@ -2790,8 +3351,8 @@ MkaStatus wm_Kay_RemoveParticipant(MkaKay* kay, const uint8_t* ckn,
     return MKA_OK;
 }
 
-/* Runs every participant; keeps the first non-OK status but still steps the
- * rest (one CA's failure must not stall the others). */
+/* Rejects a NULL KaY. Turning the policy off releases every hold at once, so it
+ * takes effect without waiting for a session to drop. */
 MkaStatus wm_Kay_SetQuiesceOthers(MkaKay* kay, bool enable)
 {
     if (kay == NULL) {
@@ -2821,7 +3382,12 @@ static void mka_kay_apply_quiesce(MkaKay* kay)
 
     for (i = 0U; i < kay->count; i++) {
         const MkaParticipant* p = &kay->parts[i];
-        if (p->latest.valid && p->latest.tx) {
+        /* The Old key counts: a make-before-break rekey demotes the in-force
+         * key to Old (keeping its transmit SA) and leaves latest.tx false until
+         * the peers report receiving on the new one. MACsec is protecting
+         * traffic throughout, so testing latest.tx alone would find no winner
+         * and let the losing CAs talk again for the whole handover. */
+        if ((p->latest.valid && p->latest.tx) || (p->old.valid && p->old.tx)) {
             winner = p;
             break;
         }
@@ -2832,6 +3398,8 @@ static void mka_kay_apply_quiesce(MkaKay* kay)
     }
 }
 
+/* Runs every participant; keeps the first non-OK status but still steps the
+ * rest (one CA's failure must not stall the others). */
 MkaStatus wm_Kay_Run(MkaKay* kay, uint32_t now_ms)
 {
     MkaStatus rc = MKA_OK;

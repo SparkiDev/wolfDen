@@ -109,6 +109,22 @@ peer (AutoMKA-03016).
 while the new MI is unproven, and that the stale one is gone once it is live —
 asserted well inside the Life Time, so it cannot pass by expiry.
 
+A device that resets *twice* inside the Life Time is the awkward case, and it
+used to reintroduce exactly the downtime the requirement exists to remove. Its
+first incarnation still holds a slot, its second was admitted but never got far
+enough to prove liveness, and a third then hits the per-SCI cap — so the device
+is refused until the first entry ages out, up to a full Life Time after the
+reset it had already recovered from. Nothing else frees either entry: the
+retirement above runs only when an entry for that SCI *becomes* live, which is
+precisely what cannot happen. Admission therefore reclaims the oldest entry for
+that SCI that never proved liveness. An entry that once went live is never
+taken — admission happens before the newcomer has proved anything, so a member
+asserting another member's SCI must not be able to displace it — and where
+there is nothing safe to reclaim the admission is still refused. The cap itself
+is unchanged: a device holds at most `MKA_MAX_PEERS_PER_SCI` entries, it may now
+churn its own share. `test_double_reset_is_not_locked_out` and
+`test_no_eviction_displaces_a_proven_peer` pin the two directions.
+
 ## Requirement map
 
 Status values: **Library** — implemented in wolfMKA. **Config** — a
@@ -149,11 +165,11 @@ feature, which wolfMKA satisfies by having it off (or compiled out).
 | AutoMKA-03003 | Transmit immediately on a peer-list change | Library + Config | `immediate_response` (see **Startup behaviour**) |
 | AutoMKA-03004 | Faster-than-Hello ramp after link up / participate | Config | `retry_base_ms` / `retry_cyclic_ms`; the helper installs 10 ms → Hello Time |
 | AutoMKA-03005 | "Acceptably recent" MN = one of the last three emitted | Library | `mka_mn_recent` accepts an echoed MN within the last `MKA_MN_RECENT_WINDOW` emitted (default 3, the profile's value). This is separate from the per-MI replay guard on the *sender's* own MN, which stays strictly increasing. `test_mn_recency_window` |
-| AutoMKA-03006 | Peer-reset handling: same SCI, new MI | Library | A reset peer is admitted as an additional Potential peer, both incarnations coexist, and the stale MI is retired the moment the new one proves liveness — never on first sight of it, so a forged or replayed MI cannot evict a working peer. `mka_retire_stale_mi`; `test_peer_reset_new_mi` |
+| AutoMKA-03006 | Peer-reset handling: same SCI, new MI | Library | A reset peer is admitted as an additional Potential peer, both incarnations coexist, and the stale MI is retired the moment the new one proves liveness — never on first sight of it, so a forged or replayed MI cannot evict a working peer. A device that resets again before the second incarnation proves liveness reclaims the oldest of its own never-live entries rather than being locked out for the rest of the Life Time. `mka_retire_stale_mi`, `mka_evict_stale_sci_entry`; `test_peer_reset_new_mi`, `test_double_reset_is_not_locked_out`, `test_no_eviction_displaces_a_proven_peer` |
 | AutoMKA-03007 | Speed up on priority 0 (always KS) / 255 (never KS) | Library | under the profile the values are absolute: `MKA_PRIORITY_NEVER_KS` (255) removes a candidate from the election entirely — self or peer — so two participants both set to it discover each other but neither serves; `MKA_PRIORITY_ALWAYS_KS` (0) needs no special case, being the lowest value the 9.5 comparison already prefers. `MkaRole` remains available for a pinned role in any build. `test_ks_priority_extremes` |
 | AutoMKA-03008 | Key Server always secures if configured; no implicit Null cipher | Library | the configured cipher suite is used; there is no implicit downgrade path in the profile build |
 | AutoMKA-03009 | Confidentiality offset 0 supported; 30/50 optional | Library | as AutoMKA-01001/01002 |
-| AutoMKA-03010 | Should distribute the SAK before installing it | Library | `MkaParticipantConfig.distribute_before_install` has the Key Server adopt the new key, send the MKPDU carrying it, then program the SecY (`mka_program_sak`), so both ends install together. Off by default; `wm_Participant_AutomotiveDefaults()` turns it on. Two properties make it safe: programming waits for the send to succeed, so a key is never installed that no peer was told about; and while it is outstanding the MACsec SAK Use withholds the receive claim, so no peer starts sending protected frames the data plane cannot yet decrypt. Only the Key Server defers — see **Interactions**. `test_distribute_before_install`, `test_deferred_install_send_failure`, `test_profile_rekey_is_single` |
+| AutoMKA-03010 | Should distribute the SAK before installing it | Library | `MkaParticipantConfig.distribute_before_install` has the Key Server adopt the new key, send the MKPDU carrying it, then program the SecY (`mka_program_sak`), so both ends install together. Off by default; `wm_Participant_AutomotiveDefaults()` turns it on. Two properties make it safe: programming waits for the send to succeed, so a key is never installed that no peer was told about; and while it is outstanding the MACsec SAK Use withholds the receive claim, so no peer starts sending protected frames the data plane cannot yet decrypt. That claim also waits on any asynchronous SecY install still in flight (`secy_pending`), not just on the deferred distribution - the receive bit is what releases the *peer's* transmit gate, so it has to be at least as conservative as the local one. Only the Key Server defers — see **Interactions**. `test_distribute_before_install`, `test_deferred_install_send_failure`, `test_profile_rekey_is_single` |
 | AutoMKA-03011 | Rekey when a peer's SAK Use goes missing/invalid/empty | Library | `mka_note_sak_use` tracks whether each peer still reports the key in force; when one that was using it stops — no SAK Use, an empty one, or a Key Number we never issued — the Key Server rekeys. A peer mid-handover still naming the Old key is not a loss. The flag clears on rekey, bounding it to one per loss rather than one per MKPDU. `test_rekey_on_lost_sak_use` |
 | AutoMKA-03012 | May operate without Distributed CAK | N/A | as AutoMKA-01008 |
 | AutoMKA-03013 | Deterministic SCI, stable across power cycles | Integrator | `cfg.sci` is supplied by the integrator; derive it from MAC + port |
@@ -204,7 +220,7 @@ and no state across power cycles.
 | AutoMKA-07005 | Activate/deactivate a CKN on a port | Library | `wm_Kay_AddParticipant` / `wm_Kay_RemoveParticipant`; the "active at next power cycle" semantics are the integrator's |
 | AutoMKA-07006 | Get CKN activation | Library | `wm_Kay_Find` / `wm_Kay_ParticipantCount` |
 | AutoMKA-07007 | Event: CKN activations | Integrator | wolfMKA raises no event on add/remove — those calls are the integrator's own actions, so it already knows |
-| AutoMKA-07008 | Get PAE status: status enum, peer SCI, CKN in use, cipher suite | Library | `wm_Participant_GetPaeStatus()` returns `MkaPaeStatus` — the profile's status enum plus peer SCI, CKN in use and the cipher suite in force. `MKA_PAE_WAITING_FOR_LINK_UP` is never returned: wolfMKA has no view of link state, so an integrator gating MKA on the link reports that itself. `test_pae_status` |
+| AutoMKA-07008 | Get PAE status: status enum, peer SCI, CKN in use, cipher suite | Library | `wm_Participant_GetPaeStatus()` returns `MkaPaeStatus` — the profile's status enum plus peer SCI, CKN in use and the cipher suite in force. `MKA_PAE_WAITING_FOR_LINK_UP` is never returned: wolfMKA has no view of link state, so an integrator gating MKA on the link reports that itself. `MKA_PAE_RUNNING` means protection is transmitting and stays set across a make-before-break rekey, where the demoted Old key carries traffic while the new one is gated. `test_pae_status` |
 | AutoMKA-07009 | Get MACsec statistics (802.1AE SecY, TxSC and RxSC counters) | Library | `MkaSecyOps.get_secy_stats` / `get_tx_sc_stats` / `get_rx_sc_stats` (all optional) feed `wm_Participant_GetSecyStats()`, `GetTxScStats()` and `GetRxScStats()`, returning `MkaSecyStats` / `MkaTxScStats` / `MkaRxScStats`. The counters stay the SecY's — wolfMKA routes, never counts. Peers are indexed as by `wm_Participant_GetPeer`. `test_macsec_statistics` |
 
 ### Configuration (§11)
@@ -267,6 +283,15 @@ on the **Key Server**, which is also the case AutoMKA-03010 describes — a memb
 has nothing to distribute early, so waiting would only delay its own data plane.
 `test_profile_rekey_is_single` holds this down: a rekey with the full automotive
 configuration on both ends advances the Key Number exactly once.
+
+A third consequence of AutoMKA-03010 is worth stating: while a deferred key is
+still undelivered, `wm_Participant_Rekey()` returns `MKA_ERR_REKEY_BUSY` rather
+than adopting another. A second key cannot help before the first has reached the
+peers, and stacking them lets the Latest and Old keys' Association Numbers
+collide - the un-programmed key is discarded on replacement while the Old key
+stays, so the two stop tracking each other. The automatic
+packet-number-exhaustion rekey is unaffected; it acts on a key that is already
+in force.
 
 ## Related specifications
 

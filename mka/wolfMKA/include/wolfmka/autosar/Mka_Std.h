@@ -34,24 +34,42 @@
     #include <stdint.h>
     #include <stddef.h>
 
+/** AUTOSAR 8-bit unsigned integer. */
 typedef uint8_t uint8;
+/** AUTOSAR 16-bit unsigned integer. */
 typedef uint16_t uint16;
+/** AUTOSAR 32-bit unsigned integer. */
 typedef uint32_t uint32;
+/** AUTOSAR boolean; holds TRUE or FALSE. */
 typedef uint8_t boolean;
 
     #ifndef TRUE
+        /** AUTOSAR boolean true. */
         #define TRUE 1U
     #endif
     #ifndef FALSE
+        /** AUTOSAR boolean false. */
         #define FALSE 0U
     #endif
 
+/** AUTOSAR standard return type: E_OK or E_NOT_OK. */
 typedef uint8 Std_ReturnType;
     #ifndef E_OK
+        /** the request succeeded */
         #define E_OK 0x00U
     #endif
     #ifndef E_NOT_OK
+        /** the request was rejected or failed */
         #define E_NOT_OK 0x01U
+    #endif
+
+    /* Configuration-switch values (AUTOSAR Std_Types.h). Guarded, so a real
+     * Std_Types.h that already defines them wins. */
+    #ifndef STD_ON
+        #define STD_ON 0x01U
+    #endif
+    #ifndef STD_OFF
+        #define STD_OFF 0x00U
     #endif
 
 /** Module version information (AUTOSAR Std_VersionInfoType). */
@@ -83,11 +101,14 @@ typedef struct {
     uint8* MetaDataPtr;
 } PduInfoType;
 
+/** Ethernet transceiver link state, as reported to Mka_LinkStateChange(). */
 typedef uint8 EthTrcv_LinkStateType;
     #ifndef ETHTRCV_LINK_STATE_DOWN
+        /** no link on the port */
         #define ETHTRCV_LINK_STATE_DOWN 0U
     #endif
     #ifndef ETHTRCV_LINK_STATE_ACTIVE
+        /** the port has link and can carry frames */
         #define ETHTRCV_LINK_STATE_ACTIVE 1U
     #endif
 

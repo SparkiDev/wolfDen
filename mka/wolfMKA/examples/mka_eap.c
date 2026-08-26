@@ -34,6 +34,11 @@
  * opposite orders), confirms they match, and then runs MKA to a SAK exactly as
  * the pre-shared demo does - proving the EAP-derived keys interoperate.
  *
+ * The MSK is the KDF key in full, so its length is what selects AES-128 or
+ * AES-256 CMAC and must match the CAK length: the 32-octet MSK here derives a
+ * 256-bit CAK. Supplying more MSK than CAK is refused rather than silently
+ * derived from a prefix - see wm_Crypto_DeriveCakFromMsk.
+ *
  * Build:  make examples   (or see README.md)
  */
 
@@ -149,8 +154,11 @@ static void hexline(const char* tag, const uint8_t* p, size_t n)
 int main(void)
 {
     /* Shared EAP outputs (in a real system these come from the EAP server /
-     * AAA, never hard-coded). A 32-octet MSK is used so the CKN derivation,
-     * which requires msk_len of 16 or 32, accepts it. */
+     * AAA, never hard-coded). The MSK is the KDF key in full, and its length is
+     * what selects AES-128 or AES-256 CMAC - so it must match the CAK length,
+     * and a 32-octet MSK here derives a 256-bit CAK. hostapd arranges the same
+     * thing from the other end: wpa_supplicant clamps the MSK to the CAK length
+     * before deriving. */
     static const uint8_t msk[32] = {0x4D, 0x53, 0x4B, 0x21, 0x00, 0x01, 0x02,
         0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
         0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A,
@@ -164,7 +172,8 @@ int main(void)
     MkaParticipant A, B;
     MkaParticipantConfig ca, cb;
     MkaCmacCtx* cmac;
-    uint8_t cakA[16], cakB[16];
+    MkaRandom* rng;
+    uint8_t cakA[32], cakB[32];
     uint8_t cknA[16], cknB[16];
     int tick;
     int rc;
@@ -180,6 +189,13 @@ int main(void)
         printf("cmac init failed\n");
         return 1;
     }
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        fprintf(stderr, "could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     /* Each PAE derives the pair from the MSK and the two MAC addresses. A
      * passes (macA, macB); B passes (macB, macA) - opposite order, to show the
@@ -193,6 +209,7 @@ int main(void)
         wm_Crypto_DeriveCknFromMsk(cmac, msk, sizeof(msk), sid, sizeof(sid),
             macB, macA, cknB, sizeof(cknB)) != MKA_OK) {
         printf("EAP key derivation failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -204,6 +221,7 @@ int main(void)
     if (memcmp(cakA, cakB, sizeof(cakA)) != 0 ||
         memcmp(cknA, cknB, sizeof(cknA)) != 0) {
         printf("Result     : FAILURE - the two ends derived different keys\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -216,6 +234,7 @@ int main(void)
     memcpy(ca.cak.ckn, cknA, sizeof(cknA));
     ca.cak.ckn_len = (uint8_t)sizeof(cknA);
     ca.cmac = cmac;
+    ca.rng = rng;
     cb = ca; /* same derived CAK/CKN and (shared) CMAC workspace */
 
     memcpy(ca.sci, macA, MKA_MAC_LEN);
@@ -243,6 +262,7 @@ int main(void)
     if (wm_Participant_Init(&A, &ca) != MKA_OK ||
         wm_Participant_Init(&B, &cb) != MKA_OK) {
         printf("init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -276,6 +296,7 @@ int main(void)
     }
     wm_Participant_Free(&A);
     wm_Participant_Free(&B);
+    wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
     return rc;
 }

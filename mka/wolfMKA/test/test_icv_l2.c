@@ -37,6 +37,7 @@ int g_tests_failed = 0;
 /* Declared in test_util.h for the shared harness; unused here but defined so
  * the header links cleanly. */
 MkaCmacCtx* g_cmac = NULL;
+MkaRandom* g_rng = NULL;
 
 #ifndef WOLFMKA_ICV_L2_ADDR
 /* Built by `make test-icv-l2`, which supplies -DWOLFMKA_ICV_L2_ADDR. Without it

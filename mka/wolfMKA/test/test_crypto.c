@@ -177,7 +177,7 @@ static void test_sak_distribution(void)
     cak.ckn_len = 4;
     CHECK(wm_Crypto_DeriveKeys(g_cmac, &cak, &keys) == MKA_OK, "derive keys");
 
-    CHECK(wm_Crypto_GenerateSak(NULL, sak, sizeof(sak)) == MKA_OK, "gen sak");
+    CHECK(wm_Crypto_GenerateSak(g_rng, sak, sizeof(sak)) == MKA_OK, "gen sak");
     CHECK(wm_Crypto_WrapSak(keys.kek, keys.kek_len, sak, sizeof(sak), wrapped,
               &wlen) == MKA_OK,
         "wrap sak");
@@ -255,6 +255,25 @@ static void test_eap_derivation(void)
               16) == MKA_OK,
         "ckn");
     CHECK_EQ_MEM(ckn, e_ckn, 16, "CKN vector");
+
+    /* An MSK longer than the CAK is refused, not truncated. The MSK is the KDF
+     * key in full, and its length is what selects AES-128 or AES-256 CMAC - so
+     * keying with the leftmost cak_len octets would drop the rest of the MSK
+     * and produce a CAK that neither the 9.3.2 formula nor hostapd's
+     * ieee802_1x_cak_aes_cmac (which passes 8 * msk_bytes) describes. Every
+     * vector above uses equal lengths, which is why none of them could tell the
+     * two rules apart. */
+    CHECK(wm_Crypto_DeriveCakFromMsk(g_cmac, msk, 32, mac1, mac2, cak16, 16) ==
+              MKA_ERR_BAD_ARG,
+        "a 32-octet MSK for a 128-bit CAK is refused");
+    CHECK(wm_Crypto_DeriveCakFromMsk(g_cmac, msk, 24, mac1, mac2, cak16, 16) ==
+              MKA_ERR_BAD_ARG,
+        "and so is any other mismatch");
+    /* The CKN derivation keeps taking the MSK length, which is what it always
+     * used and what hostapd's ieee802_1x_ckn_aes_cmac uses too. */
+    CHECK(wm_Crypto_DeriveCknFromMsk(g_cmac, msk, 32, sid, 4, mac1, mac2, ckn,
+              16) == MKA_OK,
+        "a 32-octet MSK still derives a CKN");
 
     /* Swapping the two MACs must not change the derived CAK
      * (mka_join_two_macs). */
@@ -362,7 +381,7 @@ static void test_sak_icv_errors(void)
      */
     printf("crypto error paths (sak/icv):\n");
     CHECK(wm_Crypto_GenerateSak(NULL, buf, 20) == BAD, "sak len 20");
-    CHECK(wm_Crypto_Random(NULL, buf, 0) == BAD, "random len 0");
+    CHECK(wm_Crypto_Random(g_rng, buf, 0) == BAD, "random len 0");
 
     n = sizeof buf;
     CHECK(wm_Crypto_WrapSak(k16, 20, buf, 16, buf, &n) == BAD, "wrap kek len");
@@ -392,6 +411,19 @@ static void test_sak_icv_errors(void)
  * crypto function rejected as NULL at *each* position (not just the first), so
  * each operand of the compound NULL guards is exercised both ways; plus both
  * valid key/SAK lengths (16 and 32) so each length-check operand is too. */
+/* A context length that is individually within the KDF's scratch buffer but
+ * makes the *total* (1 + label + 1 + context + 2) exceed it - so only the total
+ * check can reject it, and the per-component guard must not shadow it.
+ *
+ * The buffer is private to mka_crypto.c and its size depends on the build:
+ * MKA_KDF_BUF_LEN is 1 + 24 + 1 + MKA_KDF_CTX_MAX + 2, and MKA_KDF_CTX_MAX is
+ * 96 with EAP and 16 without. These mirror that, and must move with it. */
+#ifdef WOLFMKA_NO_EAP
+    #define MKA_KDF_TOTAL_OVERFLOW_LEN 40U /* buffer 44 */
+#else
+    #define MKA_KDF_TOTAL_OVERFLOW_LEN 120U /* buffer 124 */
+#endif
+
 static void test_crypto_invalid_params(void)
 {
     uint8_t k16[16] = {0}, k32[32] = {0};
@@ -456,10 +488,16 @@ static void test_crypto_invalid_params(void)
     CHECK(wm_Crypto_DeriveKeys(g_cmac, &cak, &dk) == MKA_OK,
         "keys cak len 32 ok");
 
-    /* wm_Crypto_GenerateSak / wm_Crypto_Random (NULL rng => per-call). */
-    CHECK(wm_Crypto_GenerateSak(NULL, NULL, 16) == BAD, "gen sak NULL buf");
-    CHECK(wm_Crypto_GenerateSak(NULL, out, 32) == MKA_OK, "gen sak len 32 ok");
-    CHECK(wm_Crypto_Random(NULL, NULL, 4) == BAD, "random NULL");
+    /* wm_Crypto_GenerateSak / wm_Crypto_Random. The RNG workspace is mandatory
+     * in every build, as the CMAC workspace is: wolfSSL's WC_RNG is never put
+     * on wolfMKA's stack or heap, so there is nothing to substitute for a
+     * missing one and it is refused rather than quietly replaced by a per-call
+     * RNG. */
+    CHECK(wm_Crypto_GenerateSak(g_rng, NULL, 16) == BAD, "gen sak NULL buf");
+    CHECK(wm_Crypto_GenerateSak(g_rng, out, 32) == MKA_OK, "gen sak len 32 ok");
+    CHECK(wm_Crypto_GenerateSak(NULL, out, 16) == BAD, "gen sak NULL rng");
+    CHECK(wm_Crypto_Random(g_rng, NULL, 4) == BAD, "random NULL buf");
+    CHECK(wm_Crypto_Random(NULL, out, 4) == BAD, "random NULL rng");
 
     /* wm_Crypto_RandomInit / RandomFree: a pool of RNG objects. Acquire
      * until exhausted, use one, release all (plus a NULL no-op free). Works for
@@ -469,6 +507,14 @@ static void test_crypto_invalid_params(void)
         MkaRandom* r;
         size_t got = 0U;
         size_t j;
+
+        /* The harness holds one slot for the whole run (every participant
+         * config needs an RNG), so hand it back first and the pool starts
+         * empty - otherwise "acquire until exhausted" would be one short of
+         * the pool size and the check below would depend on who else is
+         * holding one. */
+        wm_Crypto_RandomFree(g_rng);
+        g_rng = NULL;
         while ((r = wm_Crypto_RandomInit()) != NULL) {
             rs[got] = r;
             got++;
@@ -482,6 +528,9 @@ static void test_crypto_invalid_params(void)
             wm_Crypto_RandomFree(rs[j]);
         }
         wm_Crypto_RandomFree(NULL);
+        g_rng = wm_Crypto_RandomInit();
+        CHECK(g_rng != NULL, "the harness reclaims its RNG for the rest of the "
+                             "run");
     }
 
     /* wm_Crypto_CmacInit / CmacFree: the CMAC pool. main() holds the shared
@@ -554,6 +603,221 @@ static void test_crypto_invalid_params(void)
         "verify data NULL");
     CHECK(wm_Crypto_IcvVerify(g_cmac, k16, 16, in32, 8, NULL) == BAD,
         "verify icv NULL");
+
+    /* An output length that is not a whole number of CMAC blocks exercises the
+     * clamp on the final copy - `take = out_len - produced`, capped at the
+     * block size. Structural coverage cannot see this: the copy is the same
+     * line whether it moves 16 octets or fewer, so a suite that only ever asks
+     * for multiples of 16 leaves the partial case untested at 100% MC/DC. The
+     * guard octets past the requested length are what prove the clamp holds. */
+    {
+        uint8_t k[16];
+        uint8_t buf24[32];
+        uint8_t again[32];
+        size_t j;
+        int differ = 0;
+        int wrote = 0;
+
+        memset(k, 0x3C, sizeof k);
+        memset(buf24, 0xAA, sizeof buf24);
+        CHECK(wm_Crypto_Kdf(g_cmac, k, sizeof k, "IEEE8021 KEK", NULL, 0U,
+                  buf24, 24U) == MKA_OK,
+            "a 24-octet derivation spans two blocks, the second partial");
+        for (j = 24U; j < sizeof buf24; j++) {
+            if (buf24[j] != 0xAAU) {
+                wrote = 1;
+            }
+        }
+        CHECK(wrote == 0, "and writes nothing past the requested length");
+        for (j = 0U; j < 24U; j++) {
+            if (buf24[j] != 0U) {
+                differ = 1;
+            }
+        }
+        CHECK(differ == 1, "the requested octets were produced");
+
+        /* Deterministic, so the partial block is the real block prefix rather
+         * than whatever was left in the scratch. */
+        memset(again, 0xAA, sizeof again);
+        CHECK(wm_Crypto_Kdf(g_cmac, k, sizeof k, "IEEE8021 KEK", NULL, 0U,
+                  again, 24U) == MKA_OK,
+            "derive the same 24 octets again");
+        CHECK_EQ_MEM(buf24, again, 24U, "the derivation is deterministic");
+    }
+
+    /* A length large enough to wrap the KDF's own input-length sum must be
+     * rejected, not summed. wm_Crypto_Kdf bounds neither its label nor its
+     * context, and 1 + label + 1 + context + 2 is size_t arithmetic: before the
+     * guard, a context_len near SIZE_MAX wrapped to a small total, passed the
+     * buffer check, and was memcpy'd into a 124-octet stack buffer. The buffer
+     * is never read, so a bogus length is safe to pass here. */
+    /* The label is one octet, so the total is 5 + context_len; (size_t)-5 wraps
+     * it to exactly zero, which sails past a check on the total alone. */
+    CHECK(wm_Crypto_Kdf(g_cmac, k16, 16, "L", in32, (size_t)-5, out, 16) ==
+              MKA_ERR_BAD_ARG,
+        "a context length that would wrap the KDF total is rejected");
+    /* A context that is individually in range but pushes the *total* past the
+     * buffer is still rejected - by the total check, which the component guard
+     * above must not render unreachable. */
+    CHECK(wm_Crypto_Kdf(g_cmac, k16, 16, "L", in32, MKA_KDF_TOTAL_OVERFLOW_LEN,
+              out, 16) == MKA_ERR_BAD_ARG,
+        "a context that overflows only the total is rejected too");
+
+#ifndef WOLFMKA_NO_EAP
+    /* Same shape in the EAP Session-Id bound, which added to the caller's
+     * length before comparing. Defence in depth rather than an independent
+     * defect: the component bound above now rejects such a length first, so
+     * this asserts the contract without being able to pin that guard on its
+     * own - reverting mka_sid_valid alone leaves this passing. */
+    {
+        uint8_t mac1[MKA_MAC_LEN], mac2[MKA_MAC_LEN], ckn_out[32];
+        memset(mac1, 1, sizeof mac1);
+        memset(mac2, 2, sizeof mac2);
+        CHECK(wm_Crypto_DeriveCknFromMsk(g_cmac, k32, 32, in32, (size_t)-8,
+                  mac1, mac2, ckn_out, sizeof ckn_out) == MKA_ERR_BAD_ARG,
+            "an EAP Session-Id length that would wrap is rejected");
+    }
+#endif
+
+    /* Every length crosses into wolfSSL as a 32-bit word. On a 64-bit host an
+     * oversized size_t would truncate silently, and a truncated message length
+     * yields a valid-looking ICV over the wrong span of octets - so it has to
+     * be an error, not a cast. The buffer is never read, so a bogus length is
+     * safe to pass. */
+#if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)
+    CHECK(wm_Crypto_IcvCompute(g_cmac, k16, 16, in32, (size_t)0x100000000ULL,
+              icv) == MKA_ERR_BAD_ARG,
+        "an ICV length beyond 32 bits is rejected");
+    CHECK(wm_Crypto_IcvVerify(g_cmac, k16, 16, in32, (size_t)0x100000000ULL,
+              icv) == MKA_ERR_BAD_ARG,
+        "and so is one on verify");
+    CHECK(wm_Crypto_Random(g_rng, out, (size_t)0x100000000ULL) ==
+              MKA_ERR_BAD_ARG,
+        "and a random request beyond 32 bits");
+#endif
+    /* The in-range side of the same check. */
+    CHECK(wm_Crypto_IcvCompute(g_cmac, k16, 16, in32, sizeof in32, icv) ==
+              MKA_OK,
+        "an ordinary length still works");
+
+    /* Wrap and unwrap take an output *capacity*, which is only lower-bounded -
+     * so it too has to survive the narrowing to word32 on its way to wolfSSL.
+     */
+#if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)
+    {
+        uint8_t wrap_out[40];
+        uint8_t plain[40];
+        size_t huge = (size_t)0x100000000ULL;
+
+        CHECK(wm_Crypto_WrapSak(k32, 32, k16, 16, wrap_out, &huge) ==
+                  MKA_ERR_BAD_ARG,
+            "a wrap capacity beyond 32 bits is rejected");
+        huge = (size_t)0x100000000ULL;
+        CHECK(wm_Crypto_UnwrapSak(k32, 32, wrap_out, 24, plain, &huge) ==
+                  MKA_ERR_BAD_ARG,
+            "and so is an unwrap capacity");
+    }
+#endif
+
+    /* A failed unwrap must leave no decrypted material in the caller's buffer.
+     * This asserts the property, not the mechanism: the wolfSSL in use zeroes
+     * the output on an integrity failure by itself, so removing wolfMKA's own
+     * wipe leaves this test still passing. The wipe is kept as defence in depth
+     * against a wolfSSL that does not - see wm_Crypto_UnwrapSak - and this
+     * check would catch that regression, which is what it is for. */
+    {
+        uint8_t blob[40];
+        uint8_t plain[40];
+        size_t plain_len = sizeof plain;
+        size_t j;
+        int nonzero = 0;
+
+        memset(blob, 0x5A, sizeof blob);
+        memset(plain, 0xCC, sizeof plain);
+        CHECK(wm_Crypto_UnwrapSak(k32, 32, blob, sizeof blob, plain,
+                  &plain_len) == MKA_ERR_CRYPTO,
+            "a corrupt blob fails the integrity check");
+        /* Only the first wrapped_len - 8 octets can ever be written. The rest
+         * is the caller's own and was never plaintext, so it is deliberately
+         * left alone: sizing the wipe by the caller's capacity instead would
+         * write past the end of a buffer merely *described* as large. */
+        for (j = 0U; j < (sizeof blob - 8U); j++) {
+            if (plain[j] != 0U) {
+                nonzero = 1;
+            }
+        }
+        CHECK(nonzero == 0, "and leaves no plaintext behind");
+        CHECK(plain[sizeof blob - 8U] == 0xCCU,
+            "without touching what lies beyond the unwrapped size");
+    }
+
+    /* Documented as ignoring NULL - and it must, since the failure paths that
+     * wipe key material can reach it with nothing to wipe. */
+    wm_Crypto_ForceZero(NULL, 16U);
+    CHECK(1, "ForceZero(NULL) does not dereference");
+}
+
+/* Known-answer vectors for the 802.1X key hierarchy.
+ *
+ * The expected bytes were produced by an independent implementation of the
+ * IEEE Std 802.1X-2010 6.2.1 KDF (SP 800-108 counter mode) driving OpenSSL's
+ * AES-CMAC, itself first checked against the RFC 4493 vectors. They therefore
+ * pin the construction to the specification rather than to whatever wolfMKA
+ * happens to compute: a change to the label, the counter, the length encoding
+ * or the CKN context handling breaks these, where a self-consistent
+ * derive-then-check test would not.
+ *
+ * The CKN context is the leftmost 16 octets of the CKN, zero padded - so the
+ * short-CKN case exercises the padding and the long-CKN case the truncation
+ * (802.1X 9.3.3). */
+static void test_kek_ick_kat(void)
+{
+    static const uint8_t kek16[16] = {0x8B, 0xEE, 0x27, 0xCC, 0x21, 0x19, 0xC0,
+        0x3C, 0x2B, 0xC0, 0xE2, 0x25, 0xD3, 0x47, 0x6F, 0xA6};
+    static const uint8_t ick16[16] = {0x6A, 0x44, 0x09, 0xE6, 0x91, 0x75, 0xDF,
+        0x0E, 0x71, 0xA5, 0x14, 0xCA, 0xA2, 0x9F, 0x8C, 0xE8};
+    static const uint8_t kek32[32] = {0xEA, 0xC8, 0xB3, 0x27, 0x02, 0x26, 0x7B,
+        0xF9, 0xBB, 0xAD, 0xD0, 0xBE, 0x9A, 0x7F, 0x25, 0xD5, 0xC8, 0x01, 0x26,
+        0x13, 0xB5, 0x3A, 0x82, 0xF3, 0x76, 0x92, 0x33, 0x69, 0x5B, 0xC3, 0x4F,
+        0x22};
+    static const uint8_t ick32[32] = {0xD4, 0xE7, 0x25, 0x75, 0x57, 0x65, 0x46,
+        0x68, 0xE3, 0xDD, 0x38, 0xDE, 0xAE, 0x46, 0x4D, 0x40, 0xE5, 0x2F, 0x3F,
+        0x70, 0x87, 0x9F, 0x19, 0x3E, 0xEA, 0x22, 0xEB, 0x85, 0x50, 0xD8, 0x0A,
+        0xCC};
+    MkaCakPair cak;
+    MkaDerivedKeys keys;
+    size_t i;
+
+    printf("KEK/ICK known-answer vectors:\n");
+
+    /* 128-bit CAK, 7-octet CKN: the context is zero padded to 16. */
+    memset(&cak, 0, sizeof cak);
+    memset(cak.cak, 0x11, 16);
+    cak.cak_len = 16U;
+    memcpy(cak.ckn, "kat-ckn", 7);
+    cak.ckn_len = 7U;
+    memset(&keys, 0, sizeof keys);
+    CHECK(wm_Crypto_DeriveKeys(g_cmac, &cak, &keys) == MKA_OK, "derive 128");
+    CHECK(keys.kek_len == 16U && keys.ick_len == 16U, "128-bit key lengths");
+    CHECK_EQ_MEM(keys.kek, kek16, 16, "KEK matches the 802.1X KDF");
+    CHECK_EQ_MEM(keys.ick, ick16, 16, "ICK matches the 802.1X KDF");
+
+    /* 256-bit CAK, full-length CKN: the context is truncated to 16, and the
+     * output needs two CMAC blocks so the counter is exercised. */
+    memset(&cak, 0, sizeof cak);
+    for (i = 0U; i < 32U; i++) {
+        cak.cak[i] = (uint8_t)(0x20U + i);
+    }
+    cak.cak_len = 32U;
+    for (i = 0U; i < MKA_MAX_CKN_LEN; i++) {
+        cak.ckn[i] = (uint8_t)(0x40U + i);
+    }
+    cak.ckn_len = MKA_MAX_CKN_LEN;
+    memset(&keys, 0, sizeof keys);
+    CHECK(wm_Crypto_DeriveKeys(g_cmac, &cak, &keys) == MKA_OK, "derive 256");
+    CHECK(keys.kek_len == 32U && keys.ick_len == 32U, "256-bit key lengths");
+    CHECK_EQ_MEM(keys.kek, kek32, 32, "KEK matches across two KDF blocks");
+    CHECK_EQ_MEM(keys.ick, ick32, 32, "ICK matches across two KDF blocks");
 }
 
 #ifdef WOLFMKA_ICV_L2_ADDR
@@ -607,6 +871,18 @@ static void test_icv_l2(void)
               data, sizeof data, icv) == BAD,
         "L2 icv rejects a long prefix");
 
+    /* And the data length has to survive the narrowing to wolfSSL's word32,
+     * same as the non-L2 path. The buffer is never read, so a bogus length is
+     * safe to pass. */
+    #if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)
+    CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              (size_t)0x100000000ULL, icv) == BAD,
+        "L2 icv rejects a length beyond 32 bits");
+    CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
+              (size_t)0x100000000ULL, icv) == BAD,
+        "and so does verify");
+    #endif
+
     /* Every pointer position, on both entry points. */
     CHECK(wm_Crypto_IcvComputeL2(NULL, ick, sizeof ick, l2, sizeof l2, data,
               sizeof data, icv) == BAD,
@@ -632,6 +908,34 @@ static void test_icv_l2(void)
     CHECK(wm_Crypto_IcvVerifyL2(NULL, ick, sizeof ick, l2, sizeof l2, data,
               sizeof data, icv) == BAD,
         "L2 verify cmac NULL");
+
+    /* Known-answer: AES-CMAC(ICK, L2 || data) computed independently, so an
+     * interop-breaking change to what the prefix contains or the order it is
+     * fed in breaks this rather than passing self-consistently. */
+    {
+        static const uint8_t kat_ick[16] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11};
+        static const uint8_t kat_l2[MKA_ICV_L2_PREFIX_LEN] = {0x01, 0x80, 0xC2,
+            0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x88, 0x8E};
+        static const uint8_t kat_icv[16] = {0x14, 0xE4, 0x2E, 0xC6, 0x2A, 0x4B,
+            0x85, 0x09, 0x5C, 0xF5, 0x61, 0xCF, 0xA7, 0x1F, 0x12, 0x46};
+        static const uint8_t kat_icv_empty[16] = {0xDB, 0x2D, 0x3A, 0x0F, 0x6D,
+            0x56, 0x08, 0x72, 0xC2, 0x4A, 0x77, 0x60, 0x65, 0x44, 0x78, 0x85};
+        uint8_t kat_data[64];
+        uint8_t got[16];
+
+        memset(kat_data, 0x22, sizeof kat_data);
+        CHECK(wm_Crypto_IcvComputeL2(g_cmac, kat_ick, sizeof kat_ick, kat_l2,
+                  sizeof kat_l2, kat_data, sizeof kat_data, got) == MKA_OK,
+            "L2 icv KAT computes");
+        CHECK_EQ_MEM(got, kat_icv, 16, "L2 ICV matches the known answer");
+
+        CHECK(wm_Crypto_IcvComputeL2(g_cmac, kat_ick, sizeof kat_ick, kat_l2,
+                  sizeof kat_l2, kat_data, 0U, got) == MKA_OK,
+            "L2 icv KAT over the prefix alone");
+        CHECK_EQ_MEM(got, kat_icv_empty, 16,
+            "prefix-only L2 ICV matches the known answer");
+    }
 
     /* A zero-length body is still signable: the prefix alone is covered. */
     CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
@@ -679,6 +983,7 @@ void run_crypto_tests(void)
     test_derive_errors();
     test_sak_icv_errors();
     test_crypto_invalid_params();
+    test_kek_ick_kat();
 #ifdef WOLFMKA_ICV_L2_ADDR
     test_icv_l2();
 #endif

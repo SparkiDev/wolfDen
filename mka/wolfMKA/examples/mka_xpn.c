@@ -199,6 +199,7 @@ int main(void)
     MkaParticipant A, B;
     MkaParticipantConfig ca, cb;
     MkaCmacCtx* cmac;
+    MkaRandom* rng;
     MkaSakInfo info;
     int tick;
     int rc;
@@ -214,6 +215,13 @@ int main(void)
         printf("cmac init failed\n");
         return 1;
     }
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        fprintf(stderr, "could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     memset(&ca, 0, sizeof(ca));
     memset(ca.cak.cak, 0xCA, 16);
@@ -225,6 +233,7 @@ int main(void)
      * exchange that advertises the wide PN. */
     ca.cipher_suite = MKA_CIPHER_GCM_AES_XPN_128;
     ca.cmac = cmac;
+    ca.rng = rng;
     cb = ca; /* same CAK/CKN, suite and (shared) CMAC workspace */
 
     {
@@ -258,6 +267,7 @@ int main(void)
     if (wm_Participant_Init(&A, &ca) != MKA_OK ||
         wm_Participant_Init(&B, &cb) != MKA_OK) {
         printf("init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         return 1;
     }
@@ -296,6 +306,7 @@ int main(void)
     }
     wm_Participant_Free(&A);
     wm_Participant_Free(&B);
+    wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
     return rc;
 }

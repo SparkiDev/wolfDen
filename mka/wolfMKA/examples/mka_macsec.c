@@ -589,6 +589,7 @@ int main(int argc, char** argv)
     MkaParticipantConfig cfg;
     MkaParticipant p;
     MkaCmacCtx* cmac;
+    MkaRandom* rng;
     uint8_t cak[MKA_MAX_CAK_LEN];
     uint8_t ckn[MKA_MAX_CKN_LEN];
     size_t cak_len, ckn_len;
@@ -623,6 +624,13 @@ int main(int argc, char** argv)
         (void)close(lk.fd);
         return 1;
     }
+    rng = wm_Crypto_RandomInit();
+    if (rng == NULL) {
+        fprintf(stderr, "could not acquire RNG workspace\n");
+        wm_Crypto_RandomFree(rng);
+        wm_Crypto_CmacFree(cmac);
+        return 1;
+    }
 
     memset(&cfg, 0, sizeof cfg);
     memcpy(cfg.cak.cak, cak, cak_len);
@@ -645,9 +653,11 @@ int main(int argc, char** argv)
     cfg.send = link_send;
     cfg.send_ctx = &lk;
     cfg.cmac = cmac;
+    cfg.rng = rng;
 
     if (wm_Participant_Init(&p, &cfg) != MKA_OK) {
         printf("participant init failed\n");
+        wm_Crypto_RandomFree(rng);
         wm_Crypto_CmacFree(cmac);
         secy_macsec_free(&secy);
         (void)close(lk.fd);
@@ -709,6 +719,7 @@ int main(int argc, char** argv)
         }
     }
     wm_Participant_Free(&p);
+    wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
     secy_macsec_free(&secy);
     (void)close(lk.fd);

@@ -11,10 +11,24 @@ build/
 *.gcda
 *.gcov
 
-# Test / example binaries
+# Test / example binaries (one per feature-gated make target)
 test/runtests
 test/runalloc
 test/runfault
+test/runauto
+test/runautosar
+test/rundet
+test/rundistcak
+test/runendian
+test/runicvl2
+test/runicvl2suite
+test/runkmd
+test/runnego
+test/runsanitize
+test/runsusp
+test/test_endian_be
+test/fuzz_pdu
+test/fuzz_receive
 examples/mka_link
 
 # Generated Doxygen HTML

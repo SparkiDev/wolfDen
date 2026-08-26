@@ -1,10 +1,12 @@
 # MC/DC & Per-Configuration Structural Coverage
 
-The core sources (`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`) meet **100% line,
-decision (branch) and MC/DC** coverage (DO-178C DAL A), and the build
-**enforces** it: `make coverage` fails below 100% on any of the three metrics,
-and `make coverage-configs` re-checks the same across all eleven delivered
-configurations. This document describes how MC/DC is measured and records the
+The core sources (`mka_crypto.c`, `mka_kay.c`, `mka_pdu.c`, `mka_status.c`) meet
+**100% line, decision (branch) and MC/DC** coverage (DO-178C DAL A), and the
+build **enforces** it: `make coverage` fails below 100% on any of the three
+metrics, and `make coverage-configs` re-checks the same across all eleven
+delivered configurations. `make coverage-autosar` applies the same enforced bar
+to `src/autosar/Mka.c`, which needs its own flags and suite. Between them every
+`.c` file in `src/` is gated — nothing is measured by hand. This document describes how MC/DC is measured and records the
 evidence behind the 100% figures — in particular how the cipher-negotiation code
 and the feature-off builds were brought to full coverage.
 
@@ -18,6 +20,10 @@ source is 100% line + decision + MC/DC — i.e. the gate enforces DAL-A structur
 coverage, not just DAL-B.
 
 ## Coverage status
+
+`mka_status.c` (the exhaustive `MkaStatus` -> string switch) is enforced in
+every configuration too; it is omitted from the table below only because it is
+100% in all of them with nothing configuration-dependent to say about it.
 
 | Configuration | mka_crypto.c | mka_kay.c | mka_pdu.c |
 |---|---|---|---|
@@ -71,7 +77,7 @@ configuration. Every feature-specific test is `#ifndef`-gated, so all eleven
 configurations compile and run their suites to `failures: 0 => PASS` under their
 own flag. Reachability-driven vectors were added in the process (e.g. an
 empty-context KDF call and an explicit XPN make-before-break "old key" emission),
-so the default `make test` is now 978 checks.
+so the default `make test` is now 1408 checks (1462 under `make test-fault`, which adds the injected-failure cases).
 
 Two library fixes were needed along the way: `MKA_VAR_OK` was made
 compile-time-true in the object-backed (no-malloc) configuration, removing an
@@ -88,19 +94,21 @@ drive is covered with an added requirements-based test rather than excluded.
 The `checks` column is each configuration's suite size as `cov-impl` actually
 builds it — instrumented with `-DWOLFMKA_FAULT_INJECT` (plus, for the first three
 rows, the `DISTRIBUTED_CAK KMD SUSPENSION` certification-base flags) — so it is
-larger than the default 728-check `make test`.
+larger than the default 1408-check `make test`.
 
 | Configuration            | checks | line | decision | MC/DC |
 |--------------------------|:------:|:----:|:--------:|:-----:|
-| cert-base                |  821   | 100% |   100%   | 100%  |
-| negotiation              |  878   | 100% |   100%   | 100%  |
-| small-stack + no-malloc  |  821   | 100% |   100%   | 100%  |
-| `NO_ANNOUNCEMENTS`       |  733   | 100% |   100%   | 100%  |
-| `NO_RETRY`               |  753   | 100% |   100%   | 100%  |
-| `NO_DELAY_PROTECT`       |  751   | 100% |   100%   | 100%  |
-| `NO_XPN`                 |  719   | 100% |   100%   | 100%  |
-| `NO_EAP`                 |  737   | 100% |   100%   | 100%  |
-| `NO_AUTO_REKEY`          |  758   | 100% |   100%   | 100%  |
+| cert-base                |  1522  | 100% |   100%   | 100%  |
+| negotiation              |  1618  | 100% |   100%   | 100%  |
+| automotive-profile       |  1440  | 100% |   100%   | 100%  |
+| icv-l2                   |  1546  | 100% |   100%   | 100%  |
+| small-stack + no-malloc  |  1522  | 100% |   100%   | 100%  |
+| `NO_ANNOUNCEMENTS`       |  1417  | 100% |   100%   | 100%  |
+| `NO_RETRY`               |  1448  | 100% |   100%   | 100%  |
+| `NO_DELAY_PROTECT`       |  1433  | 100% |   100%   | 100%  |
+| `NO_XPN`                 |  1373  | 100% |   100%   | 100%  |
+| `NO_EAP`                 |  1430  | 100% |   100%   | 100%  |
+| `NO_AUTO_REKEY`          |  1444  | 100% |   100%   | 100%  |
 
 Three feature-off builds each had a single feature-conditioned branch below 100%.
 Their resolution distinguishes **dead** code from merely **untested** code:
@@ -116,3 +124,37 @@ Only the `NO_XPN` branch was genuinely dead, and it alone was excluded with
 did not reach; excluding them would have been a functional regression (the
 empty-context KDF and the manual-rekey Old-key PN advertisement would silently
 disappear), so they were closed with requirements-based tests instead.
+
+## The AUTOSAR binding has its own gate
+
+`src/autosar/Mka.c` is outside `COV_FILES`, because it needs
+`-DWOLFMKA_AUTOSAR` and its own suite rather than the shared one. That left it
+measured by hand and free to regress — which it did: at the point the gate was
+added it stood at **97.18% line / 95.83% decision / 95.11% MC/DC**, and the
+uncovered outcomes were the failure paths of recently added guards (a `PaeCount`
+with a NULL `Paes`, a zero `PermissiveTimeoutMs`, and the whole SecY statistics
+pass-through, which no test ever supplied a `get_secy_stats` hook for).
+
+`make coverage-autosar` now enforces the same 100% line + decision + MC/DC bar on
+it, and runs in CI. It is at 100% of 335 lines, 226 branch outcomes and 218
+condition outcomes. One decision was removed rather than covered:
+
+| File:function | Decision | Nature | Resolution |
+|---|---|---|---|
+| `Mka.c:mka_active_status` | `wm_Participant_GetPaeStatus(...) == MKA_OK` *false* outcome | **structurally unreachable** — that call fails only on a NULL argument, and neither argument can be NULL at this site | branch removed; `ps.state` is seeded to `MKA_PAE_UNDEFINED` (which ranks lowest, so a hypothetical failure loses to every real status) and the call's result used directly |
+
+## Decisions that exist only on some hosts
+
+Two guards are conditioned on properties of the *host* rather than a wolfMKA
+feature flag, so they are not decisions at all in the configuration where the
+property does not hold. Both are excluded by the preprocessor for exactly that
+reason, which is what keeps them from appearing as uncoverable outcomes:
+
+| Construct | Condition | Why it is excluded rather than tested |
+|---|---|---|
+| `mka_len_fits_word32` (`mka_crypto.c`) | `#if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)` | Every length crosses into wolfSSL as a `word32`. Where `size_t` is already 32 bits or narrower the comparison can never be false, so on such a target the guard would be an uncoverable outcome; the body is compiled out and the function returns `true` unconditionally. On a 64-bit host both outcomes are driven by the suite (a length of `0x100000000` is rejected, an ordinary one accepted). |
+| `mka_kdf_bounds_check` (`mka_crypto.c`) | negative array bound | Not executable code at all: a `typedef` whose bound goes negative if the KDF label, context and buffer constants stop being consistent. It contributes no line, branch or condition, and is deliberately never referenced — the declaration *is* the check. Recorded as a MISRA 2.3 deviation. |
+
+The same reasoning governs the `#if`-guarded halves of the test suite: a check
+that can only hold on a 64-bit host is `#if`-gated in `test_crypto.c` so a
+32-bit run neither fails it nor counts it.
