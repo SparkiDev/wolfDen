@@ -297,8 +297,9 @@ typedef struct {
     /** SAK size: 16 or 32 */
     uint8 SakLength;
     /** Confidentiality offset as the MkaConfidentialityOffset *encoding* -
-     *  MKA_CONF_OFFSET_0 / _30 / _50, i.e. 0, 1 or 2 - not the octet count it
-     *  names. The core rejects anything above MKA_CONF_OFFSET_50. */
+     *  MKA_CONF_OFFSET_NONE / _0 / _30 / _50, i.e. 0, 1, 2 or 3 - not the
+     *  octet count it names. The core rejects anything above
+     *  MKA_CONF_OFFSET_50. */
     uint8 ConfidentialityOffset;
     /** 0 => default by SakLength */
     uint64_t CipherSuite;

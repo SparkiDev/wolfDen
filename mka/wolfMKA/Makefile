@@ -44,12 +44,12 @@ DEPFLAGS := -MMD -MP
 # changes, so it triggers a rebuild on a flag change but not on every run.
 FLAGSTAMP := build/.cflags
 
-# test_custom_alloc.c, test_autosar.c and test_icv_l2.c are standalone programs
+# test_custom_alloc.c, test_autosar.c and abi_check.c are standalone programs
 # (own main), and the fuzz_*.c harnesses define a libFuzzer entry point (no
-# main); exclude them all from the normal runner and build via their own targets
-# instead.
+# main); exclude them all from the normal runner and build via their own
+# targets instead.
 TEST_SRC := $(filter-out test/test_custom_alloc.c test/test_autosar.c \
-                         test/test_icv_l2.c \
+                         test/abi_check.c \
                          test/fuzz_pdu.c test/fuzz_receive.c test/test_endian.c,\
                          $(wildcard test/*.c))
 TEST_BIN := test/runtests
@@ -62,14 +62,16 @@ EXAMPLE_SRC := $(filter-out examples/mka_group_cak.c examples/mka_autosar.c,\
                             $(wildcard examples/*.c))
 EXAMPLE_BIN := $(EXAMPLE_SRC:.c=)
 
-.PHONY: all lib test check examples test-alloc test-nomalloc \
+.PHONY: all lib test check check-abi examples test-alloc test-nomalloc \
         test-fault test-distcak test-kmd test-suspension test-negotiation \
-        test-icv-l2 test-icv-l2-suite test-automotive \
+        test-automotive \
         example-distcak example-autosar features cxx misra docs \
         autosar test-det coverage coverage-configs coverage-autosar \
         cov-impl \
-        sanitize analyze fuzz fuzz-pdu fuzz-receive fuzz-receive-l2 \
-        interop interop-dataplane test-endian footprint format format-check \
+        sanitize analyze fuzz fuzz-pdu fuzz-receive \
+        interop interop-dataplane interop-eap interop-mkad \
+        interop-libmka \
+        test-endian footprint format format-check \
         clean FORCE
 
 # Doxygen tool (override on the command line if not on PATH).
@@ -128,8 +130,19 @@ FORCE:
 $(TEST_BIN): $(TEST_SRC) $(LIB)
 	$(CC) $(CFLAGS) $(TEST_SRC) $(LIB) -o $@ $(LDFLAGS) $(LDLIBS)
 
-test check: $(TEST_BIN)
+# check-abi first: wolfMKA embeds wolfSSL's WC_RNG and Cmac by value, and both
+# layouts depend on __STDC_VERSION__, so a wolfSSL built with a different -std
+# corrupts every pool slot as it is initialised. Catching that here turns a
+# silent memory overrun into a build failure with the remedy in it.
+test check: check-abi $(TEST_BIN)
 	./$(TEST_BIN)
+
+# Verify that the linked libwolfssl agrees with this build about the size of
+# the structures wolfMKA embeds. Compiled with the project's own CFLAGS - the
+# -std it carries is the whole point of the check.
+check-abi:
+	@$(CC) $(CFLAGS) test/abi_check.c -o test/abi_check $(LDFLAGS) $(LDLIBS)
+	@./test/abi_check
 
 # Build the whole library + a standalone test with WOLFMKA_SMALL_STACK and a
 # custom allocator (configured via test/wolfmka_user_settings.h) to prove the
@@ -194,23 +207,6 @@ test-negotiation:
 	    $(SRC) -o test/runnego $(LDFLAGS) $(LDLIBS)
 	./test/runnego
 
-# Build and run the standalone L2-address ICV test. WOLFMKA_ICV_L2_ADDR makes
-# the ICV cover the DA || SA || EtherType L2 prefix ahead of the MKPDU, matching
-# wpa_supplicant / the Linux kernel; off by default. The full suite's PDU/KAY
-# frame builders assume the non-L2 ICV, so this path is pinned on its own.
-# Build and run the full suite with the L2-address ICV in force, so every PDU
-# and KaY test exercises the wpa_supplicant-compatible ICV input rather than
-# only the standalone smoke test below.
-test-icv-l2-suite:
-	$(CC) $(CFLAGS) -DWOLFMKA_ICV_L2_ADDR $(TEST_SRC) \
-	    $(SRC) -o test/runicvl2suite $(LDFLAGS) $(LDLIBS)
-	./test/runicvl2suite
-
-test-icv-l2:
-	$(CC) $(CFLAGS) -DWOLFMKA_ICV_L2_ADDR test/test_icv_l2.c \
-	    $(SRC) -o test/runicvl2 $(LDFLAGS) $(LDLIBS)
-	./test/runicvl2
-
 # Build the suite under the OPEN Alliance TC17 Automotive MKA profile and run
 # it. The profile emits version 3 MKPDUs and removes Secure Announcements and
 # cipher-suite negotiation; the rest of it is runtime configuration applied by
@@ -247,11 +243,56 @@ example-autosar:
 # Tier 2 also brings up the kernel MACsec data plane and checks protected
 # traffic + rekey. Both need root, iproute2 and a MACsec-capable wpa_supplicant;
 # the scripts SKIP (exit 0) when a prerequisite is missing. Not part of CI.
-interop: examples/mka_link
-	test/interop/run-interop.sh
+# Tier 3 needs wolfMKA's own EAP-MSK derivation as a command-line step, so the
+# harness can run it over the MSK a real EAP exchange produced and compare with
+# what wpa_supplicant derived from the same one.
+test/interop/eap_derive: test/interop/eap_derive.c $(SRC)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
+interop-eap: test/interop/eap_derive
+	test/interop/run-interop-eap.sh
+
+interop: examples/mka_link
+	MKA_LINK=examples/mka_link test/interop/run-interop.sh
+
+# Tier 4 needs one non-default flag. WOLFMKA_MKA_VERSION is the MKA version
+# announced in the Basic Parameter Set:
+# 1 for IEEE Std 802.1X-2010 (wolfMKA's default, and what wpa_supplicant both
+# sends and accepts), 2 for 802.1Xbx-2014, 3 for 802.1X-2020. MKAdaemon comes
+# from the OPEN Alliance side, where version 3 is mandated, and it discards any
+# MKPDU that does not announce exactly 3 - it has an MKA_ALLOW_OTHER_VERSIONS
+# build switch, off by default. wolfMKA never rejects on a peer's version, so
+# the incompatibility is one-way and shows up as MKAdaemon silently never going
+# live. Announcing 3 costs nothing: the field is advisory and the wire format
+# is unchanged.
+examples/mka_macsec_mkad: examples/mka_macsec.c $(SRC)
+	$(CC) $(CFLAGS) -DWOLFMKA_MKA_VERSION=3U $^ -o $@ \
+	    $(LDFLAGS) $(LDLIBS)
+
+# Tier 4: the same data-plane exercise against MKAdaemon instead of
+# wpa_supplicant. Set MKAD to the daemon binary. An independent implementation
+# is the point - agreeing with a single peer proves compatibility with that
+# peer, not conformance.
+# Tier 5: control-plane interop against libmka. The peer driver is built by the
+# script, since it needs libmka's headers and static library - not a dependency
+# of wolfMKA itself. Point LIBMKA at the checkout.
+#
+# It reuses examples/mka_macsec_mkad for its build flag rather than its name:
+# libmka implements the MKA Version 3 obligations, as MKAdaemon does.
+interop-libmka: examples/mka_macsec_mkad
+	MKA_MACSEC=examples/mka_macsec_mkad test/interop/run-interop-libmka.sh
+
+interop-mkad: examples/mka_macsec_mkad
+	MKA_MACSEC=examples/mka_macsec_mkad test/interop/run-interop-mkad.sh
+
+# Run the whole tier once per cipher suite. GCM-AES-256 is not the default, so
+# it is named explicitly in the Distributed SAK set and wraps a 32-octet key -
+# and here it also drives the kernel MACsec device at 256-bit, which Tier 1
+# cannot reach.
 interop-dataplane: examples/mka_macsec
-	test/interop/run-interop-dataplane.sh
+	MKA_MACSEC=examples/mka_macsec test/interop/run-interop-dataplane.sh
+	MKA_MACSEC=examples/mka_macsec SAK_LEN=32 \
+	    test/interop/run-interop-dataplane.sh
 
 # Big-endian serialization conformance. The native-memcpy MKPDU write path in
 # mka_bytes.h is only correct on a big-endian host and is otherwise never
@@ -334,22 +375,12 @@ FUZZ_CC      ?= clang
 FUZZ_SECONDS ?= 30
 FUZZ_FLAGS   := -fsanitize=fuzzer,address,undefined \
                 -fno-sanitize-recover=undefined -O1 -g
-fuzz: fuzz-pdu fuzz-receive fuzz-receive-l2
+fuzz: fuzz-pdu fuzz-receive
 
 fuzz-pdu:
 	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) test/fuzz_pdu.c $(SRC) \
 	    -o test/fuzz_pdu $(LDFLAGS) $(LDLIBS)
 	./test/fuzz_pdu -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1
-
-# The same stateful harness with the L2-address ICV in force, so the
-# wpa_supplicant-compatible decode path is fuzzed too; the harness seals frames
-# the way the library verifies them, so it still reaches the state machine.
-fuzz-receive-l2:
-	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) -DWOLFMKA_ICV_L2_ADDR \
-	    -Itest test/fuzz_receive.c $(SRC) \
-	    -o test/fuzz_receive_l2 $(LDFLAGS) $(LDLIBS)
-	./test/fuzz_receive_l2 -max_total_time=$(FUZZ_SECONDS) \
-	    -print_final_stats=1
 
 fuzz-receive:
 	$(FUZZ_CC) $(CFLAGS) $(FUZZ_FLAGS) -Itest test/fuzz_receive.c $(SRC) \
@@ -366,7 +397,7 @@ features:
 	    "-DWOLFMKA_NO_ANNOUNCEMENTS" "-DWOLFMKA_NO_AUTO_REKEY" \
 	    "-DWOLFMKA_DISTRIBUTED_CAK" "-DWOLFMKA_KMD" "-DWOLFMKA_SUSPENSION" \
 	    "-DWOLFMKA_CIPHER_NEGOTIATION" "-DWOLFMKA_AUTOMOTIVE_PROFILE" \
-	    "-DWOLFMKA_ICV_L2_ADDR" "-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
+	    "-DWOLFMKA_AUTOSAR" "$(FEATURE_OFF)" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC"; do \
 	    printf '  [features]%s\n' " $${cfg:-default}"; \
 	    for f in $(SRC); do $(CC) $(CFLAGS) $$cfg -c $$f -o /tmp/wmka.o; done; \
@@ -399,7 +430,6 @@ misra:
 	@rc=0; for cfg in "$(MISRA_DEFS)" \
 	    "$(MISRA_DEFS) -DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD -DWOLFMKA_SUSPENSION -DWOLFMKA_CIPHER_NEGOTIATION" \
 	    "$(MISRA_DEFS) -DWOLFMKA_AUTOMOTIVE_PROFILE" \
-	    "$(MISRA_DEFS) -DWOLFMKA_ICV_L2_ADDR" \
 	    "$(MISRA_BASE) -DWOLFMKA_BIG_ENDIAN" \
 	    "$(FEATURE_OFF) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC -DWOLFMKA_LITTLE_ENDIAN --max-configs=1"; \
 	  do \
@@ -541,8 +571,6 @@ coverage-configs:
 	    COV_CFG="-DWOLFMKA_FAULT_INJECT -DWOLFMKA_AUTOMOTIVE_PROFILE" \
 	    COV_LABEL=automotive-profile
 	@$(MAKE) --no-print-directory cov-impl \
-	    COV_CFG="$(COV_BASE) -DWOLFMKA_ICV_L2_ADDR" COV_LABEL=icv-l2
-	@$(MAKE) --no-print-directory cov-impl \
 	    COV_CFG="$(COV_BASE) -DWOLFMKA_SMALL_STACK -DWOLFMKA_NO_MALLOC" \
 	    COV_LABEL=small-stack-no-malloc
 	@$(MAKE) --no-print-directory cov-impl \
@@ -590,8 +618,8 @@ format-check:
 clean:
 	rm -f $(OBJ) $(DEP) $(LIB) $(TEST_BIN) $(EXAMPLE_BIN) examples/mka_group_cak examples/mka_autosar \
 	      test/runalloc test/runfault test/rundistcak test/runkmd test/runsusp \
-	      test/runnego test/runauto test/runicvl2 test/runicvl2suite test/runautosar \
-	      test/runsanitize test/fuzz_pdu test/fuzz_receive test/fuzz_receive_l2 \
+	      test/runnego test/runauto test/runautosar test/abi_check \
+	      test/runsanitize test/fuzz_pdu test/fuzz_receive \
 	      test/runendian test/test_endian_be \
 	      src/autosar/Mka.o
 	rm -rf doc build *.gcov

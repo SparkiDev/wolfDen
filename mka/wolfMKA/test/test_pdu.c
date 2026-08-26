@@ -453,7 +453,7 @@ static void test_pdu_edge_cases(void)
  * decoder passes ICV verification and reaches the parameter-set parser. */
 /* Recompute a frame's ICV in place after the test has altered its body, so the
  * decoder rejects on the field under test rather than on the seal. It must seal
- * the same input the library verifies: with WOLFMKA_ICV_L2_ADDR that includes
+ * the same input the library verifies, which includes
  * the L2 prefix the PDU layer derives from the frame (DA || SA || EtherType,
  * the SA taken from the SCI in the Basic Parameter Set). */
 static void reseal(uint8_t* f, size_t len, const uint8_t* ick)
@@ -1743,28 +1743,12 @@ static void test_pdu_set_cannot_eat_icv(void)
               MKA_ERR_PARSE,
         "a set overlapping the ICV is rejected");
 
-    /* A body that is nothing but the ICV leaves no room for the mandatory
-     * Basic set at all.
-     *
-     * Not meaningful with WOLFMKA_ICV_L2_ADDR: there the ICV also covers an L2
-     * prefix taken from the sender SCI at frame offset 8, which for a body this
-     * short lies inside the ICV itself - sealing the frame rewrites the very
-     * octets the prefix is derived from, so the check would fail on the seal
-     * rather than on the missing Basic set. */
-#ifndef WOLFMKA_ICV_L2_ADDR
-    {
-        uint8_t tiny[EAPOL_HDR_LEN + MKA_DEFAULT_ICV_LEN];
-        memset(tiny, 0, sizeof tiny);
-        tiny[0] = (uint8_t)EAPOL_VERSION_2010;
-        tiny[1] = (uint8_t)EAPOL_TYPE_MKA;
-        tiny[2] = 0U;
-        tiny[3] = (uint8_t)MKA_DEFAULT_ICV_LEN;
-        test_seal_icv(g_cmac, ick, sizeof ick, tiny, EAPOL_HDR_LEN);
-        CHECK(wm_Pdu_Decode(g_cmac, tiny, sizeof tiny, ick, sizeof ick, &out) ==
-                  MKA_ERR_PARSE,
-            "a body holding only the ICV has no Basic set");
-    }
-#endif
+    /* A body that is nothing but the ICV has no room for the mandatory Basic
+     * set, but it cannot be tested from here: the ICV covers an L2 prefix
+     * taken from the sender SCI at frame offset 8, which for a body this short
+     * lies inside the ICV itself, so sealing the frame rewrites the very
+     * octets the prefix is derived from. The decoder's length check is reached
+     * by the longer malformed frames above. */
 
     /* The ICV Indicator ends the walk, so a bogus one would hide every set
      * after it. It must sit immediately before the ICV and declare the ICV's

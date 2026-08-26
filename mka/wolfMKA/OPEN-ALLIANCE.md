@@ -170,7 +170,7 @@ feature, which wolfMKA satisfies by having it off (or compiled out).
 | AutoMKA-03008 | Key Server always secures if configured; no implicit Null cipher | Library | the configured cipher suite is used; there is no implicit downgrade path in the profile build |
 | AutoMKA-03009 | Confidentiality offset 0 supported; 30/50 optional | Library | as AutoMKA-01001/01002 |
 | AutoMKA-03010 | Should distribute the SAK before installing it | Library | `MkaParticipantConfig.distribute_before_install` has the Key Server adopt the new key, send the MKPDU carrying it, then program the SecY (`mka_program_sak`), so both ends install together. Off by default; `wm_Participant_AutomotiveDefaults()` turns it on. Two properties make it safe: programming waits for the send to succeed, so a key is never installed that no peer was told about; and while it is outstanding the MACsec SAK Use withholds the receive claim, so no peer starts sending protected frames the data plane cannot yet decrypt. That claim also waits on any asynchronous SecY install still in flight (`secy_pending`), not just on the deferred distribution - the receive bit is what releases the *peer's* transmit gate, so it has to be at least as conservative as the local one. Only the Key Server defers — see **Interactions**. `test_distribute_before_install`, `test_deferred_install_send_failure`, `test_profile_rekey_is_single` |
-| AutoMKA-03011 | Rekey when a peer's SAK Use goes missing/invalid/empty | Library | `mka_note_sak_use` tracks whether each peer still reports the key in force; when one that was using it stops — no SAK Use, an empty one, or a Key Number we never issued — the Key Server rekeys. A peer mid-handover still naming the Old key is not a loss. The flag clears on rekey, bounding it to one per loss rather than one per MKPDU. `test_rekey_on_lost_sak_use` |
+| AutoMKA-03011 | Rekey when a peer's SAK Use goes missing/invalid/empty | Library | `mka_note_sak_use` tracks whether each peer still reports the key in force; when one that was using it stops — no SAK Use, an empty one, or a Key Number we never issued — the Key Server rekeys. A peer mid-handover still naming the Old key is not a loss. The flag clears on rekey, bounding it to one per loss rather than one per MKPDU. `test_rekey_on_lost_sak_use` The profile keeps the immediate reaction: `MKA_SAK_LOSS_THRESHOLD` is 1 under `WOLFMKA_AUTOMOTIVE_PROFILE`, where recovery speed is the point and the peers are known, against a default of 3 elsewhere where the peer may legitimately omit the set now and then. |
 | AutoMKA-03012 | May operate without Distributed CAK | N/A | as AutoMKA-01008 |
 | AutoMKA-03013 | Deterministic SCI, stable across power cycles | Integrator | `cfg.sci` is supplied by the integrator; derive it from MAC + port |
 | AutoMKA-03014 | May operate without in-service upgrade / suspension | N/A | as AutoMKA-01006/01007 |
@@ -283,6 +283,16 @@ on the **Key Server**, which is also the case AutoMKA-03010 describes — a memb
 has nothing to distribute early, so waiting would only delay its own data plane.
 `test_profile_rekey_is_single` holds this down: a rekey with the full automotive
 configuration on both ends advances the Key Number exactly once.
+
+The same shape appears again with a peer that is not running this profile.
+Live interop against wpa_supplicant showed it emitting an MKPDU with no MACsec
+SAK Use parameter set from time to time; read as a lost key, that rekeys, which
+leaves the peer chasing a key it has not finished adopting, which produces
+another silent MKPDU. `MKA_SAK_LOSS_THRESHOLD` therefore counts *consecutive*
+misses before declaring a loss, and it is **1** under this profile — where
+recovery speed is the point and every peer is known to report the key in every
+MKPDU — against 3 elsewhere. `MkaParticipantConfig::sak_loss_threshold`
+overrides it per participant.
 
 A third consequence of AutoMKA-03010 is worth stating: while a deferred key is
 still undelivered, `wm_Participant_Rekey()` returns `MKA_ERR_REKEY_BUSY` rather

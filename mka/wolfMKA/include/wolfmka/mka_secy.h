@@ -121,10 +121,19 @@ typedef struct {
  * above). Optional callbacks may be left NULL; the KaY skips them.
  */
 typedef struct MkaSecyOps {
-    /** Create the transmit Secure Channel identified by our SCI. */
+    /** Create the transmit Secure Channel identified by our SCI.
+     *
+     * Called before every SAK install, so it must be idempotent: an SC that
+     * already exists is success, not an error. */
     int (*create_tx_sc)(void* ctx, const uint8_t sci[MKA_SCI_LEN]);
 
-    /** Create a receive Secure Channel for a peer SCI. */
+    /** Create a receive Secure Channel for a peer SCI.
+     *
+     * Called before every SAK install for that peer - once when the peer
+     * first goes live and again on each rekey - so it must be idempotent: an
+     * SC that already exists is success, not an error. A binding over an API
+     * that reports a duplicate SC (Linux macsec answers -EEXIST) has to map
+     * that to 0, or every rekey is charged as a SecY failure. */
     int (*create_rx_sc)(void* ctx, const uint8_t sci[MKA_SCI_LEN]);
 
     /** Install the transmit SA (our SCI, association/key num, SAK). */
@@ -175,14 +184,18 @@ typedef struct MkaSecyOps {
      * Configure the cipher suite, SSCI (for XPN) and confidentiality offset on
      * a channel.
      *
-     * Called before the channel's SAs are installed. The Salt is derived by the
-     * SecY from the SAK per 802.1AE-2018; it is not distributed by MKA.
+     * Called before the channel's SAs are installed. For the XPN suites the
+     * SecY must also derive the initialisation-vector Salt: MKA never
+     * distributes it, and it comes from the Key Identifier (the issuing Key
+     * Server's MI with the Key Number folded into the first four octets), not
+     * from the SAK. examples/mka_macsec.c carries a worked derivation.
      * @c confidentiality_offset is the in-force MkaConfidentialityOffset
-     * selection - MKA_CONF_OFFSET_0/30/50, i.e. 0, 30 or 50 octets of cleartext
-     * before encryption begins - chosen by the Key Server and adopted by every
-     * member. Under WOLFMKA_CIPHER_NEGOTIATION it may instead be
-     * MKA_CONF_OFFSET_NONE, meaning a member cannot do confidentiality, so the
-     * cipher suite must run integrity-only (no encryption).
+     * selection, chosen by the Key Server and adopted by every member:
+     * MKA_CONF_OFFSET_0/30/50 for 0, 30 or 50 octets of cleartext before
+     * encryption begins, or MKA_CONF_OFFSET_NONE for no confidentiality at
+     * all, where the cipher suite must run integrity-only (no encryption).
+     * These are the Table 11-6 selector values, not the octet counts they
+     * name.
      */
     int (*set_cipher_suite)(void* ctx, const uint8_t sci[MKA_SCI_LEN],
         uint64_t cipher_suite, uint32_t ssci, uint8_t confidentiality_offset);

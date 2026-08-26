@@ -23,7 +23,8 @@
  * The default GCM-AES suites carry a 32-bit packet number, which exhausts in
  * seconds at 100 Gb/s and forces frequent rekeys. The XPN suites widen the PN
  * to 64 bits, at the cost of a per-SA Short SCI (SSCI) and an initialisation
- * vector salt that the SecY derives from the SAK. wolfMKA surfaces exactly two
+ * vector salt that the SecY derives from the Key Identifier. wolfMKA surfaces
+ * exactly two
  * XPN-specific obligations on the data plane:
  *
  *   - set_cipher_suite() receives the negotiated suite, the per-channel SSCI
@@ -243,6 +244,7 @@ int main(void)
     ca.priority = 10;
     ca.macsec_desired = 1;
     ca.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    ca.confidentiality_offset = MKA_CONF_OFFSET_0;
     ca.key_server_capable = 1;
     ca.delay_protect = 1;
     ca.sak_len = 16;
@@ -257,6 +259,7 @@ int main(void)
     cb.priority = 20;
     cb.macsec_desired = 1;
     cb.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cb.confidentiality_offset = MKA_CONF_OFFSET_0;
     cb.key_server_capable = 1;
     cb.delay_protect = 1;
     cb.sak_len = 16;

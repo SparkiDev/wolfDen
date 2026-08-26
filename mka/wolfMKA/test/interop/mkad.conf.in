@@ -1,0 +1,46 @@
+# mkad.conf.in - MKAdaemon configuration template for Tier 4 interop.
+#
+# Copyright (C) 2006-2026 wolfSSL Inc.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Substituted by run-interop-mkad.sh, which fails the round if any at-sign
+# placeholder survives substitution (so this comment must not contain one):
+# MKAdaemon rejects the file outright on an unknown token, which surfaces as a
+# convergence timeout rather than as a config error.
+#
+# MKAdaemon requires all of transmit_empty_dist_sak, transmit_empty_sak_use,
+# transmit_null_xpn and secy_polling_ms to be present in the global section -
+# it refuses to start naming them rather than defaulting them.
+log_level: debug
+verbosity: 3
+hello_time: 2000
+bounded_hello_time: 500
+life_time: 6000
+sak_retire_time: 3000
+hello_time_rampup: 100 200 400 800 800
+transmit_empty_dist_sak: on
+transmit_empty_sak_use: on
+transmit_null_xpn: on
+secy_polling_ms: 100
+
+interfaces:
+  - device: "@DEVICE@"
+    protected_device: "@PROTECTED@"
+    # STATIC creates the protected device at startup rather than after MKA, so
+    # the harness can address it without racing negotiation. It also limits the
+    # cipher list to one entry, which is what we want: the suite under test is
+    # pinned on both sides rather than negotiated to whatever both allow.
+    intf_mode: STATIC
+    # CONF_0 is integrity + confidentiality at offset 0, matching the
+    # `encrypt on` MACsec device the wolfMKA side is given.
+    macsec: CONF_0
+    kay: on
+    priority: @PRIORITY@
+    role: AUTO
+    delay_protect: off
+    unauth_allowed: never
+    unsecure_allowed: never
+    ciphers: @CIPHER@
+    cak: @CAK@
+    ckn: @CKN@
+    drv_macsec_mode: software

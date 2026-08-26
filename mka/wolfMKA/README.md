@@ -30,7 +30,7 @@ elects a *Key Server*, and securely distributes the *Secure Association Keys
 | SAK generation (random, Key Server) | §9.8 | ✅ |
 | SAK wrap/unwrap (AES Key Wrap, RFC 3394) | §9.8.2 | ✅ |
 | MKPDU encode/decode (all core parameter sets) | §11.11 | ✅ |
-| ICV computation/verification (AES-CMAC) | §9.4.1 / §11.11 | ✅ |
+| ICV computation/verification (AES-CMAC over DA \|\| SA \|\| MSDU) | §9.4.1 / §11.11 | ✅ |
 | Peer discovery & liveness (Live/Potential lists) | §9.4.3 | ✅ |
 | Key Server election | §9.5 | ✅ |
 | SAK distribution & installation into a SecY | §9.8 / Clause 10 | ✅ |
@@ -46,7 +46,6 @@ elects a *Key Server*, and securely distributes the *Secure Association Keys
 | MKA participant suspension | 802.1Xbx-2014 | ✅ (opt-in, XPN) |
 | Fast startup: peer-list change answered at once | §9.4 (`newInfo`) | ✅ (opt-in) |
 | Peer-reset recovery (same SCI, new MI) | OA AutoMKA-03006 | ✅ |
-| L2-address ICV (wpa_supplicant-compatible ICV input) | §11.11.3 | ✅ (opt-in) |
 | Liveness requires an acceptably recent echoed MN | §9.4.3 / OA AutoMKA-03005, -04004 | ✅ |
 | SecY MACsec statistics + PAE status accessors | OA AutoMKA-07008, -07009 | ✅ |
 | Losing CAs quiesce once one establishes MACsec | OA AutoMKA-09001, -09002 | ✅ (opt-in) |
@@ -101,8 +100,11 @@ case, since a participant's CMAC operations do not nest.
   including one compiled `WOLFMKA_NO_DELAY_PROTECT` — that switch removes this
   end's own delay handling, not the far end's.
 - **Extended Packet Numbering** *(optional)* — GCM-AES-XPN-128/256 cipher suites
-  with deterministic Short SCI (SSCI) assignment (802.1Xbx). The Salt is derived
-  by the SecY from the SAK per 802.1AE-2018, not distributed by MKA.
+  with deterministic Short SCI (SSCI) assignment (802.1Xbx). MKA does not
+  distribute the initialisation-vector Salt: the SecY derives it from the Key
+  Identifier (Key Server MI with the Key Number folded into the first four
+  octets). `examples/mka_macsec.c` shows the derivation, and `make interop-mkad`
+  exercises it against MKAdaemon.
 - **Keys are identified by KI, not Key Number** — IEEE Std 802.1X-2010 names a
   SAK by its Key Identifier, KI = (Key Server MI ‖ Key Number). Key Numbers are
   unique only per Key-Server incarnation: one that restarts comes back with a
@@ -157,10 +159,9 @@ Some features are **opt-in** (off by default, so the default build is unchanged)
 |--------|------|
 | `WOLFMKA_DISTRIBUTED_CAK` | Distributed CAK parameter set (type 5): the `wm_Participant_DistributeCak` Key-Server API, plus a `cak_received` event by which a member reports the unwrapped group CAK to the integrator. `make test-distcak` builds and tests with it enabled. |
 | `WOLFMKA_KMD` | Key Management Domain parameter set (type 6): a configured `kmd` the Key Server advertises, and a `wm_Participant_GetKmd` accessor by which a member reads the received domain name. Informational only (authenticated by the MKPDU ICV; no extra crypto). `make test-kmd` builds and tests with it enabled. |
-| `WOLFMKA_ICV_L2_ADDR` | Computes and verifies the MKPDU ICV over an L2 prefix — destination (PAE group address), source (the SCI from the Basic Parameter Set) and EAPOL EtherType — followed by the MKPDU, which is the ICV input wpa_supplicant uses (IEEE Std 802.1X-2010 §11.11.3). Off by default; enable it to interoperate with peers that bind the Ethernet framing into the ICV. It changes what is signed, so **both ends must agree**. `make test-icv-l2` runs the standalone check and `make test-icv-l2-suite` runs the whole suite over this ICV path. |
 | `WOLFMKA_AUTOMOTIVE_PROFILE` | The OPEN Alliance TC17 **Automotive MKA** profile: version 3 MKPDUs and no Secure Announcements / cipher-suite negotiation, plus `wm_Participant_AutomotiveDefaults()` for the profile's startup timing (10 ms → Hello Time ramp and immediate response to a peer-list change). `make test-automotive` builds and tests with it enabled; [`OPEN-ALLIANCE.md`](OPEN-ALLIANCE.md) is the requirement-by-requirement map, including the known gaps. |
 | `WOLFMKA_SUSPENSION` | MKA participant suspension (802.1Xbx-2014): `wm_Participant_Suspend(p, seconds)` / `wm_Participant_Resume(p)`. A suspended participant advertises a suspension time (in the XPN set's MKA Suspension Time field) and goes quiet; peers hold its state past the Life Time so the SAK survives the gap. **Requires XPN** (must not be combined with `WOLFMKA_NO_XPN`). `make test-suspension` builds and tests with it enabled. |
-| `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces offset 0, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, signalled to the SecY as `MKA_CONF_OFFSET_NONE`. Both values travel inside the Distributed SAK parameter set, so they belong to the key rather than to the CA: a member joining a keyed CA with a *lower* capability than it was negotiated for therefore forces a rekey, which is the only way to move every member to the new offset at once. An ordinary join — one that reduces nothing — still does not rekey. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
+| `WOLFMKA_CIPHER_NEGOTIATION` | Key Server cipher-suite **and** MACsec-capability negotiation. (1) Each participant adds a `cipher_prefs` / `cipher_pref_count` preference list to its config and announces it; the elected Key Server picks the most-preferred suite **every live peer accepts** (a peer accepts a suite it announced, or any suite when it sends no Announcement), and that choice drives the SAK length. With no preference list a participant keeps the configured `cipher_suite` / `sak_len`. (2) The Key Server also reduces the confidentiality offset to the lowest MACsec Capability across the CA — a member that can only do `INTEGRITY_CONF` forces `MKA_CONF_OFFSET_0`, and one that can only do `INTEGRITY_ONLY` (or no MACsec) drops the CA to integrity-only, distributed as `MKA_CONF_OFFSET_NONE` (Table 11-6 gives "no confidentiality" its own wire value) and passed to the SecY as such, so every member turns encryption off together rather than each inferring it from its own view of the membership. Both values travel inside the Distributed SAK parameter set, so they belong to the key rather than to the CA: a member joining a keyed CA with a *lower* capability than it was negotiated for therefore forces a rekey, which is the only way to move every member to the new offset at once. An ordinary join — one that reduces nothing — still does not rekey. **Requires the Announcement set** (must not be combined with `WOLFMKA_NO_ANNOUNCEMENTS`). `make test-negotiation` builds and tests with it enabled. |
 
 The Key Server wraps a group CAK with the CA's KEK and emits it; each member
 unwraps it (a wrong KEK fails the AES Key Unwrap integrity check and is ignored)
@@ -524,20 +525,58 @@ vectors in the test suite:
 
 Those vectors pin the *cryptographic constructions*. A **live wire** harness
 ([`test/interop/`](test/interop/)) additionally runs wolfMKA back-to-back with
-wpa_supplicant's MKA over a veth pair in two network namespaces, proving two
-independent stacks complete the protocol on the wire:
+another implementation's MKA over a veth pair in two network namespaces,
+proving two independent stacks complete the protocol on the wire:
 
 - `sudo make interop` (Tier 1) — `mka_link` ↔ wpa_supplicant reach discovery →
-  Key Server election → SAK agreement (control plane).
-- `sudo make interop-dataplane` (Tier 2) — the combined `mka_macsec` example
+  Key Server election → SAK agreement (control plane). Three rounds: each side
+  favoured in turn, so wolfMKA is covered both distributing a SAK and receiving,
+  unwrapping and installing a peer's; then again under **GCM-AES-256**, which
+  is named explicitly in the Distributed SAK set and wraps a 32-octet key.
+- `sudo make interop-eap` (Tier 3) — hostapd and wpa_supplicant run a real
+  EAP-GPSK exchange; wolfMKA derives the CAK/CKN from the resulting MSK and must
+  match wpa_supplicant's byte for byte. This is the only tier that exercises
+  IEEE Std 802.1X-2010 9.3.2 (the other two key from a pre-shared CAK), and it
+  checks the derivation against live inputs — a method-specific EAP Session-Id,
+  the independently agreed MAC ordering, and the MSK truncation both ends must
+  apply — rather than against a fixture.
+- `sudo make interop-dataplane` (Tier 2, once per cipher suite) — the combined
+  `mka_macsec` example
   (raw-socket EAPOL **plus** the kernel MACsec netlink data plane) ↔
   wpa_supplicant: both program the kernel SA, `ping` flows MACsec-protected
-  (verified on the wire), and a Key Server rekey rolls the key without dropping
-  traffic.
+  (verified on the wire), and two successive Key Server rekeys roll the key
+  without dropping traffic, with every SecY call accepted by the kernel and the
+  SAs not accumulating across rounds.
+- `sudo make interop-mkad MKAD=…` (Tier 4) — the same data-plane exercise
+  against [MKAdaemon](https://github.com/Technica-Engineering/MKAdaemon)
+  instead of wpa_supplicant. Tiers 1–3 all measure wolfMKA against one peer,
+  which shows compatibility with *that peer* wherever the standard is ambiguous
+  or both stacks share an assumption; MKAdaemon is an unrelated implementation
+  with an automotive lineage, so it is an independent reading.
+
+Tiers 1–3 **pass** against wpa_supplicant v2.11 (`macsec_linux` driver) on
+Linux 7.0. **Tier 4 has not been run yet** — the harness and MKAdaemon build
+recipe are in place and the daemon accepts the generated configuration, but no
+green run has been recorded, so it carries no pass claim. Tier 1 passes in both Key Server roles: with wolfMKA favoured it
+generated, wrapped and distributed the SAK; with wpa_supplicant favoured wolfMKA
+yielded the election, then unwrapped and installed the peer's SAK and reported
+it back. Tier 2 then carried real traffic — both ends programmed the kernel SA,
+`ping` flowed, the on-wire frames were MACsec (0x88e5) with no cleartext, and a
+Key Server rekey rolled the key without dropping traffic. Tier 3 ran a live
+EAP-GPSK exchange and both implementations derived an identical CAK **and** CKN
+from the resulting MSK.
+
+Tier 4 builds its own binary, `examples/mka_macsec_mkad`, for one flag:
+`-DWOLFMKA_MKA_VERSION=3U`. wolfMKA announces the 802.1X-2010 MKA version 1 by
+default, and MKAdaemon discards any MKPDU not announcing the 802.1X-2020 value
+of 3. See the harness README in [`test/interop/`](test/interop/).
 
 These need root, the kernel `macsec` module and a MACsec-capable wpa_supplicant,
 so they are a manual/privileged gate rather than part of unit CI; each script
-`SKIP`s cleanly when a prerequisite is absent. See the
+`SKIP`s cleanly when a prerequisite is absent. That `SKIP` is convenient but it
+also means an unrunnable harness looks exactly like a passing one — treat a run
+that has only ever skipped as unverified, and set `INTEROP_STRICT=1` where the
+prerequisites are supposed to be present so a skip fails instead. See the
 [`test/interop/`](test/interop/) directory.
 
 ## Using the library
@@ -549,6 +588,7 @@ memcpy(cfg.sci, my_sci, 8);
 cfg.priority = 16;
 cfg.macsec_desired = 1;
 cfg.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+cfg.confidentiality_offset = MKA_CONF_OFFSET_0; /* 0 is *no* confidentiality */
 cfg.key_server_capable = 1; /* 0 means *cannot*: advertises priority 255 */
 cfg.sak_len = 16;                   /* GCM-AES-128 */
 cfg.secy = my_secy_ops;            /* install_tx_sa / install_rx_sa / ... */

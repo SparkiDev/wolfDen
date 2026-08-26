@@ -230,7 +230,7 @@ static void test_eap_derivation(void)
             mac2[6] = {0x02, 0, 0, 0, 0, 0x02};
     uint8_t sid[4] = {0x11, 0x22, 0x33, 0x44};
     uint8_t cak16[16], cak32[32], ckn[16], swapped[16];
-    uint8_t e_cak16[16], e_cak32[32], e_ckn[16];
+    uint8_t e_cak16[16], e_cak32[32], e_ckn[16], e_ckn32[16];
     size_t i;
 
     printf("EAP-MSK CAK/CKN derivation (hostapd-pinned vectors):\n");
@@ -270,10 +270,17 @@ static void test_eap_derivation(void)
               MKA_ERR_BAD_ARG,
         "and so is any other mismatch");
     /* The CKN derivation keeps taking the MSK length, which is what it always
-     * used and what hostapd's ieee802_1x_ckn_aes_cmac uses too. */
+     * used and what hostapd's ieee802_1x_ckn_aes_cmac uses too - so a 32-octet
+     * MSK selects AES-256-CMAC over the whole MSK. This one had no vector when
+     * LOW-33 was raised: the call asserted only MKA_OK, which cannot tell the
+     * two candidate keying rules apart. The expected bytes come from an
+     * independent transcription of hostapd's aes_kdf, validated against the
+     * three vectors above before being trusted for this one. */
+    hexparse("465cf7d5a4285d6f6522981770e15aa0", e_ckn32, 16);
     CHECK(wm_Crypto_DeriveCknFromMsk(g_cmac, msk, 32, sid, 4, mac1, mac2, ckn,
               16) == MKA_OK,
         "a 32-octet MSK still derives a CKN");
+    CHECK_EQ_MEM(ckn, e_ckn32, 16, "CKN-from-32-octet-MSK vector");
 
     /* Swapping the two MACs must not change the derived CAK
      * (mka_join_two_macs). */
@@ -820,7 +827,6 @@ static void test_kek_ick_kat(void)
     CHECK_EQ_MEM(keys.ick, ick32, 32, "ICK matches across two KDF blocks");
 }
 
-#ifdef WOLFMKA_ICV_L2_ADDR
 /* The L2-inclusive ICV binds the Ethernet framing - destination, source and
  * EtherType - into the same CMAC as the MKPDU, which is what wpa_supplicant
  * verifies (IEEE Std 802.1X-2010, 11.11.3). Tampering with either half must
@@ -871,17 +877,17 @@ static void test_icv_l2(void)
               data, sizeof data, icv) == BAD,
         "L2 icv rejects a long prefix");
 
-    /* And the data length has to survive the narrowing to wolfSSL's word32,
-     * same as the non-L2 path. The buffer is never read, so a bogus length is
-     * safe to pass. */
-    #if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)
+/* And the data length has to survive the narrowing to wolfSSL's word32,
+ * same as the non-L2 path. The buffer is never read, so a bogus length is
+ * safe to pass. */
+#if defined(SIZE_MAX) && (SIZE_MAX > 0xFFFFFFFFU)
     CHECK(wm_Crypto_IcvComputeL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
               (size_t)0x100000000ULL, icv) == BAD,
         "L2 icv rejects a length beyond 32 bits");
     CHECK(wm_Crypto_IcvVerifyL2(g_cmac, ick, sizeof ick, l2, sizeof l2, data,
               (size_t)0x100000000ULL, icv) == BAD,
         "and so does verify");
-    #endif
+#endif
 
     /* Every pointer position, on both entry points. */
     CHECK(wm_Crypto_IcvComputeL2(NULL, ick, sizeof ick, l2, sizeof l2, data,
@@ -945,7 +951,6 @@ static void test_icv_l2(void)
               0U, icv) == MKA_OK,
         "L2 icv over an empty body verifies");
 }
-#endif /* WOLFMKA_ICV_L2_ADDR */
 
 /* wm_Crypto_ForceZero wipes transient key material (generated/unwrapped
  * SAKs, KDF scratch), so it must clear exactly `len` octets - under-wiping
@@ -984,8 +989,6 @@ void run_crypto_tests(void)
     test_sak_icv_errors();
     test_crypto_invalid_params();
     test_kek_ick_kat();
-#ifdef WOLFMKA_ICV_L2_ADDR
     test_icv_l2();
-#endif
     test_force_zero();
 }

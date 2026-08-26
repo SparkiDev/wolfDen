@@ -47,7 +47,7 @@ base with the opt-in `-DWOLFMKA_DISTRIBUTED_CAK -DWOLFMKA_KMD
 -DWOLFMKA_SUSPENSION -DWOLFMKA_CIPHER_NEGOTIATION` features, that base under the
 OPEN Alliance automotive profile (`-DWOLFMKA_AUTOMOTIVE_PROFILE`, which selects a
 different announced MKPDU version and compiles the Announcement code out), that
-base with the L2-address ICV (`-DWOLFMKA_ICV_L2_ADDR`, which adds the streaming
+base with the L2-address ICV (which adds the streaming
 CMAC path), a
 **big-endian** build of the base (`-DWOLFMKA_BIG_ENDIAN`, which exercises the
 network-order serialization path in the MKPDU codec), and the

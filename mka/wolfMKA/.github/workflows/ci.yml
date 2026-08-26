@@ -160,6 +160,24 @@ jobs:
       - name: MISRA C:2012 (cppcheck addon)
         run: make misra
 
+      # The interop harness is the one gate that had never actually run: both
+      # scripts print SKIP and exit 0 without root, which in a log is
+      # indistinguishable from a pass - and they sat for months with a build
+      # misconfiguration that made convergence impossible. INTEROP_STRICT=1
+      # turns a missing prerequisite into a failure, so a runner that cannot
+      # provide one fails loudly instead of quietly skipping.
+      - name: Interoperability with wpa_supplicant (live, over veth)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wpasupplicant hostapd iproute2 tcpdump
+          sudo modprobe macsec || true
+          sudo make interop INTEROP_STRICT=1 WOLFSSL_DIR="$WOLFSSL_DIR"
+          sudo make interop-eap INTEROP_STRICT=1 WOLFSSL_DIR="$WOLFSSL_DIR"
+          # Tier 2 needs a loadable kernel macsec module, which not every
+          # runner image has; left non-strict so its absence skips rather than
+          # fails, while tiers 1 and 3 above are mandatory.
+          sudo make interop-dataplane WOLFSSL_DIR="$WOLFSSL_DIR"
+
       - name: Doxygen HTML (warnings are errors)
         run: make docs
 

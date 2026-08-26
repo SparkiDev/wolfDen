@@ -126,6 +126,29 @@ at all, so no CA could ever form."
     #define MKA_MN_RECENT_WINDOW 3U
 #endif
 
+#ifndef MKA_SAK_LOSS_THRESHOLD
+    /* How many consecutive MKPDUs from a live peer may fail to report the key
+     * in force before the Key Server concludes the peer has lost it and
+     * distributes a fresh SAK.
+     *
+     * A member that holds a key is expected to say so in every MKPDU, so one
+     * silent MKPDU is in principle enough - and that is what the OPEN Alliance
+     * profile asks for (AutoMKA-03011), where recovery speed is the point and
+     * the peers are known. Off the profile the peer is whatever the far end
+     * happens to run, and implementations do emit an MKPDU with no MACsec SAK
+     * Use parameter set from time to time (wpa_supplicant among them). Treating
+     * the first one as a lost key turns an occasional omission into a rekey the
+     * peer must then chase, which can repeat indefinitely - so the default
+     * elsewhere requires the report to be missing three times running, about
+     * one Life Time. Override per participant with
+     * MkaParticipantConfig::sak_loss_threshold. */
+    #ifdef WOLFMKA_AUTOMOTIVE_PROFILE
+        #define MKA_SAK_LOSS_THRESHOLD 1U
+    #else
+        #define MKA_SAK_LOSS_THRESHOLD 3U
+    #endif
+#endif
+
 #if MKA_MN_RECENT_WINDOW < 1U
     #error                                                                     \
         "MKA_MN_RECENT_WINDOW must be at least 1: a zero window accepts no \
@@ -210,9 +233,19 @@ typedef struct {
     /** this peer has reported using the SAK now in force; if it later stops,
      * the key is gone at its end and the Key Server rekeys */
     bool sak_use_seen;
+    /** consecutive MKPDUs from this peer that did not report the key in force;
+     *  compared against the participant's SAK-loss threshold */
+    uint8_t sak_loss_misses;
     /** this peer has been live at some point, even if it is not now: what the
      * peer_lost event reports as was_live */
     bool ever_live;
+#ifndef WOLFMKA_NO_XPN
+    /** the SSCI a Version 3 Key Server assigned this peer in the MKPDU that
+     * distributed the SAK in force, from that MKPDU's ordered Live Peer List
+     * (IEEE Std 802.1X-2020, 9.10). 0 when none was received, in which case
+     * the rank is computed locally. */
+    uint32_t xpn_ssci;
+#endif
 #ifdef WOLFMKA_SUSPENSION
     /** MKA Suspension Time this peer last advertised (s) */
     uint8_t suspend_for;
@@ -342,6 +375,16 @@ typedef struct {
     /** MkaConfidentialityOffset advertised in the Distributed SAK (Key Server)
      */
     uint8_t confidentiality_offset;
+    /** How many consecutive MKPDUs from a live peer may omit, empty or
+     *  misname the key in force before the Key Server treats it as lost and
+     *  distributes a fresh SAK. 0 selects the build default,
+     *  #MKA_SAK_LOSS_THRESHOLD - 1 under the OPEN Alliance automotive profile
+     *  (AutoMKA-03011 wants the fastest possible recovery), 3 elsewhere,
+     *  because peers do occasionally emit an MKPDU with no MACsec SAK Use set
+     *  and rekeying on the first one makes the peer chase a key it never
+     *  finished adopting. Ignored when this participant is not the Key
+     *  Server. */
+    uint8_t sak_loss_threshold;
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
     /** number of entries in cipher_prefs (0 disables negotiation) */
     uint8_t cipher_pref_count;
@@ -512,6 +555,11 @@ typedef struct {
     uint32_t icv_failures;
     /** SAKs adopted as the Latest key (initial key + rekeys) */
     uint32_t sak_installs;
+    /** SecY callbacks that returned an error (a negative value). The data
+     * plane refusing an operation is otherwise invisible to the KaY, which
+     * cannot see the device: without this an integrator has no way to tell a
+     * healthy CA from one whose keys never reached the hardware. */
+    uint32_t secy_errors;
 } MkaCounters;
 
 /** Fields are ordered by descending alignment to minimise padding. The SAK
@@ -534,6 +582,23 @@ typedef struct {
     size_t peer_count;
     /** confidentiality offset in force for the SAK */
     uint8_t sak_conf_offset;
+    /** an SA install for the key in force was refused by the SecY, so this
+     * participant is not able to use it. Cleared when a fresh SAK is
+     * programmed. While set, MACsec SAK Use does not claim to be receiving on
+     * the key and the transmit gate stays shut - the same restraint
+     * @c secy_pending imposes for an asynchronous data plane, applied to one
+     * that answered with an error. */
+    bool secy_install_failed;
+#ifndef WOLFMKA_NO_XPN
+    /** a member joined while an XPN SAK was in force, so the SSCI ranks that
+     * SAK was issued under no longer describe the CA and the Key Server must
+     * distribute a fresh one. */
+    bool xpn_rank_stale;
+    /** this participant's own SSCI, as assigned by a Version 3 Key Server in
+     * the MKPDU that distributed the SAK in force (9.10). 0 when none was
+     * received, in which case the rank is computed locally. */
+    uint32_t xpn_own_ssci;
+#endif
 #ifdef WOLFMKA_CIPHER_NEGOTIATION
     /** the SAK is used integrity-only: a member of the CA cannot do
      * confidentiality (its MACsec Capability is below INTEGRITY_CONF). */

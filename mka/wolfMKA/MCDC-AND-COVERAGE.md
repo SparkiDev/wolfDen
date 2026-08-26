@@ -30,7 +30,6 @@ every configuration too; it is omitted from the table below only because it is
 | **Certification base** (`FAULT_INJECT DISTRIBUTED_CAK KMD SUSPENSION`) | **100%** | **100%** | **100%** |
 | + `CIPHER_NEGOTIATION` | **100%** | **100%** | **100%** |
 | + `AUTOMOTIVE_PROFILE` | **100%** | **100%** | **100%** |
-| + `ICV_L2_ADDR` | **100%** | **100%** | **100%** |
 | + `SMALL_STACK NO_MALLOC` | **100%** | **100%** | **100%** |
 | Feature-off `NO_*` builds | **all six enforced at 100%** (table below) | | |
 

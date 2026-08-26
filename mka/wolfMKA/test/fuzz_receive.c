@@ -145,11 +145,10 @@ static size_t forge(const uint8_t* body, size_t body_n, uint8_t* out,
         memcpy(&out[EAPOL_HDR_LEN], body, body_n);
     }
     covered = EAPOL_HDR_LEN + body_n;
-    /* Seal exactly what the library verifies. Under WOLFMKA_ICV_L2_ADDR that
+    /* Seal exactly what the library verifies. That
      * includes the L2 prefix derived from the frame; sealing without it would
      * make every frame fail the ICV and the fuzzer would never reach the state
      * machine it is aimed at. */
-#ifdef WOLFMKA_ICV_L2_ADDR
     {
         static const uint8_t pae_group[6] = MKA_PAE_GROUP_ADDR;
         uint8_t l2[MKA_ICV_L2_PREFIX_LEN];
@@ -163,12 +162,6 @@ static size_t forge(const uint8_t* body, size_t body_n, uint8_t* out,
             return 0;
         }
     }
-#else
-    if (wm_Crypto_IcvCompute(g_cmac, g_ick, g_ick_len, out, covered, icv) !=
-        MKA_OK) {
-        return 0;
-    }
-#endif
     memcpy(&out[covered], icv, MKA_DEFAULT_ICV_LEN);
     return covered + MKA_DEFAULT_ICV_LEN;
 }

@@ -71,16 +71,31 @@ int main(void)
     #include <linux/if_packet.h>
     #include <linux/if_ether.h>
     #include <linux/genetlink.h>
+    #include <linux/if_link.h>
+    #include <linux/rtnetlink.h>
     #include <linux/if_macsec.h>
     #include <linux/netlink.h>
 
     #include "wolfmka/mka_kay.h"
     #include "wolfmka/mka_crypto.h"
 
-    #define EAPOL_TYPE  0x888E
-    #define ETH_HDR_LEN 14
-    #define MAX_FRAME   1600
-    #define SECY_BUF    2048
+    #define EAPOL_TYPE     0x888E
+    #define ETH_HDR_LEN    14
+    #define MAX_FRAME      1600
+    #define SECY_BUF       2048
+    /* One transmit SC plus a receive SC per peer; this example is a two-party
+     * link, so a small table covers it with room to spare. */
+    #define SECY_MAX_RX_SC 4
+
+/* Milliseconds since start, stamped on every trace line. A handover is a
+ * sequence of SecY calls whose *timing* is the thing under examination - which
+ * step waited, and for how long - and an untimed trace cannot answer that. */
+static uint32_t g_t0;
+    #define TRACE(...)                                                         \
+        do {                                                                   \
+            printf("[+%ums] ", (unsigned)(now_ms() - g_t0));                   \
+            printf(__VA_ARGS__);                                               \
+        } while (0)
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_rekey = 0;
@@ -211,11 +226,39 @@ fail:
  * (kernel netdevice over genetlink) - see secy_macsec_linux.c. */
 typedef struct {
     int fd;
+    /* The transmit Secure Association in force is a *link* attribute
+     * (IFLA_MACSEC_ENCODING_SA), not something the MACsec generic-netlink
+     * family exposes, so it needs a second socket on NETLINK_ROUTE. */
+    int rtfd;
     int family;
     unsigned int seq;
     unsigned int ifindex;
-    uint32_t ssci;
+    /* Set from set_cipher_suite. The SSCI is per Secure Channel - ours for the
+     * transmit SA, the peer's for each receive SA - and it is half the XPN
+     * initialisation vector, so a single shared value would decrypt nothing.
+     * The transmit SC is the entry whose SCI matches the participant's own. */
+    int xpn;
+    uint32_t tx_ssci;
+    struct {
+        uint8_t sci[MKA_SCI_LEN];
+        uint32_t ssci;
+        int used;
+    } rx_ssci[SECY_MAX_RX_SC];
+    /* Set once the participant exists. The SecY hooks are handed a Key Number
+     * but not the Member Identifier of the Key Server that issued it, and the
+     * kernel's Key Identifier is the full KI - so the key is looked up here to
+     * recover the MI. Read-only, and only for that. */
+    const MkaParticipant* p;
 } SecyMacsec;
+
+    /* Older kernel headers predate the XPN attributes. MACSEC_SA_ATTR_SSCI and
+     * _SALT are enumerators rather than macros, so they cannot be tested
+     * directly; MACSEC_SALT_LEN is a macro and arrived with them, so it stands
+     * in as the guard. Without it this build cannot drive an XPN device, which
+     * is better than inventing attribute numbers. */
+    #ifdef MACSEC_SALT_LEN
+        #define SECY_HAVE_XPN 1
+    #endif
 
     #define NL_TAIL(n)                                                         \
         ((struct nlattr*)((char*)(n) + NLMSG_ALIGN((n)->nlmsg_len)))
@@ -269,6 +312,19 @@ static struct nlmsghdr* nl_msg(void* buf, int family, uint8_t cmd,
     return n;
 }
 
+/* Send one request and return the kernel's verdict on *that* request.
+ *
+ * The sequence number is checked rather than trusting whatever arrives next.
+ * A netlink socket carries replies to every request sent on it, so a reply
+ * that is not matched to its request can be attributed to the wrong call - and
+ * a diagnostic that names the wrong command is worse than none, because it
+ * sends the reader looking at innocent code. This mattered here: a receive SA
+ * that could not be deleted reported -EBUSY against a later, unrelated
+ * install, which read as the kernel rejecting a perfectly good SA.
+ *
+ * Every request sets NLM_F_ACK, so the kernel always answers with an
+ * NLMSG_ERROR carrying 0 on success. Anything not bearing our sequence number
+ * is a leftover and is skipped. */
 static int nl_send_ack(SecyMacsec* s, struct nlmsghdr* n)
 {
     union {
@@ -277,25 +333,36 @@ static int nl_send_ack(SecyMacsec* s, struct nlmsghdr* n)
     } r;
     struct nlmsghdr* h;
     ssize_t len;
+    unsigned int want = n->nlmsg_seq;
+    int tries;
 
     if (send(s->fd, n, n->nlmsg_len, 0) < 0) {
         return -errno;
     }
-    len = recv(s->fd, &r, sizeof r, 0);
-    if (len < 0) {
-        return -errno;
-    }
-    {
-        int rem = (int)len;
+    /* Bounded: a reply that never comes must not wedge the event loop. */
+    for (tries = 0; tries < 16; tries++) {
+        int rem;
+        len = recv(s->fd, &r, sizeof r, 0);
+        if (len < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -errno;
+        }
+        rem = (int)len;
         for (h = &r.n; NLMSG_OK(h, rem); h = NLMSG_NEXT(h, rem)) {
+            if (h->nlmsg_seq != want) {
+                continue;
+            }
             if (h->nlmsg_type == NLMSG_ERROR) {
                 const struct nlmsgerr* e =
                     (const struct nlmsgerr*)NLMSG_DATA(h);
                 return e->error;
             }
+            return 0;
         }
     }
-    return 0;
+    return -ETIMEDOUT;
 }
 
 static int nl_resolve(SecyMacsec* s, const char* name)
@@ -350,13 +417,77 @@ static int nl_resolve(SecyMacsec* s, const char* name)
     return -1;
 }
 
-static void secy_keyid(uint8_t kid[MACSEC_KEYID_LEN], uint32_t kn)
+/* The kernel's MACSEC_SA_ATTR_KEYID is the MKA Key Identifier: the issuing Key
+ * Server's Member Identifier followed by the Key Number (IEEE Std 802.1X-2010,
+ * 9.8). It is a local handle - it never goes on the wire and peers do not
+ * compare it - but writing the real KI is what makes `ip macsec show` legible
+ * during a handover, where two keys are installed at once and the KN alone is
+ * the only thing telling them apart. wpa_supplicant writes the same thing.
+ *
+ * The SAK hooks are given a Key Number but not the MI, so the key is matched
+ * against the participant's Latest and Old slots to recover it. A KN belonging
+ * to neither leaves the MI zero rather than inventing one. */
+static void secy_keyid(const SecyMacsec* s, uint8_t kid[MACSEC_KEYID_LEN],
+    uint32_t kn)
 {
+    const MkaParticipant* p = s->p;
+
     (void)memset(kid, 0, MACSEC_KEYID_LEN);
+    if (p != NULL) {
+        if (p->latest.valid && (p->latest.kn == kn)) {
+            (void)memcpy(kid, p->latest.ks_mi, MKA_MI_LEN);
+        }
+        else if (p->old.valid && (p->old.kn == kn)) {
+            (void)memcpy(kid, p->old.ks_mi, MKA_MI_LEN);
+        }
+        else {
+            /* not a key this participant holds */
+        }
+    }
     kid[12] = (uint8_t)(kn >> 24);
     kid[13] = (uint8_t)(kn >> 16);
     kid[14] = (uint8_t)(kn >> 8);
     kid[15] = (uint8_t)kn;
+}
+
+/* The initialisation-vector salt for the XPN suites. It is not distributed by
+ * MKA and not derived from the SAK: it is the Key Identifier's Member
+ * Identifier with the Key Number folded into its first four octets, so both
+ * ends compute the same value from what the Distributed SAK already told them
+ * (IEEE Std 802.1AE-2018). The octet order below is the one MKAdaemon and
+ * wpa_supplicant both implement - the two 16-bit halves of the Key Number are
+ * swapped - and it has to match exactly or the peer decrypts nothing. */
+static void secy_salt(const SecyMacsec* s, uint8_t salt[MACSEC_SALT_LEN],
+    uint32_t kn)
+{
+    uint8_t kid[MACSEC_KEYID_LEN];
+
+    secy_keyid(s, kid, kn);
+    (void)memcpy(salt, kid, MACSEC_SALT_LEN);
+    salt[0] ^= (uint8_t)(kn >> 8);
+    salt[1] ^= (uint8_t)kn;
+    salt[2] ^= (uint8_t)(kn >> 24);
+    salt[3] ^= (uint8_t)(kn >> 16);
+}
+
+/* The SSCI for one channel: the transmit SA (sci == NULL) uses ours, a receive
+ * SA uses the one the Key Server assigned to that peer. */
+static uint32_t secy_ssci_for(const SecyMacsec* s, const uint8_t* sci)
+{
+    uint32_t v = s->tx_ssci;
+
+    if (sci != NULL) {
+        size_t i;
+        v = 0U;
+        for (i = 0U; i < (size_t)SECY_MAX_RX_SC; i++) {
+            if (s->rx_ssci[i].used &&
+                (memcmp(s->rx_ssci[i].sci, sci, MKA_SCI_LEN) == 0)) {
+                v = s->rx_ssci[i].ssci;
+                break;
+            }
+        }
+    }
+    return v;
 }
 
 static uint64_t secy_sci64(const uint8_t sci[MKA_SCI_LEN])
@@ -366,7 +497,12 @@ static uint64_t secy_sci64(const uint8_t sci[MKA_SCI_LEN])
     return v;
 }
 
-static int secy_add_sa(SecyMacsec* s, const uint8_t* sci, uint8_t an,
+/* Defined below; needed here to clear a stale SA out of the way. */
+static int secy_set_active(SecyMacsec* s, const uint8_t* sci, uint8_t an,
+    bool active);
+static int secy_delete_sa(void* ctx, const uint8_t* sci, uint8_t an);
+
+static int secy_add_sa_once(SecyMacsec* s, const uint8_t* sci, uint8_t an,
     uint32_t kn, const uint8_t* sak, size_t sak_len)
 {
     union {
@@ -395,8 +531,35 @@ static int secy_add_sa(SecyMacsec* s, const uint8_t* sci, uint8_t an,
     }
     sa = nl_nest(n, (int)sizeof u, MACSEC_ATTR_SA_CONFIG);
     (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_AN, &an, (int)sizeof an);
-    (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_PN, &pn, (int)sizeof pn);
-    secy_keyid(keyid, kn);
+    #ifdef SECY_HAVE_XPN
+    if (s->xpn) {
+        /* An XPN device rejects a 4-octet packet number: the kernel picks the
+         * attribute width from the SecY's cipher suite, so the whole 64-bit
+         * number goes in. The SSCI travels in network order, and the salt is
+         * derived locally from the Key Identifier. */
+        uint64_t pn64 = pn;
+        uint32_t v = secy_ssci_for(s, sci);
+        uint8_t ssci_be[4];
+        uint8_t salt[MACSEC_SALT_LEN];
+
+        ssci_be[0] = (uint8_t)(v >> 24);
+        ssci_be[1] = (uint8_t)(v >> 16);
+        ssci_be[2] = (uint8_t)(v >> 8);
+        ssci_be[3] = (uint8_t)v;
+        secy_salt(s, salt, kn);
+        (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_PN, &pn64,
+            (int)sizeof pn64);
+        (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_SSCI, ssci_be,
+            (int)sizeof ssci_be);
+        (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_SALT, salt,
+            MACSEC_SALT_LEN);
+    }
+    else
+    #endif
+    {
+        (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_PN, &pn, (int)sizeof pn);
+    }
+    secy_keyid(s, keyid, kn);
     (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_KEYID, keyid,
         (int)sizeof keyid);
     (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_KEY, sak, (int)sak_len);
@@ -404,6 +567,108 @@ static int secy_add_sa(SecyMacsec* s, const uint8_t* sci, uint8_t an,
         (int)sizeof active);
     nl_nest_end(n, sa);
     return nl_send_ack(s, n);
+}
+
+/* Install one Secure Association, clearing a stale one out of the way first if
+ * the Association Number is still occupied.
+ *
+ * The MACsec device outlives this process - it is provisioned separately, and
+ * the SAs installed into it stay there when the participant exits. A restarted
+ * participant comes back with a fresh Member Identifier and a fresh SAK, but
+ * the Association Numbers restart at 0, so the kernel refuses the install with
+ * -EBUSY and the new key never reaches the data plane. Interop found this the
+ * hard way: the restarted end went on transmitting under the *previous* key,
+ * which its peer had already discarded.
+ *
+ * A SecY that owns its device can delete and recreate it instead (MKAdaemon
+ * does). This one is handed a device, so it evicts the previous incarnation's
+ * SA - disabling it first, since an active SA cannot be deleted - and retries.
+ */
+static int secy_add_sa(SecyMacsec* s, const uint8_t* sci, uint8_t an,
+    uint32_t kn, const uint8_t* sak, size_t sak_len)
+{
+    int rc = secy_add_sa_once(s, sci, an, kn, sak, sak_len);
+
+    if ((rc == -EBUSY) || (rc == -EEXIST)) {
+        TRACE("[SecY] an=%u occupied (%d), evicting the stale SA\n",
+            (unsigned)an, rc);
+        (void)secy_set_active(s, sci, an, false);
+        (void)secy_delete_sa(s, sci, an);
+        rc = secy_add_sa_once(s, sci, an, kn, sak, sak_len);
+    }
+    return rc;
+}
+
+/* Point the device at the transmit SA that is now in force.
+ *
+ * Marking a TXSA "active" through the MACsec genl family does not make the
+ * kernel transmit on it: encoding_sa selects that, and it is an rtnetlink link
+ * attribute. Leaving it alone means the device keeps encoding with whatever
+ * Association Number it started on - which works right up until that SA is
+ * deleted at the end of a make-before-break handover, at which point transmit
+ * stops dead while `ip macsec show` still reports the new SA installed and
+ * active. That is what a rekey looked like from the far end: the key agreement
+ * completed on both sides and the data plane went silent.
+ *
+ * RTM_NEWLINK carrying IFLA_LINKINFO { IFLA_INFO_KIND="macsec",
+ * IFLA_INFO_DATA { IFLA_MACSEC_ENCODING_SA } }, which is what
+ * `ip link set <dev> type macsec encodingsa <an>` sends. */
+static int secy_set_encoding_sa(SecyMacsec* s, uint8_t an)
+{
+    union {
+        struct nlmsghdr n;
+        char b[SECY_BUF];
+    } u;
+    struct nlmsghdr* n;
+    struct ifinfomsg* ifi;
+    struct nlattr* li;
+    struct nlattr* id;
+    struct nlmsghdr* r;
+    ssize_t len;
+    union {
+        struct nlmsghdr n;
+        char b[SECY_BUF];
+    } resp;
+
+    if (s->rtfd < 0) {
+        return -EBADF;
+    }
+    (void)memset(&u, 0, sizeof u);
+    n = &u.n;
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(*ifi));
+    n->nlmsg_type = RTM_NEWLINK;
+    n->nlmsg_flags = (uint16_t)(NLM_F_REQUEST | NLM_F_ACK);
+    n->nlmsg_seq = ++s->seq;
+    ifi = (struct ifinfomsg*)NLMSG_DATA(n);
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = (int)s->ifindex;
+
+    li = nl_nest(n, (int)sizeof u, IFLA_LINKINFO);
+    (void)nl_put(n, (int)sizeof u, IFLA_INFO_KIND, "macsec", 7);
+    id = nl_nest(n, (int)sizeof u, IFLA_INFO_DATA);
+    (void)nl_put(n, (int)sizeof u, IFLA_MACSEC_ENCODING_SA, &an,
+        (int)sizeof an);
+    nl_nest_end(n, id);
+    nl_nest_end(n, li);
+
+    if (send(s->rtfd, n, n->nlmsg_len, 0) < 0) {
+        return -errno;
+    }
+    len = recv(s->rtfd, &resp, sizeof resp, 0);
+    if (len < 0) {
+        return -errno;
+    }
+    {
+        int rem = (int)len;
+        for (r = &resp.n; NLMSG_OK(r, rem); r = NLMSG_NEXT(r, rem)) {
+            if (r->nlmsg_type == NLMSG_ERROR) {
+                const struct nlmsgerr* e =
+                    (const struct nlmsgerr*)NLMSG_DATA(r);
+                return e->error;
+            }
+        }
+    }
+    return 0;
 }
 
 static int secy_set_active(SecyMacsec* s, const uint8_t* sci, uint8_t an,
@@ -465,31 +730,71 @@ static int secy_create_rx_sc(void* ctx, const uint8_t* sci)
     (void)nl_put(n, (int)sizeof u, MACSEC_RXSC_ATTR_SCI, &sci64,
         (int)sizeof sci64);
     nl_nest_end(n, rxsc);
-    return nl_send_ack(s, n);
+    {
+        int rc = nl_send_ack(s, n);
+        /* The KaY creates the SC ahead of every install for this peer, so
+         * from the second SAK onwards the kernel already has it. -EEXIST
+         * means the SC is present, which is exactly what was asked for. */
+        if (rc == -EEXIST) {
+            rc = 0;
+        }
+        TRACE("[SecY] create RX SC -> %d\n", rc);
+        return rc;
+    }
 }
 
+/* Each hook reports what it was asked to do and whether the kernel accepted it.
+ * A make-before-break rekey is several of these in a specific order across two
+ * Association Numbers, and without a trace there is no way to tell "the SecY
+ * was never told" from "the SecY refused" when a handover does not complete. */
 static int secy_install_tx_sa(void* ctx, const uint8_t* sci, uint8_t an,
     uint32_t kn, const uint8_t* sak, size_t sak_len)
 {
+    int rc;
     (void)sci;
-    return secy_add_sa((SecyMacsec*)ctx, NULL, an, kn, sak, sak_len);
+    rc = secy_add_sa((SecyMacsec*)ctx, NULL, an, kn, sak, sak_len);
+    TRACE("[SecY] install TX SA an=%u kn=%u len=%u -> %d\n", (unsigned)an,
+        (unsigned)kn, (unsigned)sak_len, rc);
+    return rc;
 }
 
 static int secy_install_rx_sa(void* ctx, const uint8_t* sci, uint8_t an,
     uint32_t kn, const uint8_t* sak, size_t sak_len)
 {
-    return secy_add_sa((SecyMacsec*)ctx, sci, an, kn, sak, sak_len);
+    int rc = secy_add_sa((SecyMacsec*)ctx, sci, an, kn, sak, sak_len);
+    TRACE("[SecY] install RX SA an=%u kn=%u len=%u -> %d\n", (unsigned)an,
+        (unsigned)kn, (unsigned)sak_len, rc);
+    return rc;
 }
 
 static int secy_enable_transmit(void* ctx, uint8_t an, bool enable)
 {
-    return secy_set_active((SecyMacsec*)ctx, NULL, an, enable);
+    SecyMacsec* s = (SecyMacsec*)ctx;
+    int rc = secy_set_active(s, NULL, an, enable);
+
+    /* Enabling is also the moment the device must start encoding with this
+     * Association Number; disabling one is not, since the KaY enables the
+     * successor first. */
+    if (enable && (rc == 0)) {
+        int erc = secy_set_encoding_sa(s, an);
+        TRACE("[SecY] encoding SA -> an=%u -> %d\n", (unsigned)an, erc);
+        if (erc != 0) {
+            rc = erc;
+        }
+    }
+    TRACE("[SecY] transmit an=%u %s -> %d\n", (unsigned)an,
+        enable ? "ENABLED" : "off", rc);
+    return rc;
 }
 
 static int secy_enable_receive(void* ctx, const uint8_t* sci, uint8_t an,
     bool enable)
 {
-    return secy_set_active((SecyMacsec*)ctx, sci, an, enable);
+    int rc = secy_set_active((SecyMacsec*)ctx, sci, an, enable);
+
+    TRACE("[SecY] receive an=%u %s -> %d\n", (unsigned)an,
+        enable ? "ENABLED" : "off", rc);
+    return rc;
 }
 
 static int secy_delete_sa(void* ctx, const uint8_t* sci, uint8_t an)
@@ -519,7 +824,64 @@ static int secy_delete_sa(void* ctx, const uint8_t* sci, uint8_t an)
     sa = nl_nest(n, (int)sizeof u, MACSEC_ATTR_SA_CONFIG);
     (void)nl_put(n, (int)sizeof u, MACSEC_SA_ATTR_AN, &an, (int)sizeof an);
     nl_nest_end(n, sa);
-    return nl_send_ack(s, n);
+    {
+        int rc = nl_send_ack(s, n);
+        TRACE("[SecY] delete %s SA an=%u -> %d\n", (sci == NULL) ? "TX" : "RX",
+            (unsigned)an, rc);
+        return rc;
+    }
+}
+
+/* The kernel fixes a MACsec device's cipher suite when the device is created,
+ * so this hook does not - and cannot - change it; see the note in main(). It
+ * is implemented for the one thing only MKA can supply: the per-channel SSCI
+ * that the XPN suites need before any SA on that channel is installed. */
+static int secy_set_cipher_suite(void* ctx, const uint8_t sci[MKA_SCI_LEN],
+    uint64_t cipher_suite, uint32_t ssci, uint8_t confidentiality_offset)
+{
+    SecyMacsec* s = (SecyMacsec*)ctx;
+
+    /* Linux MACsec offers no confidentiality-offset control: a device is
+     * created "encrypt on" or "encrypt off" and every frame follows. */
+    (void)confidentiality_offset;
+    s->xpn = ((cipher_suite == MKA_CIPHER_GCM_AES_XPN_128) ||
+                 (cipher_suite == MKA_CIPHER_GCM_AES_XPN_256))
+                 ? 1
+                 : 0;
+
+    if ((s->p != NULL) && (memcmp(sci, s->p->cfg.sci, MKA_SCI_LEN) == 0)) {
+        s->tx_ssci = ssci;
+    }
+    else {
+        /* Update this peer's entry, or claim a free one. A full table drops
+         * the assignment rather than overwriting another channel's. */
+        size_t i;
+        size_t slot = (size_t)SECY_MAX_RX_SC;
+
+        for (i = 0U; i < (size_t)SECY_MAX_RX_SC; i++) {
+            if (s->rx_ssci[i].used) {
+                if (memcmp(s->rx_ssci[i].sci, sci, MKA_SCI_LEN) == 0) {
+                    slot = i;
+                    break;
+                }
+            }
+            else if (slot == (size_t)SECY_MAX_RX_SC) {
+                slot = i;
+            }
+            else {
+                /* keep the first free slot seen */
+            }
+        }
+        if (slot < (size_t)SECY_MAX_RX_SC) {
+            (void)memcpy(s->rx_ssci[slot].sci, sci, MKA_SCI_LEN);
+            s->rx_ssci[slot].ssci = ssci;
+            s->rx_ssci[slot].used = 1;
+        }
+    }
+    TRACE("[SecY] cipher suite %08x%08x ssci=%u xpn=%d\n",
+        (unsigned)(cipher_suite >> 32), (unsigned)cipher_suite, (unsigned)ssci,
+        s->xpn);
+    return 0;
 }
 
 static MkaSecyOps secy_macsec_ops(SecyMacsec* s)
@@ -533,6 +895,7 @@ static MkaSecyOps secy_macsec_ops(SecyMacsec* s)
     ops.enable_transmit = secy_enable_transmit;
     ops.enable_receive = secy_enable_receive;
     ops.delete_sa = secy_delete_sa;
+    ops.set_cipher_suite = secy_set_cipher_suite;
     ops.ctx = s;
     return ops;
 }
@@ -542,6 +905,7 @@ static int secy_macsec_init(SecyMacsec* s, const char* ifname)
     struct sockaddr_nl sa;
 
     (void)memset(s, 0, sizeof *s);
+    s->rtfd = -1;
     s->fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
     if (s->fd < 0) {
         perror("socket(NETLINK_GENERIC)");
@@ -562,6 +926,17 @@ static int secy_macsec_init(SecyMacsec* s, const char* ifname)
         s->fd = -1;
         return -1;
     }
+    s->rtfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s->rtfd >= 0) {
+        struct sockaddr_nl rsa;
+        (void)memset(&rsa, 0, sizeof rsa);
+        rsa.nl_family = AF_NETLINK;
+        if (bind(s->rtfd, (struct sockaddr*)&rsa, sizeof rsa) < 0) {
+            perror("bind(NETLINK_ROUTE)");
+            (void)close(s->rtfd);
+            s->rtfd = -1;
+        }
+    }
     s->ifindex = if_nametoindex(ifname);
     if (s->ifindex == 0U) {
         fprintf(stderr, "macsec interface '%s' not found\n", ifname);
@@ -577,6 +952,10 @@ static void secy_macsec_free(SecyMacsec* s)
     if (s->fd >= 0) {
         (void)close(s->fd);
         s->fd = -1;
+    }
+    if (s->rtfd >= 0) {
+        (void)close(s->rtfd);
+        s->rtfd = -1;
     }
 }
 
@@ -595,11 +974,22 @@ int main(int argc, char** argv)
     size_t cak_len, ckn_len;
     int pri;
     int prev_ks = -1, prev_live = -1, prev_sak = -1;
+    /* Previous peer-reported state. The Key Server's rekey triggers are
+     * computed from what the peer says about the key in use, so when a rekey
+     * happens that nobody asked for, this is the evidence that explains it. */
+    int prev_prx = -1, prev_ptx = -1, prev_plive = -1;
+    uint32_t prev_pkn = 0xFFFFFFFFU;
+
+    /* Line-buffer stdout: same reason as mka_link.c - the interop script polls
+     * this log while the process is still running, and full buffering would
+     * leave it empty. */
+    (void)setvbuf(stdout, NULL, _IOLBF, 0);
+    g_t0 = now_ms();
     uint32_t prev_kn = 0;
 
-    if ((argc != 6) && (argc != 7)) {
+    if ((argc < 6) || (argc > 9)) {
         printf("usage: %s <eth> <macsec> <priority> <cak-hex> <ckn-hex> "
-               "[rekey-ms]\n",
+               "[rekey-ms] [sak-octets] [xpn]\n",
             argv[0]);
         return 1;
     }
@@ -644,10 +1034,33 @@ int main(int argc, char** argv)
     cfg.priority = (uint8_t)pri;
     cfg.macsec_desired = 1;
     cfg.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cfg.confidentiality_offset = MKA_CONF_OFFSET_0;
     cfg.key_server_capable = 1;
-    cfg.sak_len = 16;
-    if (argc == 7) {
+    if (argc >= 7) {
         cfg.sak_rekey_time_ms = (uint32_t)strtoul(argv[6], NULL, 10);
+    }
+    /* SAK length selects the cipher suite, as in mka_link: 16 -> GCM-AES-128
+     * (left implicit on the wire), 32 -> GCM-AES-256, named explicitly in the
+     * Distributed SAK parameter set.
+     *
+     * The set_cipher_suite SecY hook is implemented, but it cannot change a
+     * device's suite: the kernel fixes that when the device is created, so the
+     * suite has to match how the device was provisioned (`ip link add ... type
+     * macsec cipher gcm-aes-256`). Configuring a 32-octet SAK against a device
+     * created at the default GCM-AES-128 agrees a key that then decrypts
+     * nothing. The hook exists to capture the per-channel SSCI, which only MKA
+     * can supply and which the XPN suites need. */
+    cfg.sak_len = (argc >= 8) ? (size_t)atoi(argv[7]) : 16U;
+    if (cfg.sak_len == 32U) {
+        cfg.cipher_suite = MKA_CIPHER_GCM_AES_256;
+    }
+    /* Arg 8 selects the Extended Packet Numbering variant of the suite the SAK
+     * length already chose. The device has to have been created for it too
+     * (`ip link add ... cipher gcm-aes-xpn-128`); the SecY hook below reads the
+     * suite back and switches the netlink attributes accordingly. */
+    if ((argc == 9) && (atoi(argv[8]) != 0)) {
+        cfg.cipher_suite = (cfg.sak_len == 32U) ? MKA_CIPHER_GCM_AES_XPN_256
+                                                : MKA_CIPHER_GCM_AES_XPN_128;
     }
     cfg.secy = secy_macsec_ops(&secy);
     cfg.send = link_send;
@@ -663,6 +1076,9 @@ int main(int argc, char** argv)
         (void)close(lk.fd);
         return 1;
     }
+    /* The SecY names each key by its full Key Identifier, which needs the
+     * participant to recover the issuing Key Server's MI from a Key Number. */
+    secy.p = &p;
     printf("MKA+MACsec on %s/%s (priority %d). SIGUSR1 rekeys; Ctrl-C stops.\n",
         argv[1], argv[2], pri);
     (void)signal(SIGINT, on_sigint);
@@ -677,7 +1093,16 @@ int main(int argc, char** argv)
         pfd.events = POLLIN;
         pfd.revents = 0;
         if (poll(&pfd, 1, 1000) < 0) {
-            break; /* EINTR from a signal: re-check g_stop / g_rekey */
+            /* A signal interrupting poll is the normal way SIGUSR1 and SIGINT
+             * arrive, so go round and re-check g_stop / g_rekey. Breaking here
+             * quit the whole program on the very signal that asks for a rekey,
+             * which tore down the Secure Associations mid-handover and looked
+             * from the peer's side like the link going away. */
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
         }
         t = now_ms();
 
@@ -696,7 +1121,7 @@ int main(int argc, char** argv)
         if (g_rekey != 0) {
             g_rekey = 0;
             if (wm_Participant_Rekey(&p) == MKA_OK) {
-                printf("rekey requested\n");
+                TRACE("rekey requested\n");
             }
             else {
                 printf("rekey ignored (not Key Server)\n");
@@ -705,12 +1130,35 @@ int main(int argc, char** argv)
 
         (void)wm_Participant_Run(&p, t, NULL);
 
+        /* The peer table is public, so the example can show exactly what the
+         * peer last reported: whether it is live, whether it says it is
+         * receiving/transmitting on a key, and which Key Number it named. A
+         * peer that stops reporting our key is what raises the "SAK lost"
+         * rekey (OPEN Alliance AutoMKA-03011), and an MKPDU carrying no MACsec
+         * SAK Use set at all clears these. */
+        if (p.peers[0].valid) {
+            int plive = p.peers[0].live ? 1 : 0;
+            int prx = p.peers[0].sak_rx ? 1 : 0;
+            int ptx = p.peers[0].sak_tx ? 1 : 0;
+            uint32_t pkn = p.peers[0].latest_kn;
+
+            if ((plive != prev_plive) || (prx != prev_prx) ||
+                (ptx != prev_ptx) || (pkn != prev_pkn)) {
+                TRACE("peer: live=%d sak_rx=%d sak_tx=%d latest_kn=%u\n", plive,
+                    prx, ptx, pkn);
+                prev_plive = plive;
+                prev_prx = prx;
+                prev_ptx = ptx;
+                prev_pkn = pkn;
+            }
+        }
+
         live = (int)wm_Participant_LivePeerCount(&p);
         ks = wm_Participant_IsKeyServer(&p) ? 1 : 0;
         sak = wm_Participant_HasSak(&p) ? 1 : 0;
         if ((live != prev_live) || (ks != prev_ks) || (sak != prev_sak) ||
             (p.latest.kn != prev_kn)) {
-            printf("state: live=%d key_server=%d sak=%d kn=%u\n", live, ks, sak,
+            TRACE("state: live=%d key_server=%d sak=%d kn=%u\n", live, ks, sak,
                 p.latest.kn);
             prev_live = live;
             prev_ks = ks;
@@ -718,6 +1166,9 @@ int main(int argc, char** argv)
             prev_kn = p.latest.kn;
         }
     }
+    /* Say why the loop ended: a clean Ctrl-C looks nothing like a poll error,
+     * and from a peer's point of view both are just the link going quiet. */
+    printf("stopping (%s)\n", g_stop ? "signal" : "poll error");
     wm_Participant_Free(&p);
     wm_Crypto_RandomFree(rng);
     wm_Crypto_CmacFree(cmac);
