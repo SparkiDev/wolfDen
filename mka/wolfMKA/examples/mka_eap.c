@@ -242,6 +242,7 @@ int main(void)
     ca.priority = 10;
     ca.macsec_desired = 1;
     ca.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    ca.confidentiality_offset = MKA_CONF_OFFSET_0;
     ca.key_server_capable = 1;
     ca.sak_len = 16;
     ca.secy = secy_noop();
@@ -253,6 +254,7 @@ int main(void)
     cb.priority = 20;
     cb.macsec_desired = 1;
     cb.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cb.confidentiality_offset = MKA_CONF_OFFSET_0;
     cb.key_server_capable = 1;
     cb.sak_len = 16;
     cb.secy = secy_noop();

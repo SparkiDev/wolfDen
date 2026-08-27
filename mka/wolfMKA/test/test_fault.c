@@ -487,7 +487,6 @@ static void test_fault_run_sak_gen(void)
     wm_Fault_Reset();
 }
 
-    #ifdef WOLFMKA_ICV_L2_ADDR
 /* The L2 ICV builds its CMAC in four streaming steps; a failure at any of them
  * must propagate out as MKA_ERR_CRYPTO rather than yielding a half-computed
  * ICV. Arming the hook fails the first step, which is what drives the
@@ -513,7 +512,6 @@ static void test_fault_icv_l2(void)
         "L2 icv verify reports a CMAC failure");
     wm_Fault_Reset();
 }
-    #endif /* WOLFMKA_ICV_L2_ADDR */
 
 /* A participant whose initialisation fails must keep nothing: p->cfg already
  * holds the caller's plaintext CAK by then, and a failure after DeriveKeys
@@ -578,9 +576,7 @@ void run_fault_tests(void)
     test_fault_run_sak_gen();
     test_fault_build_failure_is_rate_limited();
     test_fault_init_leaves_no_key_material();
-    #ifdef WOLFMKA_ICV_L2_ADDR
     test_fault_icv_l2();
-    #endif
 }
 
 #else /* fault injection compiled out */

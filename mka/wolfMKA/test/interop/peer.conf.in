@@ -1,6 +1,7 @@
 # wpa_supplicant MKA / MACsec peer configuration - template for the wolfMKA
 # interop harness (test/interop/). The harness substitutes @CTRL@, @CAK@,
-# @CKN@ and @PRIORITY@ before launching wpa_supplicant with the macsec_linux
+# @CKN@, @PRIORITY@ and @CSINDEX@ (0 = GCM-AES-128, 1 = GCM-AES-256) before
+# launching wpa_supplicant with the macsec_linux
 # driver. PSK-CAK mode (key_mgmt=NONE): the CAK/CKN are pre-shared, exactly as
 # the wolfMKA peer is configured, so no EAP exchange is involved.
 ctrl_interface=@CTRL@
@@ -16,4 +17,5 @@ network={
 	mka_cak=@CAK@
 	mka_ckn=@CKN@
 	mka_priority=@PRIORITY@
+	macsec_csindex=@CSINDEX@
 }

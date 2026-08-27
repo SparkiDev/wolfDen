@@ -348,19 +348,20 @@ typedef enum {
     MKA_CAP_INTEGRITY_CONF_OFFSET = 3
 } MkaMacsecCapability;
 
-/** Confidentiality offsets carried in the Distributed SAK parameter set. */
+/** Confidentiality offsets carried in the Distributed SAK parameter set
+ * (Table 11-6). The field is two bits wide, so all four values are legal on
+ * the wire; the enumeration is the offset selector, not the octet count it
+ * names. */
 typedef enum {
-    MKA_CONF_OFFSET_0 = 0,
-    MKA_CONF_OFFSET_30 = 1,
-    MKA_CONF_OFFSET_50 = 2
+    /** no confidentiality: the cipher suite runs integrity-only */
+    MKA_CONF_OFFSET_NONE = 0,
+    /** confidentiality from octet 0 */
+    MKA_CONF_OFFSET_0 = 1,
+    /** confidentiality from octet 30 */
+    MKA_CONF_OFFSET_30 = 2,
+    /** confidentiality from octet 50 */
+    MKA_CONF_OFFSET_50 = 3
 } MkaConfidentialityOffset;
-
-/* In-force "no confidentiality" (integrity-only) indication. Not a wire value:
- * it is passed to the SecY set_cipher_suite hook in place of a confidentiality
- * offset when WOLFMKA_CIPHER_NEGOTIATION determines a member of the CA cannot
- * do confidentiality, so the data plane runs the cipher suite integrity-only.
- */
-#define MKA_CONF_OFFSET_NONE 0xFFU
 
 /* ------------------------------------------------------------------------- */
 /* Return codes                                                              */

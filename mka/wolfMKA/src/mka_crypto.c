@@ -916,7 +916,6 @@ MkaStatus wm_Crypto_IcvVerify(MkaCmacCtx* cmac, const uint8_t* ick,
     return (MkaStatus)(-(int32_t)sel);
 }
 
-#ifdef WOLFMKA_ICV_L2_ADDR
 /* AES-CMAC(ICK) over an L2 prefix (DA || SA || EAPOL EtherType) then the MKPDU,
  * via the streaming API so no scratch buffer is needed. Matches the ICV input
  * wpa_supplicant uses (IEEE Std 802.1X-2010, 11.11.3). */
@@ -1019,4 +1018,3 @@ MkaStatus wm_Crypto_IcvVerifyL2(MkaCmacCtx* cmac, const uint8_t* ick,
     sel = (0U - (((uint32_t)diff + 0xFFU) >> 8U)) & MKA_ICV_ERR_MAG;
     return (MkaStatus)(-(int32_t)sel);
 }
-#endif /* WOLFMKA_ICV_L2_ADDR */

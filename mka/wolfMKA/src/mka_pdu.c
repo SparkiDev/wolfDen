@@ -27,14 +27,13 @@
 /* shared w_be16/32/48, rd_be16/32/48 */
 #include "wolfmka/mka_bytes.h"
 
-#ifdef WOLFMKA_ICV_L2_ADDR
-    /* Offset of the sender SCI MAC within the EAPOL PDU: past the EAPOL header,
-     * then the 4-octet Basic Parameter Set header that precedes the Actor SCI.
-     */
-    #define MKA_L2_SCI_MAC_OFFSET (EAPOL_HDR_LEN + 4U)
-    /* Smallest EAPOL PDU this helper may be handed: it reads the six SCI MAC
-     * octets at MKA_L2_SCI_MAC_OFFSET. */
-    #define MKA_L2_MIN_PDU_LEN    (MKA_L2_SCI_MAC_OFFSET + 6U)
+/* Offset of the sender SCI MAC within the EAPOL PDU: past the EAPOL header,
+ * then the 4-octet Basic Parameter Set header that precedes the Actor SCI.
+ */
+#define MKA_L2_SCI_MAC_OFFSET (EAPOL_HDR_LEN + 4U)
+/* Smallest EAPOL PDU this helper may be handed: it reads the six SCI MAC
+ * octets at MKA_L2_SCI_MAC_OFFSET. */
+#define MKA_L2_MIN_PDU_LEN    (MKA_L2_SCI_MAC_OFFSET + 6U)
 
 /**
  * Build the L2 prefix the ICV covers: PAE group DA || sender SCI MAC || EAPOL
@@ -62,7 +61,6 @@ static void mka_build_l2_prefix(uint8_t l2[MKA_ICV_L2_PREFIX_LEN],
     l2[12] = (uint8_t)(EAPOL_ETHERTYPE >> 8);
     l2[13] = (uint8_t)(EAPOL_ETHERTYPE & 0xFFU);
 }
-#endif /* WOLFMKA_ICV_L2_ADDR */
 
 /* ------------------------------------------------------------------------- */
 /* Byte cursor helpers                                                       */
@@ -370,8 +368,10 @@ static void mka_peer_list_encode(MkaWriter* w, const MkaPeerList* pl,
          * || Message Number) per peer; each entry is 16 octets, no pad
          * (11.11.2/11.11.3). */
         mka_w_u8(w, type);
-        /* reserved */
-        mka_w_u8(w, 0U);
+        /* Octet 2: reserved, except that a Version 3 Key Server distributing
+         * an XPN SAK puts its own SSCI here (11.11, 9.10). The KaY leaves it
+         * zero everywhere else, including in every Potential Peer List. */
+        mka_w_u8(w, pl->ks_ssci);
         mka_w_u8(w, (body_len >> 8U) & 0x0FU);
         mka_w_u8(w, body_len & 0xFFU);
         for (i = 0U; i < pl->count; i++) {
@@ -743,9 +743,7 @@ MkaStatus wm_Pdu_Encode(MkaCmacCtx* cmac, const MkaPdu* pdu, const uint8_t* ick,
     size_t icv_off;
     uint8_t icv[MKA_DEFAULT_ICV_LEN];
     MkaStatus rc;
-#ifdef WOLFMKA_ICV_L2_ADDR
     uint8_t l2[MKA_ICV_L2_PREFIX_LEN];
-#endif
 
     if ((cmac == NULL) || (pdu == NULL) || (ick == NULL) || (out == NULL) ||
         (out_len == NULL)) {
@@ -804,13 +802,9 @@ MkaStatus wm_Pdu_Encode(MkaCmacCtx* cmac, const MkaPdu* pdu, const uint8_t* ick,
 
     /* ICV = AES-CMAC(ICK, everything so far, i.e. through the ICV header). */
     icv_off = w.len;
-#ifdef WOLFMKA_ICV_L2_ADDR
     mka_build_l2_prefix(l2, out, icv_off);
     rc = wm_Crypto_IcvComputeL2(cmac, ick, ick_len, l2, sizeof l2, out, icv_off,
         icv);
-#else
-    rc = wm_Crypto_IcvCompute(cmac, ick, ick_len, out, icv_off, icv);
-#endif
     if (rc != MKA_OK) {
         return rc;
     }
@@ -959,6 +953,11 @@ static MkaStatus mka_decode_peer_list(const uint8_t* p, size_t body_len,
 
     pl->present = true;
     pl->count = n;
+    /* Octet 2 of the header; reserved in every list but a Version 3 Key
+     * Server's Live Peer List accompanying an XPN Distributed SAK. Recorded
+     * rather than acted on: a receiver ranking SSCIs from this list is the
+     * other half of 9.10 and is not implemented yet. */
+    pl->ks_ssci = p[1];
     r.buf = p;
     r.cap = MKA_PARAM_HDR_LEN + body_len;
     r.pos = MKA_PARAM_HDR_LEN;
@@ -1345,9 +1344,7 @@ static MkaStatus mka_verify_frame(MkaCmacCtx* cmac, const uint8_t* in,
 {
     size_t covered;
     MkaStatus rc;
-#ifdef WOLFMKA_ICV_L2_ADDR
     uint8_t l2[MKA_ICV_L2_PREFIX_LEN];
-#endif
 
     rc = mka_parse_eapol(in, in_len, body, body_len);
     if (rc != MKA_OK) {
@@ -1362,13 +1359,9 @@ static MkaStatus mka_verify_frame(MkaCmacCtx* cmac, const uint8_t* in,
         return MKA_ERR_PARSE;
     }
     covered = (EAPOL_HDR_LEN + *body_len) - MKA_DEFAULT_ICV_LEN;
-#ifdef WOLFMKA_ICV_L2_ADDR
     mka_build_l2_prefix(l2, in, in_len);
     return wm_Crypto_IcvVerifyL2(cmac, ick, ick_len, l2, sizeof l2, in, covered,
         &in[covered]);
-#else
-    return wm_Crypto_IcvVerify(cmac, ick, ick_len, in, covered, &in[covered]);
-#endif
 }
 
 /**

@@ -117,6 +117,13 @@ typedef struct {
     MkaPeerId peers[MKA_MAX_PEERS];
     /** number of entries in @c peers */
     size_t count;
+    /** Octet 2 of the parameter set. Reserved (0) except in a Live Peer List
+     * sent by a Key Server distributing a SAK for an XPN Cipher Suite, where
+     * it carries that Key Server's own SSCI (IEEE Std 802.1X-2020 11.11,
+     * 9.10) - the value it transmits under, and equally the position it would
+     * have occupied in this list. Only meaningful alongside an MKA Version
+     * Identifier of 3 or above. */
+    uint8_t ks_ssci;
 } MkaPeerList;
 
 /*

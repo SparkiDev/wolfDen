@@ -44,6 +44,7 @@ int main(void)
     #ifndef _GNU_SOURCE /* g++ predefines it; avoid a redefinition warning */
         #define _GNU_SOURCE
     #endif
+    #include <errno.h>
     #include <stdio.h>
     #include <stdlib.h>
     #include <string.h>
@@ -279,8 +280,16 @@ int main(int argc, char** argv)
     int pri;
     int prev_ks = -1, prev_live = -1, prev_sak = -1;
 
-    if (argc != 5) {
-        printf("usage: %s <ifname> <priority> <cak-hex> <ckn-hex>\n", argv[0]);
+    /* Line-buffer stdout. These examples are driven by the interop scripts with
+     * stdout redirected to a file, where stdio defaults to full buffering: the
+     * short status lines below would sit in a 4 KB buffer for the whole run, so
+     * the log a script polls stays empty however well the protocol is going. */
+    (void)setvbuf(stdout, NULL, _IOLBF, 0);
+
+    if ((argc != 5) && (argc != 6)) {
+        printf("usage: %s <ifname> <priority> <cak-hex> <ckn-hex> "
+               "[sak-octets]\n",
+            argv[0]);
         return 1;
     }
     pri = atoi(argv[2]);
@@ -318,8 +327,16 @@ int main(int argc, char** argv)
     cfg.priority = (uint8_t)pri;
     cfg.macsec_desired = 1;
     cfg.macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    cfg.confidentiality_offset = MKA_CONF_OFFSET_0;
     cfg.key_server_capable = 1;
-    cfg.sak_len = 16;
+    /* SAK length selects the cipher suite: 16 -> GCM-AES-128 (the default, left
+     * as 0 so the Distributed SAK parameter set omits the suite), 32 ->
+     * GCM-AES-256, which is named explicitly on the wire. The interop harness
+     * uses this to exercise both against wpa_supplicant's macsec_csindex. */
+    cfg.sak_len = (argc == 6) ? (size_t)atoi(argv[5]) : 16U;
+    if (cfg.sak_len == 32U) {
+        cfg.cipher_suite = MKA_CIPHER_GCM_AES_256;
+    }
     cfg.secy = make_secy();
     cfg.send = link_send;
     cfg.send_ctx = &lk;
@@ -345,6 +362,12 @@ int main(int argc, char** argv)
         pfd.events = POLLIN;
         pfd.revents = 0;
         if (poll(&pfd, 1, 1000) < 0) {
+            /* A signal is the normal way SIGINT arrives; re-check g_stop
+             * rather than treating it as a fatal poll error. */
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
             break;
         }
         t = now_ms();

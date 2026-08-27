@@ -180,6 +180,7 @@ static void group_cfg(MkaParticipantConfig* c, const uint8_t* cak,
     c->priority = priority;
     c->macsec_desired = 1;
     c->macsec_capability = MKA_CAP_INTEGRITY_CONF_OFFSET;
+    c->confidentiality_offset = MKA_CONF_OFFSET_0;
     c->key_server_capable = 1;
     c->sak_len = 16;
     c->secy = secy_noop();

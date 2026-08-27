@@ -26,6 +26,16 @@ HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 MKA_MACSEC=${MKA_MACSEC:-"$HERE/../../examples/mka_macsec"}
 WPA=${WPA_SUPPLICANT:-wpa_supplicant}
 TIMEOUT=${TIMEOUT:-25}
+# SAK length, which selects the cipher suite on both sides: 16 -> GCM-AES-128,
+# 32 -> GCM-AES-256 (macsec_csindex=1 for wpa_supplicant). The make target runs
+# the whole tier once per suite; each invocation builds and tears down its own
+# namespaces, so they cannot interfere.
+SAK_LEN=${SAK_LEN:-16}
+if [ "$SAK_LEN" = 32 ]; then
+    CSINDEX=1; SUITE=GCM-AES-256; CIPHER=gcm-aes-256
+else
+    CSINDEX=0; SUITE=GCM-AES-128; CIPHER=gcm-aes-128
+fi
 
 NS_A=wmka_a
 NS_B=wmka_b
@@ -38,7 +48,18 @@ CAK=0123456789abcdef0123456789abcdef
 CKN=00112233445566778899aabbccddeeff
 RUNDIR=
 
-skip() { echo "SKIP: $1"; exit 0; }
+# See run-interop.sh: a skip reads like a pass in a CI log, so INTEROP_STRICT=1
+# turns a missing prerequisite into a failure.
+STRICT=${INTEROP_STRICT:-0}
+
+skip() {
+    if [ "$STRICT" = 1 ]; then
+        echo "FAIL (INTEROP_STRICT=1): $1"
+        exit 1
+    fi
+    echo "SKIP: $1"
+    exit 0
+}
 
 cleanup() {
     [ -n "${WM_PID:-}" ] && kill "$WM_PID" 2>/dev/null || true
@@ -57,7 +78,8 @@ modprobe macsec 2>/dev/null || true
 trap cleanup EXIT INT TERM
 RUNDIR=$(mktemp -d)
 
-echo "== Tier 2: wolfMKA mka_macsec <-> wpa_supplicant (data plane) =="
+echo "== Tier 2: wolfMKA mka_macsec <-> wpa_supplicant (data plane," \
+    "$SUITE) =="
 
 ip netns add "$NS_A"
 ip netns add "$NS_B"
@@ -70,20 +92,35 @@ ip netns exec "$NS_B" ip link set "$VETH_B" up
 # wolfMKA side: create the MACsec child device up front (mka_macsec opens it by
 # name), give it an address, then run the combined participant as Key Server.
 # Creating it also serves as the kernel-MACsec availability probe.
-ip netns exec "$NS_A" ip link add link "$VETH_A" "$MS_A" type macsec encrypt on \
+# The cipher suite is a property of the MACsec device, fixed when it is created.
+# The example does implement set_cipher_suite, but only to record the SSCI that
+# the XPN suites need - it cannot re-cipher a live device, so a device left at
+# the default GCM-AES-128 stays there however long a 32-octet SAK is.
+# wpa_supplicant creates its own child device from macsec_csindex, so without
+# this the two ends run different suites and no frame decrypts.
+#
+# wpa_supplicant 2.11 implements only GCM-AES-128 and GCM-AES-256, so no XPN
+# round is possible here; Tier 4 covers XPN against MKAdaemon.
+ip netns exec "$NS_A" ip link add link "$VETH_A" "$MS_A" type macsec \
+    cipher "$CIPHER" encrypt on \
     2>/dev/null || skip "kernel MACsec unavailable (cannot create macsec device)"
 ip netns exec "$NS_A" ip link set "$MS_A" up
 ip netns exec "$NS_A" ip addr add "$IP_A/24" dev "$MS_A"
+# Arg 6 is the auto-rekey period (0 = off; the rekey below is driven by
+# SIGUSR1), arg 7 the SAK length.
 ip netns exec "$NS_A" "$MKA_MACSEC" "$VETH_A" "$MS_A" 10 "$CAK" "$CKN" \
-    >"$RUNDIR/wm.log" 2>&1 &
+    0 "$SAK_LEN" >"$RUNDIR/wm.log" 2>&1 &
 WM_PID=$!
 
 # wpa_supplicant side: the macsec_linux driver creates its own MACsec child
 # device when MKA secures; the harness discovers and addresses it below.
 sed -e "s|@CTRL@|$RUNDIR/wpa|g" -e "s|@CAK@|$CAK|g" -e "s|@CKN@|$CKN|g" \
-    -e "s|@PRIORITY@|20|g" "$HERE/peer.conf.in" >"$RUNDIR/peer.conf"
+    -e "s|@PRIORITY@|20|g" -e "s|@CSINDEX@|$CSINDEX|g" \
+    "$HERE/peer.conf.in" >"$RUNDIR/peer.conf"
+# -dd: the KaY logs its reason for ignoring a Distributed SAK only at debug
+# level, and that reason is the whole diagnosis when a rekey does not take.
 ip netns exec "$NS_B" "$WPA" -i "$VETH_B" -D macsec_linux \
-    -c "$RUNDIR/peer.conf" >"$RUNDIR/wpa.log" 2>&1 &
+    -c "$RUNDIR/peer.conf" -dd >"$RUNDIR/wpa.log" 2>&1 &
 WPA_PID=$!
 
 # Wait for wolfMKA to install a SAK and for wpa's MACsec device to appear, then
@@ -106,8 +143,13 @@ done
 
 echo "--- wolfMKA (mka_macsec) state ---"
 grep "state:" "$RUNDIR/wm.log" 2>/dev/null | tail -3 || true
-echo "--- wpa MACsec device: ${ms_b:-<none>} ---"
-ip netns exec "$NS_A" ip macsec show 2>/dev/null | sed -n '1,4p' || true
+# Both ends, each from its own namespace. The kernel does not echo SAK bytes
+# back, so the "key" column here is not the agreed key - what matters is that
+# each side has a TXSC and an RXSC in state on.
+echo "--- wolfMKA MACsec device (ns $NS_A) ---"
+ip netns exec "$NS_A" ip macsec show 2>/dev/null | sed -n '1,6p' || true
+echo "--- wpa_supplicant MACsec device: ${ms_b:-<none>} (ns $NS_B) ---"
+ip netns exec "$NS_B" ip macsec show 2>/dev/null | sed -n '1,6p' || true
 
 if [ -z "$ms_b" ] || ! grep -q "sak=1" "$RUNDIR/wm.log" 2>/dev/null; then
     echo "FAIL: control plane did not converge (no SAK / no wpa macsec device)"
@@ -147,25 +189,178 @@ else
 fi
 
 # (3) Rekey: the Key Server rolls the SAK; traffic must survive the handover.
-echo "--- rekey (SIGUSR1 -> Key Server) ---"
-kill -USR1 "$WM_PID" 2>/dev/null || true
-j=0
-while [ "$j" -lt 10 ]; do
-    sleep 1
-    j=$((j + 1))
-    grep -q "kn=2" "$RUNDIR/wm.log" 2>/dev/null && break
-done
-if grep -q "kn=2" "$RUNDIR/wm.log" 2>/dev/null; then
-    echo "  wolfMKA advanced to Key Number 2"
-else
-    echo "  WARN: did not observe kn=2 (rekey may not have completed)"
-fi
-if ip netns exec "$NS_A" ping -c 3 -W 2 "$IP_B" >/dev/null 2>&1; then
-    echo "  ping OK after rekey"
-else
-    echo "FAIL: traffic stopped after rekey"
-    exit 1
-fi
+#
+# Run more than once. The first rekey is the interesting one for the handover
+# itself, but several bugs only show up from the *second* SAK onwards - the KaY
+# re-creating a receive Secure Channel that already exists is one (Linux
+# answers -EEXIST), and an Old SA that is never torn down is another, since a
+# single rekey leaves a plausible-looking two SAs either way. So the round is a
+# function of the Key Number it expects.
 
-echo "PASS: wolfMKA and wpa_supplicant established and rekeyed a MACsec session"
+# Number of SecY teardown calls so far. A delete from an earlier round is
+# already in the log, so "did a delete happen" is vacuous after round one;
+# what matters is that this round produced a new one.
+secy_deletes() {
+    # grep -c exits 1 when the count is zero and 2 when the file is missing,
+    # so the status is discarded and the (possibly empty) output defaulted -
+    # `|| echo 0` would append a second line to a count that is already "0".
+    n=$(grep -c "\[SecY\] delete" "$RUNDIR/wm.log" 2>/dev/null || true)
+    echo "${n:-0}"
+}
+
+# Every SA the kernel currently holds, across both Secure Channels. Make-
+# before-break tops out at Old + Latest per SC, so 4 is the ceiling while a
+# handover is in flight and 2 is the resting state. A count that climbs with
+# the round number means the old SAs are never reclaimed, which ends with the
+# Association Numbers wrapping onto a key that is still installed.
+secy_sa_count() {
+    n=$(ip netns exec "$NS_A" ip macsec show 2>/dev/null \
+        | grep -cE "^[[:space:]]+[0-9]+: PN " || true)
+    echo "${n:-0}"
+}
+
+rekey_round() {
+    want_kn=$1
+    label=$2
+
+    echo "--- rekey $label (SIGUSR1 -> Key Server, expecting kn=$want_kn) ---"
+    deletes_before=$(secy_deletes)
+    kill -USR1 "$WM_PID" 2>/dev/null || true
+    j=0
+    while [ "$j" -lt 10 ]; do
+        sleep 1
+        j=$((j + 1))
+        grep -q "kn=$want_kn" "$RUNDIR/wm.log" 2>/dev/null && break
+    done
+    if grep -q "kn=$want_kn" "$RUNDIR/wm.log" 2>/dev/null; then
+        echo "  wolfMKA advanced to Key Number $want_kn"
+    else
+        echo "  WARN: did not observe kn=$want_kn" \
+            "(rekey may not have completed)"
+    fi
+    # The Key Number appearing means wolfMKA has *adopted* the new key, not
+    # that the handover is over: make-before-break keeps transmitting on the
+    # Old key until every live peer reports receiving on the Latest one, and
+    # the peer first has to receive the Distributed SAK and program it.
+    # Pinging the instant it appears races that, so poll until traffic is
+    # flowing again and fail only if it never resumes.
+    # How long it took is printed either way - a handover that takes many
+    # seconds is worth noticing even when it eventually completes.
+    # Wall clock, not an attempt count: a ping that fails with "host
+    # unreachable" returns immediately, so counting iterations measures how
+    # fast ping gives up, not how long traffic was down.
+    t0=$(date +%s)
+    resumed=0
+    while [ $(($(date +%s) - t0)) -lt 20 ]; do
+        if ip netns exec "$NS_A" ping -c 1 -W 1 "$IP_B" >/dev/null 2>&1; then
+            resumed=1
+            break
+        fi
+        sleep 1
+    done
+    k=$(($(date +%s) - t0))
+    if [ "$resumed" = 1 ]; then
+        echo "  ping OK after rekey (traffic down for ~${k}s)"
+        # Make-before-break is supposed to be seamless: the Old key keeps
+        # carrying traffic until every live peer reports receiving on the
+        # Latest one, so a multi-second gap means something waited for a timer
+        # rather than for the handshake. Not a failure - the peer's own MKA
+        # cadence is outside our control - but a regression here is worth
+        # seeing, so it is called out.
+        echo "  --- wolfMKA SecY timeline across the rekey ---"
+        grep -E "\[SecY\]|rekey requested|peer:|state:" "$RUNDIR/wm.log" \
+            | tail -24 || true
+        if [ "$k" -gt 3 ]; then
+            echo "  NOTE: the handover cost ${k}s of traffic;" \
+                "a make-before-break rekey should be close to seamless"
+        fi
+        # (4) Every SecY hook must have been accepted by the kernel. The traffic
+        # check above cannot see this: a rejected call leaves the device in a
+        # state that still happens to forward, so a bookkeeping bug survives a
+        # green ping. The trace prints the return code of every hook, so a
+        # single grep for a negative one covers all of them. This caught the
+        # KaY re-creating an existing receive SC, answered with -EEXIST.
+        if grep -E "\[SecY\].* -> -[0-9]+$" "$RUNDIR/wm.log" \
+                >/dev/null 2>&1; then
+            echo "  --- SecY calls the kernel refused ---"
+            grep -E "\[SecY\].* -> -[0-9]+$" "$RUNDIR/wm.log" | tail -12
+            if [ "$STRICT" = 1 ]; then
+                echo "FAIL (INTEROP_STRICT=1): a SecY hook was refused"
+                exit 1
+            fi
+            echo "  WARN: a SecY hook was refused (see above)"
+        else
+            echo "  every SecY hook was accepted by the kernel"
+        fi
+        # (5) Old-key retirement. Make-before-break installs the new SAK
+        # alongside the old one, so the interesting part is not that the new key
+        # appeared but that the old one is eventually torn down - otherwise the
+        # device accumulates a live SA per rekey and the Association Numbers
+        # wrap into a key that is still installed.
+        r=0
+        while [ "$r" -lt 15 ]; do
+            [ "$(secy_deletes)" -gt "$deletes_before" ] && break
+            sleep 1
+            r=$((r + 1))
+        done
+        if [ "$(secy_deletes)" -gt "$deletes_before" ]; then
+            echo "  old key retired after ~${r}s:"
+            grep "\[SecY\] delete" "$RUNDIR/wm.log" | tail -4
+        else
+            echo "  --- wolfMKA SAs still installed ---"
+            ip netns exec "$NS_A" ip macsec show 2>/dev/null \
+                | sed -n '1,12p' || true
+            if [ "$STRICT" = 1 ]; then
+                echo "FAIL (INTEROP_STRICT=1): the old SAK was never deleted"
+                exit 1
+            fi
+            echo "  WARN: the old SAK was never deleted within 15s of the rekey"
+        fi
+    else
+        echo "FAIL: traffic never resumed within 20s of the rekey"
+        echo "  --- wolfMKA state (last 6) ---"
+        grep "state:" "$RUNDIR/wm.log" | tail -6 || true
+        echo "  --- wolfMKA SecY calls (last 12) ---"
+        grep -E "install|transmit|delete" "$RUNDIR/wm.log" | tail -12 || true
+        echo "  --- wolfMKA MACsec device ---"
+        ip netns exec "$NS_A" ip macsec show 2>/dev/null | sed -n '1,8p' || true
+        echo "  --- wpa_supplicant MACsec device ---"
+        ip netns exec "$NS_B" ip macsec show 2>/dev/null | sed -n '1,8p' || true
+        # Every reason ieee802_1x_mka_decode_dist_sak_body has for ignoring a
+        # Distributed SAK, so the one that fired is named rather than inferred.
+        echo "  --- wpa_supplicant: why the Distributed SAK was ignored ---"
+        grep -E "not principal|I'm a key server|MACsec-desired|not in my live" \
+            "$RUNDIR/wpa.log" 2>/dev/null | tail -5 || true
+        grep -E "key server is not elected|already been installed|Cipher Suite" \
+            "$RUNDIR/wpa.log" 2>/dev/null | tail -5 || true
+        grep -E "AES unwrap failed|Distributed SAK|distributed SAK" \
+            "$RUNDIR/wpa.log" 2>/dev/null | tail -10 || true
+        echo "  --- wpa_supplicant KaY lines (last 25) ---"
+        grep -E "KaY" "$RUNDIR/wpa.log" 2>/dev/null | tail -25 || true
+        exit 1
+    fi
+
+    sa_now=$(secy_sa_count)
+    echo "  kernel holds $sa_now SA(s) after rekey $label"
+    # The device's own view, not the trace's. These have disagreed: hooks that
+    # reported -EEXIST/-EBUSY still left the SA installed and traffic flowing,
+    # which means a refused-looking return code is not proof the command
+    # failed. Print the table so the two can be reconciled from one run.
+    echo "  --- wolfMKA SAs after rekey $label ---"
+    ip netns exec "$NS_A" ip macsec show 2>/dev/null | sed -n '1,20p' || true
+    if [ "$sa_now" -gt 4 ]; then
+        echo "  --- wolfMKA MACsec device ---"
+        ip netns exec "$NS_A" ip macsec show 2>/dev/null \
+            | sed -n '1,20p' || true
+        echo "FAIL: $sa_now SAs installed; make-before-break tops out at 4" \
+            "(Old + Latest per Secure Channel), so they are accumulating"
+        exit 1
+    fi
+}
+
+rekey_round 2 "1/2"
+rekey_round 3 "2/2"
+
+echo "PASS: wolfMKA and wpa_supplicant established and rekeyed a MACsec" \
+    "session ($SUITE)"
 exit 0

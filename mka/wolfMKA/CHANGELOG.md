@@ -10,6 +10,158 @@ exposed in code as `WOLFMKA_VERSION_MAJOR` / `_MINOR` / `_PATCH` /
 
 ### Added
 
+- **`make check-abi`** (`test/abi_check.c`), run automatically by `make test`.
+  wolfMKA embeds wolfSSL's `WC_RNG` and `Cmac` by value in its crypto pools, so
+  their sizes are part of the ABI between the two - and `WC_RNG`'s layout is
+  conditional on `__STDC_VERSION__`. wolfSSL's `types.h` defines
+  `HAVE_ANONYMOUS_INLINE_AGGREGATES` only from C11 up, and under it `random.h`
+  wraps the DRBG members in an anonymous struct whose tail padding shifts the
+  trailing `pid_t pid`: `sizeof(WC_RNG)` is 48 under `-std=c99`/`gnu99` and 56
+  from `-std=c11` up.
+
+  wolfMKA compiles at `-std=c99`, so a wolfSSL built at the autotools default
+  (`gnu17`) wrote eight octets past the reserved `WC_RNG` - over the pool
+  slot's `used` flag - on every acquire. It was invisible because the next
+  statement assigns that flag; only the injected-failure path returns before
+  it, which is why `make test-fault` was the sole target that failed.
+
+  The check reproduces the pool layout with a guard where `used` sits, compiles
+  with the project's own `CFLAGS`, and fails the build naming the remedy.
+  **Build wolfSSL with the same `-std` as wolfMKA** (`CFLAGS="-std=c99 -O2"`),
+  keeping one wolfSSL install per standard if `CFLAGS` changes. Every wolfMKA
+  target that links wolfSSL uses `$(CFLAGS)`; `cxx` is `-fsyntax-only` and the
+  big-endian cross build does not link it, so one matched install suffices.
+
+- **Tier 4 peer loss and rejoin** (`make interop-mkad`). MKAdaemon is stopped,
+  wolfMKA must expire it after the MKA Life Time, and it returns with a fresh
+  Member Identifier - a new participant as far as MKA is concerned, so a fresh
+  SAK must be agreed. The round asserts a strictly higher Key Number rather
+  than just "a SAK", since the pre-restart key would satisfy the latter. Run on
+  a GCM-AES-128 round and an XPN round, where the changing Key Identifier also
+  changes the Salt. Nothing else in the tier covered peer expiry.
+
+- **XPN interop coverage (`make interop-mkad`)** — three GCM-AES-XPN rounds
+  against MKAdaemon: both Key Server roles and both SAK lengths. This is the
+  only tier that can run them; the wpa_supplicant the other tiers use (2.11)
+  implements GCM-AES-128 and GCM-AES-256 and nothing else.
+
+  The two Key Server rounds rekey, which is the only thing that varies the Salt
+  - it is folded from the Key Number, so both ends must recompute it in step on
+  every new key. Note that a Key Number below 256 leaves three of the fold's
+  four XOR terms zero, so the swapped-halves ordering itself is still only as
+  good as the reading of MKAdaemon's source.
+
+  `examples/mka_macsec` grew what an XPN data plane needs, none of which the
+  32-bit suites exercise: `MACSEC_SA_ATTR_PN` as a `u64` (an XPN device rejects
+  the 32-bit form), `MACSEC_SA_ATTR_SSCI` in network order and *per Secure
+  Channel* - ours on the transmit SA, the peer's on each receive SA - and the
+  12-octet `MACSEC_SA_ATTR_SALT`. It now implements `set_cipher_suite`, which
+  is the only way MKA hands a SecY the SSCI; it still cannot re-cipher a device,
+  since the kernel fixes that at creation.
+
+  The Salt derivation was documented wrongly here: it does **not** come from the
+  SAK. It is the Key Identifier's Member Identifier with the Key Number folded
+  into the first four octets (the two 16-bit halves swapped), which both ends
+  already hold from the Distributed SAK. A SecY built to the old description
+  would have installed SAs happily and passed no traffic. `mka_secy.h`,
+  `README.md`, `examples/mka_xpn.c` and `mka_kay.c` are corrected; the
+  derivation is matched against MKAdaemon and has not been cross-checked
+  against a third implementation.
+
+- **`MkaParticipantConfig.sak_loss_threshold`** — how many consecutive MKPDUs a
+  live peer may fail to report the key in force before the Key Server treats it
+  as lost and rekeys. 0 selects the build default (`MKA_SAK_LOSS_THRESHOLD`):
+  **1** under `WOLFMKA_AUTOMOTIVE_PROFILE`, where AutoMKA-03011 wants the
+  fastest recovery and the peers are known, and **3** elsewhere.
+
+  Live interop found why the distinction matters. wpa_supplicant emits an MKPDU
+  with no MACsec SAK Use parameter set from time to time; treating the first one
+  as a lost key made the Key Server rekey, which left the peer chasing a key it
+  had not finished adopting, which produced another silent MKPDU — an endless
+  rekey storm rather than a recovery, with the data plane never settling. The
+  Association Number cycled 0→1→2→3→0 roughly every two Hello Times and traffic
+  dropped for as long as the ping happened to overlap it. A report that does
+  name the key resets the count, so the threshold counts *consecutive* misses.
+
+- **Tier 4 interop: MKAdaemon** (`make interop-mkad`). Tiers 1-3 all measure
+  wolfMKA against hostapd/wpa_supplicant, which is one reading of IEEE Std
+  802.1X-2010 - where the standard is ambiguous, or where both stacks share an
+  assumption, agreeing with it shows compatibility with wpa_supplicant rather
+  than conformance. MKAdaemon (Technica Engineering, GPL-2.0-or-later) is an
+  unrelated implementation with an automotive lineage, so it is an independent
+  check. The tier repeats the Tier 2 data-plane exercise against it: both Key
+  Server roles, GCM-AES-128 and GCM-AES-256, protected traffic across the link.
+
+  It immediately found a one-way incompatibility no wpa_supplicant tier could.
+  `WOLFMKA_MKA_VERSION` is the version announced in the Basic Parameter Set: 1
+  for 802.1X-2010 (wolfMKA's default, and what wpa_supplicant sends *and*
+  accepts), 2 for 802.1Xbx-2014, 3 for 802.1X-2020. MKAdaemon announces 3 and
+  discards any MKPDU that does not announce exactly 3. wolfMKA never rejects on
+  a peer's version, so the failure is silent in one direction: MKAdaemon looks
+  healthy and simply never goes live. Tier 4 therefore builds
+  `examples/mka_macsec_mkad` with `-DWOLFMKA_MKA_VERSION=3U`, and the harness
+  names this case by hand when a round times out rather than leaving it as a
+  bare convergence timeout.
+
+  It also paid for itself on a question the harness had been treating as
+  a peer quirk. `WOLFMKA_ICV_L2_ADDR` - signing the Ethernet framing along with
+  the MKPDU, per 11.11.3 - was documented as something wpa_supplicant does.
+  MKAdaemon does the same: `mka_receive_from_l2` passes `mka_mkpdu_verify` the
+  whole frame buffer with the Ethernet header still attached. Two unrelated
+  implementations reading the clause the same way is far better evidence for
+  that framing than either one alone.
+
+  Not wired into CI: MKAdaemon is not packaged, so a CI job would have to build
+  it from source, and a step that silently skips when that build fails is the
+  exact failure mode `INTEROP_STRICT` exists to prevent. The build recipe is in
+  `test/interop/README.md`.
+
+  XPN is still uncovered, but the reason has changed. MKAdaemon negotiates
+  `GCM_AES_XPN_128/256`, so there is now a peer; what blocks a round is
+  `examples/mka_macsec`, which writes `MACSEC_SA_ATTR_PN` as 32 bits and sets
+  neither `MACSEC_SA_ATTR_SSCI` nor `MACSEC_SA_ATTR_SALT`.
+
+- **Tier 2 rekeys twice rather than once**, and counts the SAs the kernel
+  holds after each round, failing above the make-before-break ceiling of four
+  (Old + Latest per Secure Channel). One rekey is a weak test of everything
+  around the handover: a device holding Old + Latest looks the same whether or
+  not anything is ever reclaimed, and the bugs below only surface from the
+  second SAK onwards.
+
+- **Tier 2 now checks two things a green `ping` cannot see.** Every SecY hook
+  must have been accepted by the kernel — a refused call can leave a device
+  that still forwards, so a bookkeeping bug otherwise passes the traffic test
+  (this is what hid the `-EEXIST` above) — and the old SAK must be retired
+  after the handover, since make-before-break installs the new key alongside
+  it and an SA that is never torn down accumulates one per rekey until the
+  Association Numbers wrap onto a key that is still installed. Warnings by
+  default, failures under `INTEROP_STRICT=1`.
+
+- **Interop now runs in CI**, with `INTEROP_STRICT=1` on tiers 1 and 3 so a
+  runner that cannot provide the prerequisites fails rather than skipping — the
+  condition under which the harness previously sat broken and unnoticed. A new
+  `INTEROP_STRICT` environment variable turns any `SKIP` into a failure.
+- **Tiers 1 and 2 cover GCM-AES-256** as well as GCM-AES-128. The 256-bit suite is not
+  the default, so the Distributed SAK parameter set names it explicitly on the
+  wire and the key wrap is over 32 octets — an encode and unwrap path no other
+  tier reaches; in Tier 2 it also drives the kernel MACsec device at 256-bit.
+  `examples/mka_link` and `examples/mka_macsec` take an optional SAK length to
+  select it. XPN suites remain uncovered — the wpa_supplicant tested against has
+  no XPN support.
+- **Tier 3 interop: the EAP-derived CAK** (`make interop-eap`). Tiers 1 and 2
+  key from a pre-shared CAK, so IEEE Std 802.1X-2010 9.3.2 never ran on the
+  wire. wolfMKA has no EAP of its own, so the exchange is run by hostapd (802.1X
+  authenticator, built-in EAP server, wired driver) and wpa_supplicant over a
+  veth pair using EAP-GPSK; wolfMKA then derives a CAK/CKN from the resulting
+  MSK through the new `test/interop/eap_derive` tool and the two must match byte
+  for byte. Unlike a known-answer vector this checks the derivation against
+  live inputs: a method-specific EAP Session-Id, the MAC ordering both ends
+  agree on independently, and the MSK truncation to the CAK length — the
+  `msk_len == cak_len` rule verified against the real implementation rather
+  than against a reading of its source. `test/interop/kdf_oracle.py`, an
+  independent transcription of hostapd's `aes_kdf`, remains as the offline
+  complement and regenerates the pinned vectors.
+
 - **`MkaEventOps.key_server_lost`** — the other edge of `key_server_elected`.
   Losing the elected Key Server (the last live peer expiring, or a participant
   that cannot serve losing the peer it was following) previously fired nothing
@@ -83,6 +235,43 @@ exposed in code as `WOLFMKA_VERSION_MAJOR` / `_MINOR` / `_PATCH` /
   announced version has never been used to reject a frame.
 
 ### Changed
+
+- **The MKPDU ICV always covers the Ethernet framing; `WOLFMKA_ICV_L2_ADDR` is
+  removed.** IEEE Std 802.1X-2020 9.4.1 defines it as
+  `ICV = AES-CMAC(ICK, M, 128)` with `M = DA + SA + (MSDU - ICV)`, the MSDU
+  "including the allocated Ethertype". That is not one reading among several:
+  Algorithm Agility is the only mechanism by which the ICV computation may
+  differ, and 6.4.1 withholds any conformance claim from an alternate - so a
+  build announcing the standard Algorithm Agility value while signing something
+  else is non-conformant by the standard's own terms. 9.4.5 adds that including
+  the addresses is a security property, not an encoding detail: it "makes
+  attacking MKA from a distance more difficult".
+
+  wolfMKA had this behind an off-by-default flag, documented as an
+  accommodation for "peers that bind the Ethernet framing into the ICV". That
+  was wrong twice over - it is the standard's ICV, not a peer's variant, and
+  the default build could not interoperate with anything. All three peers this
+  project tests against compute it this way (wpa_supplicant, MKAdaemon,
+  libmka), which is what prompted re-reading the clause.
+
+  **Migration:** a default-built wolfMKA now signs different bytes than before,
+  so it will not interoperate with an older default-built wolfMKA - only with
+  conformant peers, which is the point. Builds that already set
+  `WOLFMKA_ICV_L2_ADDR` are unaffected in behaviour and should drop the flag;
+  it is gone rather than deprecated, so it will not silently do nothing.
+
+  Removed with it: `test-icv-l2-suite` and the `icv-l2` coverage configuration
+  (both now identical to the base), `fuzz-receive-l2` (identical to
+  `fuzz-receive`), `examples/mka_link_icvl2` / `examples/mka_macsec_icvl2`
+  (identical to the plain examples, so the interop harnesses use those), and
+  the standalone `test-icv-l2` target with `test/test_icv_l2.c`. That last one
+  existed because the suite's frame builders assumed the non-L2 ICV and could
+  not reach this path; they all run over it now, and `test_crypto.c`'s
+  `test_icv_l2` covers the compute/verify pair directly with a superset of the
+  standalone program's assertions - it adds a wrong ICK and separate short and
+  long prefix cases.
+  `wm_Crypto_IcvComputeL2` / `wm_Crypto_IcvVerifyL2` keep their names - they
+  take an L2 prefix argument - and are now the only ICV path the library uses.
 
 - **The RNG workspace is now mandatory**, as the CMAC workspace already was.
   `MkaParticipantConfig.rng` is validated at `wm_Participant_Init`, and
@@ -158,6 +347,284 @@ exposed in code as `WOLFMKA_VERSION_MAJOR` / `_MINOR` / `_PATCH` /
   from one thread.
 
 ### Fixed
+
+- **A member ranked XPN SSCIs from its own membership view instead of adopting
+  the Key Server's.** IEEE Std 802.1X-2020 9.10 has the Key Server state the
+  mapping in the MKPDU that distributes the SAK: its own SA takes the SSCI in
+  Octet 2 of the Live Peer List, and each MI in that ordered list takes its
+  1-based position, plus one once the position reaches the Key Server's own.
+  wolfMKA computed a local rank instead. The two agree only while both ends see
+  the same membership, and diverge exactly when an MKPDU is lost or delayed -
+  which is the case 9.10 exists to handle. An SSCI is half the XPN
+  initialisation vector, so a divergence means a CA that converges and passes
+  no traffic.
+
+  Adopted whatever version this build announces, gated on the *sender*
+  announcing version 3 and supplying the field: the Key Server has stated the
+  mapping, so following it can only agree with the CA. Where no assignment
+  arrives - a Version 1 or 2 Key Server, or a non-XPN suite - the local ranking
+  still applies, which is what a two-member CA has always relied on.
+
+  **Not implemented:** 9.10 also has the receiver retain the ordered Live List
+  so a receive SA can be created later for an MI it has not yet heard from. A
+  member absent from our peer table when the SAK arrives is skipped and ranked
+  locally if it appears before the next SAK. Retaining the list costs about 420
+  octets on a 2312-octet participant (`MKA_MAX_PEERS` x `MKA_MI_LEN` plus the
+  assignments), which is not obviously worth it for a window that a rekey
+  closes; the omission is recorded here rather than left to be discovered.
+
+- **A SecY error was silently ignored, and the CA was told the key was in
+  use.** `mka_secy_track` counted only the asynchronous-pending case; a
+  negative return from any hook was discarded. A data plane that refused a key
+  was therefore invisible to the KaY, which went on to enable transmit and to
+  set Latest Rx in its MACsec SAK Use - inviting the peer to transmit into a
+  hole. Two changes:
+
+  - `MkaCounters.secy_errors` counts every SecY callback that returns an error.
+    The KaY cannot see the device, so the return value is the only evidence an
+    operation did not take effect.
+  - `MkaParticipant.secy_install_failed` latches when an SA install for the key
+    in force is refused. While set, the transmit gate stays shut and SAK Use
+    does not claim Latest Rx - the same restraint `secy_pending` already
+    imposed for an asynchronous data plane, applied to one that answered with
+    an error. Cleared when a fresh SAK is programmed, since the verdict belongs
+    to the key rather than the participant.
+
+  No automatic rekey on failure: a persistently unhappy SecY would then rekey
+  in a tight loop. The CA sees this end reporting neither Rx nor Tx and reacts
+  through the machinery that already exists for a member that cannot receive.
+
+  Found by the Tier 4 "wolfMKA restarts and rejoins" round, where both installs
+  were refused with `-EBUSY` and the participant advertised the key regardless.
+
+- **`examples/mka_macsec` could not re-key a device it had already keyed.** The
+  MACsec device is provisioned separately and outlives the process, so the SAs
+  stay installed when the participant exits. A restarted participant comes back
+  with a fresh Member Identifier and a fresh SAK but Association Numbers
+  starting again at 0, the kernel refuses the install with `-EBUSY`, and the
+  new key never reaches the data plane - while the participant goes on
+  transmitting under the previous key, which its peer has already discarded.
+  The SecY now evicts the stale SA (disabling it first, since an active SA
+  cannot be deleted) and retries. A SecY that owns its device can delete and
+  recreate it instead, which is what MKAdaemon does.
+
+  Found by the Tier 4 "wolfMKA restarts and rejoins" round.
+
+- **A build announcing MKA Version 3 did not honour what that version
+  asserts.** IEEE Std 802.1X-2020 11.11 c): an implementation transmitting
+  MKPDUs with an MKA Version Identifier of 3 *shall* order the entries in the
+  Live Peer List, and *shall* encode the Key Server's SSCI in Octet 2 of that
+  parameter set in MKPDUs carrying a Distributed SAK for an XPN Cipher Suite.
+  wolfMKA did neither: the list went out in peer-table order and Octet 2 was
+  always the reserved zero.
+
+  This was not hypothetical - `WOLFMKA_AUTOMOTIVE_PROFILE` selects Version 3,
+  as does the Tier 4 interop binary, so a shipped configuration was making a
+  claim it did not meet. Two-member CAs are unaffected either way, which is why
+  the interop rounds pass regardless: with only two SCIs a receiver can rank
+  them itself. It is at three or more members that a peer needs the order and
+  the Key Server's position to map SCIs to SSCIs at all, and an SSCI is half
+  the XPN initialisation vector.
+
+  Both are now emitted, gated on `WOLFMKA_MKA_VERSION >= 3` so a Version 1
+  build's wire format is unchanged and its Octet 2 stays reserved.
+  `MkaPeerList.ks_ssci` also carries the received value, so a decoder can see
+  it.
+
+  **The receive half of 9.10 is still not implemented**: this end continues to
+  rank SSCIs from its own live-peer view (`mka_compute_ssci`) rather than from
+  the ordered list and Key Server SSCI in the MKPDU that distributed the SAK.
+  The two agree for a two-member CA and can diverge beyond it, precisely when
+  an MKPDU is lost or delayed - which is the case 9.10 exists to handle.
+
+- **An XPN member joining re-ranked the SSCIs under the SAK already in force,
+  which no SecY can honour.** An SSCI is a member's rank within the CA and is
+  half the XPN initialisation vector. wolfMKA recomputed the ranks on a join
+  and called `set_cipher_suite` again for each channel - but an SA's SSCI is
+  fixed when the SA is created (Linux MACsec takes `MACSEC_SA_ATTR_SSCI` at
+  `MACSEC_CMD_ADD_*SA` and offers no way to change it), so a channel that
+  already had SAs kept the rank it was installed with and the reapply silently
+  did nothing.
+
+  IEEE Std 802.1X-2020 9.10 settles it the other way round: the SSCIs belong to
+  the Live List of the MKPDU that distributed the SAK, so a Live List change
+  calls for a fresh SAK, not a revision under the existing one. A Key Server
+  now distributes one when a member joins while an XPN SAK is in force
+  (`MkaParticipant.xpn_rank_stale`), which installs new SAs carrying the new
+  ranks.
+
+  Found by the Tier 4 peer-restart round: this end rekeyed while alone -
+  ranking itself 1 of 1 - and the returning peer ranked it 2. The CA re-formed,
+  both ends installed SAs under the same key, `ip macsec show` looked healthy
+  on both sides, and traffic flowed one way only. The receiving end's PN stayed
+  at 1 while the sender's climbed, which is what identified the direction.
+
+  A departure already forced a rekey, so only the join direction was exposed.
+  Non-XPN suites are unaffected: their SSCI is 0 on every channel.
+
+- **XPN Short SCI assignment ranked the SCIs the wrong way round.** The SSCI is
+  the 1-based rank of a member's SCI within the CA; wolfMKA ranked *ascending*,
+  giving 1 to the numerically lowest SCI. IEEE Std 802.1AE-2018 10.7.13 assigns
+  1 to the highest, which is how MKAdaemon reads it, so on a two-member CA each
+  end assigned itself 2 and its peer 1 - and the SSCI is half the XPN
+  initialisation vector, so every frame was sent under one IV and decrypted
+  under another, in both directions.
+
+  Found by the first `make interop-mkad` XPN round: the CA converged, both ends
+  installed SAs, both reported a healthy link, and the ping failed. The unit
+  suite could not have found it - `test_xpn_ssci` asserts that the two ends
+  *agree* on each channel's SSCI, which an inverted ranking satisfies
+  perfectly, being wrong symmetrically. Only a peer that ranks the other way
+  can tell the difference.
+
+  `test_xpn_ssci_membership_change` and the departure test needed reshaping as
+  well as renumbering: both had the participant under test holding the highest
+  SCI in the CA, which under the corrected rule pins its rank at 1 no matter
+  who joins or leaves, so neither would have exercised the reprogramming it
+  exists to check. The joining member now outranks it.
+
+- **The Confidentiality Offset was encoded one value low, so a conformant peer
+  read "confidentiality offset 0" as "no confidentiality".** Table 11-6 makes
+  the two-bit field a four-value selector - 0 no confidentiality, 1/2/3 offset
+  0/30/50 - but `MkaConfidentialityOffset` numbered it 0/1/2 for offset
+  0/30/50, with no wire value for "none" at all; the missing state is why
+  integrity-only had to be carried out of band as a `0xFF` sentinel that never
+  reached a peer. A Key Server running wolfMKA therefore distributed 0 for
+  "encrypt from octet 0", and a peer decoding Table 11-6 turned encryption off.
+
+  Found by Tier 4 (`make interop-mkad`): whenever wolfMKA was Key Server,
+  MKAdaemon's data plane came up `encrypt off`, while the round in which
+  MKAdaemon held the role came up `encrypt on`. Nothing else could see it. The
+  CA converges, the SAKs match, and traffic flows either way, because the
+  SecTAG carries the E bit per frame - so one end encrypting and the other not
+  is a working link that silently protects without confidentiality. Tier 2
+  cannot catch it either: wpa_supplicant does not act on the received field, so
+  it encrypted regardless. `make interop-mkad` now asserts `encrypt on` at both
+  ends.
+
+  `MKA_CONF_OFFSET_NONE` is now the enumerator 0 rather than a `0xFF` define,
+  and under `WOLFMKA_CIPHER_NEGOTIATION` a Key Server that drops the CA to
+  integrity-only distributes it, instead of leaving each member to infer the
+  decision from its own view of the membership. The Distributed SAK offset is
+  no longer validated on receive: all four values are legal, and the decoder
+  already masks the field to the two bits it occupies.
+
+  **Migration:** the encoding changed, so a wolfMKA build talking to an older
+  wolfMKA build disagrees by one step. More sharply, `confidentiality_offset`
+  left at 0 - as a zero-initialised `MkaParticipantConfig` leaves it - now
+  means *no confidentiality* where it used to mean offset 0. Set
+  `cfg.confidentiality_offset = MKA_CONF_OFFSET_0` explicitly; every example
+  does. `MkaSecyOps.set_cipher_suite` receives the same values, so a binding
+  that compared against `MKA_CONF_OFFSET_NONE` still works, and one that
+  treated 0 as "encrypt from 0" must be updated.
+
+- **The Old key's receive SAs were deleted without being disabled, and so
+  were never deleted at all.** `mka_delete_sak_sas` issued `delete_sa` for each
+  peer's receive SA while that SA was still enabled. The transmit side is
+  disabled first - `mka_maybe_enable_tx` turns the Old key off as the Latest
+  one takes over - but the receive side had no equivalent, so a SecY that
+  refuses to remove an SA still in use kept it. On Linux, `macsec_del_rxsa`
+  answers `-EBUSY` while `rx_sa->active`, so every make-before-break handover
+  leaked one receive SA: the device accumulated them until the Association
+  Numbers wrapped onto a key that was still installed, at which point the
+  install fails and the handover has nowhere to go. `mka_delete_sak_sas` now
+  calls `enable_receive(..., false)` before `delete_sa` for each peer.
+
+  Found by the interop work, and invisible to the unit suite as it stood: the
+  test SecY accepted every deletion, so the call count was right and only the
+  order was wrong. The shim now models the kernel's rule (opt-in via
+  `Secy.strict_del`) and `test_rekey` asserts that no deletion was refused -
+  which fails against the old code.
+
+- **`examples/mka_macsec` charged every rekey with a spurious SecY failure.**
+  The KaY creates the receive Secure Channel ahead of each SAK install for a
+  peer, so from the second SAK onwards Linux already has it and answers
+  `MACSEC_CMD_ADD_RXSC` with `-EEXIST`, which the example passed straight back
+  and `mka_secy_track` counted as a SecY error. The device ended up correct
+  either way - the SC really did exist - but the failure count did not, and a
+  genuine SecY fault was hidden among the noise. `MkaSecyOps.create_rx_sc` and
+  `.create_tx_sc` now document that they are called before every install and
+  must therefore be idempotent, and the Linux binding maps `-EEXIST` to
+  success. `create_rx_sc` and `enable_receive` are traced as well, so no hook
+  is silent.
+
+  Separately, `nl_send_ack` returned whatever reply arrived next instead of
+  matching `nlmsg_seq`, so a refusal could be reported against a later,
+  unrelated command - which is exactly how the receive-SA leak above stayed
+  hidden, its `-EBUSY` surfacing on an innocent `install_tx_sa`. Replies are
+  now matched to their requests, the wait is bounded, and `EINTR` is retried.
+
+  Tracing them is what exposed the receive-SA leak below: with `create_rx_sc`
+  reporting 0, the codes that remained could not belong to the commands they
+  were printed against, which is what led to `nl_send_ack`.
+
+- **A peer holding our key in its *Old* slot read as holding no key of ours.**
+  The MACsec SAK Use set reports both keys a peer holds, and either slot may
+  name ours, but `mka_sak_use_reports_ours` only ever examined the Latest pair —
+  `src/mka_kay.c` referenced the received `old_kn` nowhere, though `mka_pdu.c`
+  decodes it and `MKA_SAK_USE_IS_OLD_TX/RX` exist. wpa_supplicant adopts a
+  distributed SAK as Latest and then demotes it to Old once it settles,
+  reporting Old Tx / Old Rx with the Latest Key Server MI and Key Number empty;
+  a healthy association therefore looked like a peer that had lost the SAK, on
+  every MKPDU, and the Key Server rekeyed — after which the peer demoted the new
+  key too and it repeated. What matters is whether the peer names a Key Number
+  we issued, not which of its two slots it keeps it in.
+
+  The unit suite could not have caught this: it only ever generated the Latest
+  form, because that is the form wolfMKA's own encoder emits. It took live
+  interop against a second implementation.
+- **The same blind spot stalled Old-key retirement.** `mka_apply_sak_use` also
+  read only the Latest pair, so a peer keeping our key in its Old slot was
+  recorded as holding no key — and `pe->sak_rx` / `pe->sak_tx` /
+  `pe->latest_kn` are exactly what the transmit gate (`mka_peers_rx_on`) and
+  `mka_retire_old` wait on. The Old key was therefore never retired and its
+  Association Number never came back; with only four of them, a long-lived
+  association rekeying against such a peer would eventually wrap onto an
+  Association Number whose Secure Associations were still installed. The peer's
+  report is now taken from whichever slot names a key: the Latest pair whenever
+  it names one, the Old pair only when the peer reports no Latest key. The XPN
+  packet-number MSBs and the delay-protection bound follow the same slot.
+
+- **`examples/mka_link` and `examples/mka_macsec` quit on the signal that asked
+  them to rekey.** Both treated an interrupted `poll()` as fatal —
+  `if (poll(...) < 0) break;` — under a comment that said "EINTR from a signal:
+  re-check g_stop / g_rekey", which is what `continue` does. `SIGUSR1` therefore
+  terminated the process mid-handover, tearing down both Secure Associations;
+  from the peer's side the link simply went silent and its Life Timer expired.
+  Whether the signal landed inside `poll` or between iterations was a race, so
+  the Tier 2 rekey check failed intermittently. `EINTR` now retries; a real
+  poll error reports and exits, and `mka_macsec` says which happened.
+- **`examples/mka_macsec` wrote a Key Identifier with a zero Member
+  Identifier.** `MACSEC_SA_ATTR_KEYID` is the MKA KI — the issuing Key Server's
+  MI followed by the Key Number — and only the KN was filled in. It is a local
+  handle, never on the wire, but it is what distinguishes the two keys installed
+  at once during a handover when reading `ip macsec show`. It now recovers the
+  MI from the participant's Latest/Old slots, as wpa_supplicant does.
+- **`examples/mka_macsec` logged no SecY activity**, which made a failed
+  handover impossible to diagnose: there was no way to tell "the SecY was never
+  told" from "the SecY refused". All four hooks now trace with the kernel's
+  return code.
+- **The interop harness could never have passed.** `make interop` and
+  `make interop-dataplane` built `examples/mka_link` / `examples/mka_macsec`
+  from the default library, which computes the MKPDU ICV over the MKPDU alone.
+  wpa_supplicant computes it over the Ethernet framing as well — it assembles
+  destination MAC, source MAC and EtherType into the buffer it hashes
+  (`ieee802_1x_kay_encode_mkpdu`), per IEEE Std 802.1X-2010 11.11.3 — which is
+  wolfMKA's `WOLFMKA_ICV_L2_ADDR`, off by default. The two sign different bytes,
+  so every frame was rejected with an ICV mismatch and no peer ever became live.
+  The targets now build dedicated binaries with the flag set, compiling the
+  library sources directly (linking the default `libwolfmka.a` would not do,
+  since the flag changes what the library signs). The defect was invisible
+  because the scripts had only ever `SKIP`ped for lack of root.
+- **The interop examples never flushed their logs.** `mka_link` and
+  `mka_macsec` write status with `printf` and no `setvbuf`, so with stdout
+  redirected to a file — which is how the scripts run them — stdio block-buffers
+  and 25 s of short status lines never reach the file. The scripts poll that log
+  for `sak=1`, so the convergence check could not fire whatever the protocol
+  did, and the diagnostic dumps came out empty. Both now line-buffer.
+- **Tier 2 dumped the wrong namespace.** It labelled the output "wpa MACsec
+  device" but ran `ip macsec show` in wolfMKA's namespace, so a failure report
+  showed one end twice. It now shows both, each labelled with its namespace.
 
 - **Duplicate MACsec Cipher Suites TLVs are rejected.** An announcement carries
   at most one, and the walk assigned rather than merged - so a second TLV

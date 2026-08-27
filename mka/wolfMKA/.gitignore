@@ -13,6 +13,7 @@ build/
 
 # Test / example binaries (one per feature-gated make target)
 test/runtests
+test/abi_check
 test/runalloc
 test/runfault
 test/runauto
@@ -20,8 +21,6 @@ test/runautosar
 test/rundet
 test/rundistcak
 test/runendian
-test/runicvl2
-test/runicvl2suite
 test/runkmd
 test/runnego
 test/runsanitize
@@ -29,7 +28,17 @@ test/runsusp
 test/test_endian_be
 test/fuzz_pdu
 test/fuzz_receive
+examples/mka_autosar
+examples/mka_demo
+examples/mka_eap
+examples/mka_group_cak
 examples/mka_link
+examples/mka_macsec
+examples/mka_macsec_mkad
+examples/mka_rekey
+examples/mka_xpn
+examples/secy_macsec_linux
+test/interop/eap_derive
 
 # Generated Doxygen HTML
 doc/
